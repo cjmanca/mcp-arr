@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Queue-item removal for Sonarr and Lidarr.** New tools `sonarr_delete_queue_item` and `lidarr_delete_queue_item` call the native queue `DELETE` endpoints (`/api/v3/queue/{id}` and `/api/v1/queue/{id}`) with `removeFromClient` (default `true`), `blocklist` (default `false`), `skipRedownload` (default `false`) and `changeCategory` (default `false`). The implementation lives in the shared `ArrClient` — Sonarr, Radarr and Lidarr expose identical queue-removal controls.
+
+### Changed
+- **`radarr_delete_queue_item` gained `skipRedownload` and `changeCategory`.** Existing `queueId`/`removeFromClient`/`blocklist` behavior and defaults are unchanged; the two new options default to `false`.
+
+### Fixed
+- **Queue DELETE no longer fails on empty response bodies.** The *arr queue `DELETE` endpoints reply 200/204 with no body; `ArrClient.request()` unconditionally called `response.json()`, which throws on an empty body. It now returns `undefined` for empty responses.
+
 ## [1.7.3] - 2026-07-29
 
 ### Fixed

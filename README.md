@@ -285,6 +285,7 @@ The existing service-specific tools remain available for richer local or power-u
 | `sonarr_get_root_folders` | Get available root folders for adding series |
 | `sonarr_get_quality_profiles` | Get available quality profiles for adding series |
 | `sonarr_get_queue` | View current download queue with `limit` and `offset` pagination |
+| `sonarr_delete_queue_item` | Remove a queue item; `removeFromClient` (default true), `blocklist`, `skipRedownload`, `changeCategory` |
 | `sonarr_get_calendar` | See upcoming episodes |
 | `sonarr_get_episodes` | List episodes for a series (shows missing vs available) |
 | `sonarr_search_missing` | Trigger search for all missing episodes in a series |
@@ -305,7 +306,7 @@ The existing service-specific tools remain available for richer local or power-u
 | `radarr_search_movie` | Trigger search to download a movie in your library |
 | `radarr_search_movies` | Bulk-trigger searches for multiple movie IDs at once |
 | `radarr_update_movie` | Update a movie's quality profile, monitored status, minimum availability, tags, or path |
-| `radarr_delete_queue_item` | Remove an item from the download queue (optionally blocklist the release) |
+| `radarr_delete_queue_item` | Remove a queue item; `removeFromClient` (default true), `blocklist`, `skipRedownload`, `changeCategory` |
 | `radarr_refresh_movie` | Trigger a metadata refresh for a specific movie in Radarr |
 
 ### Lidarr Tools (Music)
@@ -319,6 +320,7 @@ The existing service-specific tools remain available for richer local or power-u
 | `lidarr_get_quality_profiles` | Get available quality profiles for adding artists |
 | `lidarr_get_metadata_profiles` | Get available metadata profiles for adding artists |
 | `lidarr_get_queue` | View current download queue with `limit` and `offset` pagination |
+| `lidarr_delete_queue_item` | Remove a queue item; `removeFromClient` (default true), `blocklist`, `skipRedownload`, `changeCategory` |
 | `lidarr_get_albums` | List albums for an artist (shows missing vs available) |
 | `lidarr_search_album` | Trigger search for a specific album |
 | `lidarr_search_missing` | Trigger search for all missing albums for an artist |

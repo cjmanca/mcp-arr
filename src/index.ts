@@ -280,6 +280,36 @@ if (clients.sonarr) {
       },
     },
     {
+      name: "sonarr_delete_queue_item",
+      description: "Remove an item from the Sonarr download queue (destructive). Use sonarr_get_queue to find queue item IDs. removeFromClient=true (default) also removes the item from the download client. blocklist=true blocklists the release so it will not be grabbed again; combine with skipRedownload=false to let Sonarr find a replacement (bad release), or leave blocklist=false for valid-but-unneeded items (already imported, not an upgrade). skipRedownload=true suppresses automatic replacement/redownload when blocklisting. changeCategory=true marks the item as imported by changing its queue category.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          queueId: {
+            type: "number",
+            description: "Queue item ID (from sonarr_get_queue)",
+          },
+          removeFromClient: {
+            type: "boolean",
+            description: "Also remove the item from the download client (default: true)",
+          },
+          blocklist: {
+            type: "boolean",
+            description: "Blocklist the release so it will not be grabbed again (default: false)",
+          },
+          skipRedownload: {
+            type: "boolean",
+            description: "When blocklisting/failing the download, suppress automatic replacement/redownload (default: false)",
+          },
+          changeCategory: {
+            type: "boolean",
+            description: "Mark the item as imported by changing its queue category (default: false)",
+          },
+        },
+        required: ["queueId"],
+      },
+    },
+    {
       name: "sonarr_get_calendar",
       description: "Get upcoming TV episodes from Sonarr",
       inputSchema: {
@@ -573,7 +603,7 @@ if (clients.radarr) {
     },
     {
       name: "radarr_delete_queue_item",
-      description: "Remove an item from the Radarr download queue. Use radarr_get_queue to find queue item IDs. Can optionally blocklist the release to prevent re-grabbing.",
+      description: "Remove an item from the Radarr download queue (destructive). Use radarr_get_queue to find queue item IDs. removeFromClient=true (default) also removes the item from the download client. blocklist=true blocklists the release so it will not be grabbed again; combine with skipRedownload=false to let Radarr find a replacement (bad release), or leave blocklist=false for valid-but-unneeded items (already imported, not an upgrade). skipRedownload=true suppresses automatic replacement/redownload when blocklisting. changeCategory=true marks the item as imported by changing its queue category.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -583,11 +613,19 @@ if (clients.radarr) {
           },
           removeFromClient: {
             type: "boolean",
-            description: "Also remove from download client (default: true)",
+            description: "Also remove the item from the download client (default: true)",
           },
           blocklist: {
             type: "boolean",
-            description: "Add release to blocklist to prevent re-grabbing (default: false)",
+            description: "Blocklist the release so it will not be grabbed again (default: false)",
+          },
+          skipRedownload: {
+            type: "boolean",
+            description: "When blocklisting/failing the download, suppress automatic replacement/redownload (default: false)",
+          },
+          changeCategory: {
+            type: "boolean",
+            description: "Mark the item as imported by changing its queue category (default: false)",
           },
         },
         required: ["queueId"],
@@ -775,6 +813,36 @@ if (clients.lidarr) {
         type: "object" as const,
         properties: {},
         required: [],
+      },
+    },
+    {
+      name: "lidarr_delete_queue_item",
+      description: "Remove an item from the Lidarr download queue (destructive). Use lidarr_get_queue to find queue item IDs. removeFromClient=true (default) also removes the item from the download client. blocklist=true blocklists the release so it will not be grabbed again; combine with skipRedownload=false to let Lidarr find a replacement (bad release), or leave blocklist=false for valid-but-unneeded items (already imported, not an upgrade). skipRedownload=true suppresses automatic replacement/redownload when blocklisting. changeCategory=true marks the item as imported by changing its queue category.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          queueId: {
+            type: "number",
+            description: "Queue item ID (from lidarr_get_queue)",
+          },
+          removeFromClient: {
+            type: "boolean",
+            description: "Also remove the item from the download client (default: true)",
+          },
+          blocklist: {
+            type: "boolean",
+            description: "Blocklist the release so it will not be grabbed again (default: false)",
+          },
+          skipRedownload: {
+            type: "boolean",
+            description: "When blocklisting/failing the download, suppress automatic replacement/redownload (default: false)",
+          },
+          changeCategory: {
+            type: "boolean",
+            description: "Mark the item as imported by changing its queue category (default: false)",
+          },
+        },
+        required: ["queueId"],
       },
     }
   );
@@ -1618,6 +1686,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         return jsonText(await getPaginatedQueue(clients.sonarr, args as { limit?: number; offset?: number }));
       }
 
+      case "sonarr_delete_queue_item": {
+        if (!clients.sonarr) throw new Error("Sonarr not configured");
+        const { queueId, removeFromClient = true, blocklist = false, skipRedownload = false, changeCategory = false } = args as {
+          queueId: number; removeFromClient?: boolean; blocklist?: boolean; skipRedownload?: boolean; changeCategory?: boolean;
+        };
+        await clients.sonarr.deleteQueueItem(queueId, { removeFromClient, blocklist, skipRedownload, changeCategory });
+        return jsonText({
+          success: true,
+          message: `Removed queue item ${queueId}${blocklist ? ' and added to blocklist' : ''}`,
+          queueId,
+          removedFromClient: removeFromClient,
+          blocklisted: blocklist,
+          skipRedownload,
+          changeCategory,
+        });
+      }
+
       case "sonarr_get_calendar": {
         if (!clients.sonarr) throw new Error("Sonarr not configured");
         const days = (args as { days?: number })?.days || 7;
@@ -1925,10 +2010,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "radarr_delete_queue_item": {
         if (!clients.radarr) throw new Error("Radarr not configured");
-        const { queueId, removeFromClient = true, blocklist = false } = args as {
-          queueId: number; removeFromClient?: boolean; blocklist?: boolean;
+        const { queueId, removeFromClient = true, blocklist = false, skipRedownload = false, changeCategory = false } = args as {
+          queueId: number; removeFromClient?: boolean; blocklist?: boolean; skipRedownload?: boolean; changeCategory?: boolean;
         };
-        await clients.radarr.deleteQueueItem(queueId, { removeFromClient, blocklist });
+        await clients.radarr.deleteQueueItem(queueId, { removeFromClient, blocklist, skipRedownload, changeCategory });
         return {
           content: [{
             type: "text",
@@ -1938,6 +2023,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
               queueId,
               removedFromClient: removeFromClient,
               blocklisted: blocklist,
+              skipRedownload,
+              changeCategory,
             }, null, 2),
           }],
         };
@@ -2009,6 +2096,23 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "lidarr_get_queue": {
         if (!clients.lidarr) throw new Error("Lidarr not configured");
         return jsonText(await getPaginatedQueue(clients.lidarr, args as { limit?: number; offset?: number }));
+      }
+
+      case "lidarr_delete_queue_item": {
+        if (!clients.lidarr) throw new Error("Lidarr not configured");
+        const { queueId, removeFromClient = true, blocklist = false, skipRedownload = false, changeCategory = false } = args as {
+          queueId: number; removeFromClient?: boolean; blocklist?: boolean; skipRedownload?: boolean; changeCategory?: boolean;
+        };
+        await clients.lidarr.deleteQueueItem(queueId, { removeFromClient, blocklist, skipRedownload, changeCategory });
+        return jsonText({
+          success: true,
+          message: `Removed queue item ${queueId}${blocklist ? ' and added to blocklist' : ''}`,
+          queueId,
+          removedFromClient: removeFromClient,
+          blocklisted: blocklist,
+          skipRedownload,
+          changeCategory,
+        });
       }
 
       case "lidarr_get_albums": {
