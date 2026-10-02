@@ -29,6 +29,7 @@ import {
   ProwlarrClient,
   ArrService,
 } from "./arr-client.js";
+import type { QueueStatusMessage } from "./arr-client.js";
 import { trashClient, TrashService } from "./trash-client.js";
 
 // Read from package.json rather than hardcoding, so the version reported to
@@ -263,7 +264,7 @@ if (clients.sonarr) {
     },
     {
       name: "sonarr_get_queue",
-      description: "Get Sonarr download queue. Supports pagination with limit and offset.",
+      description: "Get Sonarr download queue, including import diagnostics: structured statusMessages (per-file import rejection reasons), errorMessage, trackedDownloadStatus/State, downloadId, outputPath, indexer, and seriesId/episodeId/seasonNumber for correlating with the library. Use these to understand why a completed download was not imported automatically. Supports pagination with limit and offset.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -467,7 +468,7 @@ if (clients.radarr) {
     },
     {
       name: "radarr_get_queue",
-      description: "Get Radarr download queue. Supports pagination with limit and offset.",
+      description: "Get Radarr download queue, including import diagnostics: structured statusMessages (per-file import rejection reasons), errorMessage, trackedDownloadStatus/State, downloadId, outputPath, indexer, and movieId for correlating with the library. Use these to understand why a completed download was not imported automatically. Supports pagination with limit and offset.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -677,7 +678,7 @@ if (clients.lidarr) {
     },
     {
       name: "lidarr_get_queue",
-      description: "Get Lidarr download queue. Supports pagination with limit and offset.",
+      description: "Get Lidarr download queue, including import diagnostics: structured statusMessages (per-file import rejection reasons), errorMessage, trackedDownloadStatus/State, downloadId, outputPath, indexer, and artistId/albumId for correlating with the library. Use these to understand why a completed download was not imported automatically. Supports pagination with limit and offset.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -1256,6 +1257,38 @@ async function fetchSearchEntry(id: string): Promise<unknown> {
 
 type QueueCapableClient = SonarrClient | RadarrClient | LidarrClient;
 
+/**
+ * Shape of each item returned by the *_get_queue tools. All fields come
+ * straight from the native *arr queue API; diagnostic fields are passed
+ * through faithfully (statusMessages keeps its structured shape) so the
+ * calling agent can reason about why a completed download was not
+ * imported. Service-specific IDs are only present when the native API
+ * supplied them for that item.
+ */
+interface MappedQueueItem {
+  id: number;
+  title: string;
+  status: string;
+  progress: string;
+  timeLeft: string;
+  downloadClient: string;
+  protocol: string;
+  trackedDownloadStatus: string;
+  trackedDownloadState: string;
+  statusMessages: QueueStatusMessage[];
+  errorMessage: string | null;
+  downloadId: string | null;
+  outputPath: string | null;
+  indexer: string | null;
+  indexerId: number | null;
+  seriesId?: number;
+  episodeId?: number;
+  seasonNumber?: number;
+  movieId?: number;
+  artistId?: number;
+  albumId?: number;
+}
+
 async function getPaginatedQueue(
   client: QueueCapableClient,
   args: { limit?: number; offset?: number } | undefined
@@ -1279,17 +1312,36 @@ async function getPaginatedQueue(
     page += 1;
   }
 
-  const items = records.slice(offset, offset + limit).map((q) => ({
-    id: q.id,
-    title: q.title,
-    status: q.status,
-    progress: q.size > 0 ? ((1 - q.sizeleft / q.size) * 100).toFixed(1) + "%" : "unknown",
-    timeLeft: q.timeleft,
-    downloadClient: q.downloadClient,
-    protocol: q.protocol,
-    trackedDownloadStatus: q.trackedDownloadStatus,
-    trackedDownloadState: q.trackedDownloadState,
-  }));
+  const items: MappedQueueItem[] = records.slice(offset, offset + limit).map((q) => {
+    const sizeleft = q.sizeleft ?? q.sizeLeft;
+    const item: MappedQueueItem = {
+      id: q.id,
+      title: q.title,
+      status: q.status,
+      progress: q.size > 0 && sizeleft != null ? ((1 - sizeleft / q.size) * 100).toFixed(1) + "%" : "unknown",
+      timeLeft: q.timeleft,
+      downloadClient: q.downloadClient,
+      protocol: q.protocol,
+      trackedDownloadStatus: q.trackedDownloadStatus,
+      trackedDownloadState: q.trackedDownloadState,
+      // Import/download diagnostics, passed through from the native API
+      // without flattening, classifying, or truncating them.
+      statusMessages: Array.isArray(q.statusMessages) ? q.statusMessages : [],
+      errorMessage: q.errorMessage ?? null,
+      downloadId: q.downloadId ?? null,
+      outputPath: q.outputPath ?? null,
+      indexer: q.indexer ?? null,
+      indexerId: q.indexerId ?? null,
+    };
+    // Service-specific identifiers, only when the native API provided them.
+    if (q.seriesId != null) item.seriesId = q.seriesId;
+    if (q.episodeId != null) item.episodeId = q.episodeId;
+    if (q.episode?.seasonNumber != null) item.seasonNumber = q.episode.seasonNumber;
+    if (q.movieId != null) item.movieId = q.movieId;
+    if (q.artistId != null) item.artistId = q.artistId;
+    if (q.albumId != null) item.albumId = q.albumId;
+    return item;
+  });
 
   return {
     total: totalRecords,

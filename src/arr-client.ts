@@ -29,13 +29,24 @@ export interface SystemStatus {
   isWindows: boolean;
 }
 
+/**
+ * One diagnostic group from the native *arr queue API: a filename (or release
+ * title) paired with the messages the app produced for it, e.g. import
+ * rejections like "Episode file already imported" or
+ * "Unable to determine if file is a sample".
+ */
+export interface QueueStatusMessage {
+  title: string;
+  messages: string[];
+}
+
 export interface QueueItem {
   id: number;
   title: string;
   status: string;
   trackedDownloadStatus: string;
   trackedDownloadState: string;
-  statusMessages: Array<{ title: string; messages: string[] }>;
+  statusMessages: QueueStatusMessage[];
   downloadId: string;
   protocol: string;
   downloadClient: string;
@@ -44,6 +55,25 @@ export interface QueueItem {
   size: number;
   timeleft: string;
   estimatedCompletionTime: string;
+  /** Sonarr/Radarr v3 serialize the remaining size as `sizeLeft`; Lidarr uses `sizeleft`. */
+  sizeLeft?: number;
+  /** Not part of the native queue resource; kept optional so responses pass through untouched. */
+  errorMessage?: string | null;
+  indexerId?: number | null;
+  indexer?: string | null;
+  added?: string;
+  /** Service-specific identifiers supplied by the native queue resources. */
+  seriesId?: number | null;
+  episodeId?: number | null;
+  movieId?: number | null;
+  artistId?: number | null;
+  albumId?: number | null;
+  /** Embedded resources the queue endpoints include with each item. */
+  episode?: { seasonNumber?: number } | null;
+  series?: { id?: number; title?: string } | null;
+  movie?: { id?: number; title?: string } | null;
+  artist?: { id?: number; artistName?: string } | null;
+  album?: { id?: number; title?: string } | null;
 }
 
 export interface Series {

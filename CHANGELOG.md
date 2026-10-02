@@ -5,16 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [1.7.4] - 2026-10-02
 
 ### Added
 - **Queue-item removal for Sonarr and Lidarr.** New tools `sonarr_delete_queue_item` and `lidarr_delete_queue_item` call the native queue `DELETE` endpoints (`/api/v3/queue/{id}` and `/api/v1/queue/{id}`) with `removeFromClient` (default `true`), `blocklist` (default `false`), `skipRedownload` (default `false`) and `changeCategory` (default `false`). The implementation lives in the shared `ArrClient` — Sonarr, Radarr and Lidarr expose identical queue-removal controls.
 
 ### Changed
 - **`radarr_delete_queue_item` gained `skipRedownload` and `changeCategory`.** Existing `queueId`/`removeFromClient`/`blocklist` behavior and defaults are unchanged; the two new options default to `false`.
+- **Queue tools now return native import diagnostics.** `sonarr_get_queue`, `radarr_get_queue` and `lidarr_get_queue` pass through the diagnostic fields the native *arr queue APIs supply instead of discarding them: structured `statusMessages` (per-file import rejection reasons, kept as `{title, messages[]}` groups — never flattened, classified or truncated), `errorMessage`, `downloadId`, `outputPath`, `indexer`/`indexerId`, and service-specific identifiers when the API provides them (`seriesId`/`episodeId`/`seasonNumber` for Sonarr, `movieId` for Radarr, `artistId`/`albumId` for Lidarr). All previously returned fields and the existing `limit`/`offset` pagination semantics are unchanged, so existing consumers keep working. An MCP client can now tell an ordinary downloading item apart from an import-pending item (e.g. "Episode file already imported", "Not a Custom Format upgrade", "Unable to determine if file is a sample") without direct Sonarr API access.
 
 ### Fixed
 - **Queue DELETE no longer fails on empty response bodies.** The *arr queue `DELETE` endpoints reply 200/204 with no body; `ArrClient.request()` unconditionally called `response.json()`, which throws on an empty body. It now returns `undefined` for empty responses.
+- **Queue `progress` no longer reports `NaN%` when the app returns the camelCase `sizeLeft` spelling** (used by Sonarr/Radarr v3). The mapping now falls back to `sizeLeft` when `sizeleft` is absent.
 
 ## [1.7.3] - 2026-07-29
 
