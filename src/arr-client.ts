@@ -68,6 +68,13 @@ export interface QueueItem {
   movieId?: number | null;
   artistId?: number | null;
   albumId?: number | null;
+  /**
+   * Sonarr's queue resource exposes `seasonNumber` at the top level. The
+   * embedded `episode.seasonNumber` below is only a compatibility fallback:
+   * `getQueue()` never asks for embedded episodes, so the top-level field is
+   * the one a live Sonarr response carries.
+   */
+  seasonNumber?: number | null;
   /** Embedded resources the queue endpoints include with each item. */
   episode?: { seasonNumber?: number } | null;
   series?: { id?: number; title?: string } | null;
@@ -781,6 +788,12 @@ export class ArrClient {
    * DELETE /api/{version}/queue/{id} with removeFromClient (default true),
    * blocklist (default false), skipRedownload (default false) and
    * changeCategory (default false) query parameters.
+   *
+   * Every option is transmitted with its literal value when the caller supplies
+   * one, and omitted when it does not. Omitting is NOT equivalent to sending
+   * false for `removeFromClient`, whose server-side default is true, so an
+   * explicit `removeFromClient: false` must always appear in the query —
+   * dropping it would make the app remove the release from the download client.
    */
   async deleteQueueItem(
     queueId: number,
@@ -792,10 +805,10 @@ export class ArrClient {
     } = {},
   ): Promise<void> {
     const params = new URLSearchParams();
-    if (options.removeFromClient) params.append('removeFromClient', 'true');
-    if (options.blocklist) params.append('blocklist', 'true');
-    if (options.skipRedownload) params.append('skipRedownload', 'true');
-    if (options.changeCategory) params.append('changeCategory', 'true');
+    if (options.removeFromClient !== undefined) params.set('removeFromClient', String(options.removeFromClient));
+    if (options.blocklist !== undefined) params.set('blocklist', String(options.blocklist));
+    if (options.skipRedownload !== undefined) params.set('skipRedownload', String(options.skipRedownload));
+    if (options.changeCategory !== undefined) params.set('changeCategory', String(options.changeCategory));
     const query = params.toString() ? `?${params.toString()}` : '';
     await this.request<void>(`/queue/${queueId}${query}`, {
       method: 'DELETE',

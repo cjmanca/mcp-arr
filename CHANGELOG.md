@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **`removeFromClient=false` now reaches the app as an explicit `false`.** `ArrClient.deleteQueueItem()` appended queue `DELETE` query parameters only when they were truthy, so a caller asking for `removeFromClient=false` produced a request with the parameter **omitted** — and Sonarr, Radarr and Lidarr all default `removeFromClient` to `true` server-side. The result was the opposite of what was requested: the release was deleted from the download client (qBittorrent/SABnzbd/etc.) while the MCP response reported `removedFromClient: false`. Every supplied option (`removeFromClient`, `blocklist`, `skipRedownload`, `changeCategory`) is now transmitted with its literal value, and only genuinely unspecified options are omitted, so the native request can no longer disagree with the MCP response. MCP-level defaults are unchanged.
+- **Sonarr queue items keep their `seasonNumber`.** The native Sonarr queue resource exposes `seasonNumber` at the **top level**, but the MCP mapper only read `episode.seasonNumber`. `getQueue()` never requests embedded episode resources, so live responses carry the season number top-level and MCP dropped it. The mapper now reads the top-level field first and keeps the nested value as a compatibility fallback.
+
 ## [1.7.4] - 2026-10-02
 
 ### Added

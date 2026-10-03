@@ -59,10 +59,15 @@ test("ArrClient.getQueue: native records (incl. statusMessages) pass through unm
 // Sonarr and Radarr share the /api/v3/queue path, so the stub answers every
 // service with the same superset record set; the mapping must expose the
 // identifiers each service's native API supplies.
+//
+// Shape note: `getQueue()` never requests embedded episode resources, and the
+// native Sonarr queue resource carries `seasonNumber` at the TOP level. This
+// fixture therefore has no `episode` object — a real Sonarr response does not.
 const SONARR_RECORD = {
   id: 123,
   seriesId: 7,
   episodeId: 456,
+  seasonNumber: 6,
   status: "Completed",
   size: 0,
   sizeleft: 0,
@@ -90,7 +95,6 @@ const SONARR_RECORD = {
   downloadClient: "qBittorrent",
   indexerId: 3,
   indexer: "ExampleIndexer",
-  episode: { id: 456, seriesId: 7, seasonNumber: 6 },
   series: { id: 7, title: "The Good Fight" },
 };
 
@@ -98,6 +102,7 @@ const DOWNLOADING_RECORD = {
   id: 124,
   seriesId: 7,
   episodeId: 457,
+  seasonNumber: 1,
   status: "Downloading",
   size: 1000,
   sizeleft: 250,
@@ -112,7 +117,6 @@ const DOWNLOADING_RECORD = {
   downloadClient: "qBittorrent",
   indexerId: 4,
   indexer: "OtherIndexer",
-  episode: { id: 457, seriesId: 7, seasonNumber: 1 },
 };
 
 // Uses the camelCase sizeLeft spelling (Sonarr/Radarr v3) with no `sizeleft`.
@@ -281,7 +285,7 @@ test("sonarr_get_queue: statusMessages survive mapping with structure intact", a
     // Service-specific identifiers supplied by the native API.
     assert.equal(item.seriesId, 7);
     assert.equal(item.episodeId, 456);
-    assert.equal(item.seasonNumber, 6, "seasonNumber comes from the embedded episode resource");
+    assert.equal(item.seasonNumber, 6, "seasonNumber comes from the native top-level queue field, with no embedded episode in the response");
 
     // Existing fields must remain present and unchanged.
     assert.equal(item.id, 123);
@@ -296,12 +300,41 @@ test("sonarr_get_queue: statusMessages survive mapping with structure intact", a
   });
 });
 
+test("sonarr_get_queue: top-level seasonNumber is preferred, embedded episode is only the fallback", async () => {
+  // The native shape: top-level only, no embedded episode.
+  await withServer(queuePageHandler([{ ...SONARR_RECORD, seasonNumber: 6 }]), async (port) => {
+    const result = await callTool(port, "sonarr_get_queue", {});
+    assert.equal(result.items[0].seasonNumber, 6);
+  });
+
+  // Compatibility fallback: a response that carries only the nested value.
+  await withServer(queuePageHandler([{
+    ...SONARR_RECORD,
+    seasonNumber: null,
+    episode: { id: 456, seriesId: 7, seasonNumber: 3 },
+  }]), async (port) => {
+    const result = await callTool(port, "sonarr_get_queue", {});
+    assert.equal(result.items[0].seasonNumber, 3, "the nested episode value is used when the top-level field is absent");
+  });
+
+  // Precedence: when both are present, the top-level native field wins.
+  await withServer(queuePageHandler([{
+    ...SONARR_RECORD,
+    seasonNumber: 6,
+    episode: { id: 456, seriesId: 7, seasonNumber: 3 },
+  }]), async (port) => {
+    const result = await callTool(port, "sonarr_get_queue", {});
+    assert.equal(result.items[0].seasonNumber, 6, "the top-level field must win over the embedded fallback");
+  });
+});
+
 test("radarr_get_queue: movieId and statusMessages preserved", async () => {
   const radarrRecord = {
     ...SONARR_RECORD,
     id: 222,
     seriesId: null,
     episodeId: null,
+    seasonNumber: null,
     movieId: 11,
     title: "Some.Movie.2026",
     episode: null,
@@ -314,7 +347,7 @@ test("radarr_get_queue: movieId and statusMessages preserved", async () => {
     assert.equal(item.movieId, 11);
     assert.ok(!("seriesId" in item), "null seriesId from the API must not be fabricated");
     assert.ok(!("episodeId" in item), "null episodeId from the API must not be fabricated");
-    assert.ok(!("seasonNumber" in item), "no embedded episode means no seasonNumber");
+    assert.ok(!("seasonNumber" in item), "Radarr's queue resource supplies no season data, so seasonNumber must not be fabricated");
     assert.deepEqual(item.statusMessages, radarrRecord.statusMessages);
     assert.equal(item.downloadId, "abc123");
     assert.equal(item.indexer, "ExampleIndexer");
@@ -328,6 +361,7 @@ test("lidarr_get_queue: artistId/albumId and statusMessages preserved", async ()
     id: 333,
     seriesId: null,
     episodeId: null,
+    seasonNumber: null,
     artistId: 5,
     albumId: 9,
     title: "Some.Artist.Album",

@@ -1724,7 +1724,10 @@ async function getPaginatedQueue(
     // Service-specific identifiers, only when the native API provided them.
     if (q.seriesId != null) item.seriesId = q.seriesId;
     if (q.episodeId != null) item.episodeId = q.episodeId;
-    if (q.episode?.seasonNumber != null) item.seasonNumber = q.episode.seasonNumber;
+    // Sonarr exposes seasonNumber on the queue resource itself; the embedded
+    // episode value is only a fallback for responses that carry one.
+    if (q.seasonNumber != null) item.seasonNumber = q.seasonNumber;
+    else if (q.episode?.seasonNumber != null) item.seasonNumber = q.episode.seasonNumber;
     if (q.movieId != null) item.movieId = q.movieId;
     if (q.artistId != null) item.artistId = q.artistId;
     if (q.albumId != null) item.albumId = q.albumId;

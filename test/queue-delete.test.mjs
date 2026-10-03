@@ -8,6 +8,11 @@ import { SonarrClient, RadarrClient, LidarrClient } from "../dist/arr-client.js"
 
 // ---------------------------------------------------------------------------
 // Client-level tests: stub fetch and inspect the request each client makes.
+//
+// Serialization contract: an option the caller supplies is transmitted with
+// its literal value; an option the caller omits is left out of the query.
+// Omission is NOT the same as false — the native apps default removeFromClient
+// to true, so an explicit false must appear in the query.
 // ---------------------------------------------------------------------------
 
 function stubFetch(status = 204, body = "") {
@@ -28,6 +33,16 @@ function queuePathOf(url) {
   return new URL(url).pathname;
 }
 
+function paramsOf(url) {
+  return new URL(url).searchParams;
+}
+
+const CLIENTS = [
+  ["sonarr", SonarrClient, "/api/v3/queue"],
+  ["radarr", RadarrClient, "/api/v3/queue"],
+  ["lidarr", LidarrClient, "/api/v1/queue"],
+];
+
 test("sonarr_delete_queue_item: DELETE /api/v3/queue/{id} with all params", async () => {
   const { calls, restore } = stubFetch();
   try {
@@ -41,7 +56,7 @@ test("sonarr_delete_queue_item: DELETE /api/v3/queue/{id} with all params", asyn
     assert.equal(calls.length, 1);
     assert.equal(calls[0].init.method, "DELETE");
     assert.equal(queuePathOf(calls[0].url), "/api/v3/queue/123");
-    const params = new URL(calls[0].url).searchParams;
+    const params = paramsOf(calls[0].url);
     assert.equal(params.get("removeFromClient"), "true");
     assert.equal(params.get("blocklist"), "true");
     assert.equal(params.get("skipRedownload"), "true");
@@ -65,7 +80,7 @@ test("lidarr_delete_queue_item: DELETE /api/v1/queue/{id} with all params", asyn
     assert.equal(calls.length, 1);
     assert.equal(calls[0].init.method, "DELETE");
     assert.equal(queuePathOf(calls[0].url), "/api/v1/queue/456");
-    const params = new URL(calls[0].url).searchParams;
+    const params = paramsOf(calls[0].url);
     assert.equal(params.get("removeFromClient"), "true");
     assert.equal(params.get("blocklist"), "true");
     assert.equal(params.get("skipRedownload"), "true");
@@ -83,10 +98,10 @@ test("radarr_delete_queue_item: endpoint and legacy options unchanged", async ()
     assert.equal(calls.length, 1);
     assert.equal(calls[0].init.method, "DELETE");
     assert.equal(queuePathOf(calls[0].url), "/api/v3/queue/789");
-    const params = new URL(calls[0].url).searchParams;
+    const params = paramsOf(calls[0].url);
     assert.equal(params.get("removeFromClient"), "true");
     assert.equal(params.get("blocklist"), "true");
-    assert.equal(params.get("skipRedownload"), null);
+    assert.equal(params.get("skipRedownload"), null, "unspecified options stay out of the query");
     assert.equal(params.get("changeCategory"), null);
   } finally {
     restore();
@@ -105,15 +120,74 @@ test("deleteQueueItem: empty options send no query params (client-level defaults
   }
 });
 
-test("deleteQueueItem: false flags are omitted from the query", async () => {
+test("deleteQueueItem: removeFromClient=false is transmitted as false, never omitted", async () => {
+  for (const [name, Client, path] of CLIENTS) {
+    const { calls, restore } = stubFetch();
+    try {
+      const client = new Client({ url: "http://127.0.0.1:2999", apiKey: "test-key" });
+      await client.deleteQueueItem(7, { removeFromClient: false });
+      assert.equal(calls.length, 1, `${name}: exactly one request`);
+      assert.equal(queuePathOf(calls[0].url), `${path}/7`);
+      const params = paramsOf(calls[0].url);
+      assert.equal(
+        params.get("removeFromClient"),
+        "false",
+        `${name}: removeFromClient=false must reach the app as an explicit false; omitting it means the app's true default and deletes the client-side download`,
+      );
+    } finally {
+      restore();
+    }
+  }
+});
+
+test("deleteQueueItem: removeFromClient=true is transmitted as true", async () => {
+  for (const [name, Client] of CLIENTS) {
+    const { calls, restore } = stubFetch();
+    try {
+      const client = new Client({ url: "http://127.0.0.1:2999", apiKey: "test-key" });
+      await client.deleteQueueItem(7, { removeFromClient: true });
+      const params = paramsOf(calls[0].url);
+      assert.equal(params.get("removeFromClient"), "true", `${name}: explicit true must be sent as true`);
+    } finally {
+      restore();
+    }
+  }
+});
+
+test("deleteQueueItem: every supplied option keeps its own value; unspecified ones stay omitted", async () => {
   const { calls, restore } = stubFetch();
   try {
     const client = new RadarrClient({ url: "http://127.0.0.1:2999", apiKey: "test-key" });
-    await client.deleteQueueItem(7, { removeFromClient: false, blocklist: true, skipRedownload: false });
-    const params = new URL(calls[0].url).searchParams;
-    assert.equal(params.get("removeFromClient"), null);
+    await client.deleteQueueItem(7, {
+      removeFromClient: false,
+      blocklist: true,
+      skipRedownload: false,
+      changeCategory: true,
+    });
+    const params = paramsOf(calls[0].url);
+    assert.equal(params.get("removeFromClient"), "false");
     assert.equal(params.get("blocklist"), "true");
-    assert.equal(params.get("skipRedownload"), null);
+    assert.equal(params.get("skipRedownload"), "false");
+    assert.equal(params.get("changeCategory"), "true");
+  } finally {
+    restore();
+  }
+});
+
+test("deleteQueueItem: all-false is transmitted as all-false", async () => {
+  const { calls, restore } = stubFetch();
+  try {
+    const client = new LidarrClient({ url: "http://127.0.0.1:2999", apiKey: "test-key" });
+    await client.deleteQueueItem(7, {
+      removeFromClient: false,
+      blocklist: false,
+      skipRedownload: false,
+      changeCategory: false,
+    });
+    const params = paramsOf(calls[0].url);
+    for (const key of ["removeFromClient", "blocklist", "skipRedownload", "changeCategory"]) {
+      assert.equal(params.get(key), "false", `${key} must be sent as an explicit false`);
+    }
   } finally {
     restore();
   }
@@ -133,7 +207,8 @@ test("request(): empty 204 response body does not throw (queue DELETE shape)", a
 // ---------------------------------------------------------------------------
 // MCP-level tests: run the real server (HTTP transport) against a stub *arr
 // app and call the tools end to end. Verifies tool registration, handler
-// routing to the right client, MCP-level defaults, and param propagation.
+// routing to the right client, MCP-level defaults, param propagation, and that
+// the native request never disagrees with what the MCP response reports.
 // ---------------------------------------------------------------------------
 
 function startStubArrApp() {
@@ -215,7 +290,9 @@ async function callTool(port, name, args) {
   return payload;
 }
 
-test("MCP handlers route to the correct client, apply defaults, propagate params", async () => {
+// Boots the real MCP server against the stub *arr app, runs `fn`, then tears
+// everything down. `requests` records every HTTP call the stub received.
+async function withServer(fn) {
   const port = String(33000 + Math.floor(Math.random() * 1000));
   const { server: stub, requests } = await startStubArrApp();
   const stubBase = `http://127.0.0.1:${stub.address().port}`;
@@ -255,7 +332,22 @@ test("MCP handlers route to the correct client, apply defaults, propagate params
       },
     });
     assert.equal(initResponse.status, 200);
+    await fn(port, requests);
+  } finally {
+    child.kill("SIGTERM");
+    await once(child, "exit").catch(() => {});
+    stub.close();
+  }
 
+  assert.doesNotMatch(stderr, /Fatal error/);
+}
+
+function lastDelete(requests) {
+  return requests.filter((r) => r.method === "DELETE").at(-1);
+}
+
+test("MCP handlers route to the correct client, apply defaults, propagate params", async () => {
+  await withServer(async (port, requests) => {
     const toolsResponse = await postMcp(port, {
       jsonrpc: "2.0",
       id: 2,
@@ -268,18 +360,20 @@ test("MCP handlers route to the correct client, apply defaults, propagate params
       assert.ok(tools.includes(name), `${name} must be registered`);
     }
 
-    // Defaults: only queueId provided → removeFromClient=true, everything else omitted.
+    // Defaults: only queueId provided → removeFromClient=true, the rest false.
+    // The handler passes its explicit defaults through, so the native request
+    // carries all four parameters with exactly the values the response reports.
     const sonarrDefaults = await callTool(port, "sonarr_delete_queue_item", { queueId: 123 });
     assert.deepEqual(
       { removedFromClient: sonarrDefaults.removedFromClient, blocklisted: sonarrDefaults.blocklisted, skipRedownload: sonarrDefaults.skipRedownload, changeCategory: sonarrDefaults.changeCategory },
       { removedFromClient: true, blocklisted: false, skipRedownload: false, changeCategory: false },
     );
-    let deleteReq = requests.find((r) => r.method === "DELETE");
+    let deleteReq = lastDelete(requests);
     assert.equal(deleteReq.path, "/api/v3/queue/123", "sonarr handler must hit the Sonarr (v3) endpoint");
     assert.equal(deleteReq.params.get("removeFromClient"), "true");
-    assert.equal(deleteReq.params.get("blocklist"), null);
-    assert.equal(deleteReq.params.get("skipRedownload"), null);
-    assert.equal(deleteReq.params.get("changeCategory"), null);
+    assert.equal(deleteReq.params.get("blocklist"), "false");
+    assert.equal(deleteReq.params.get("skipRedownload"), "false");
+    assert.equal(deleteReq.params.get("changeCategory"), "false");
 
     // Lidarr handler must hit the Lidarr (v1) endpoint with all params propagated.
     const lidarrResult = await callTool(port, "lidarr_delete_queue_item", {
@@ -289,34 +383,55 @@ test("MCP handlers route to the correct client, apply defaults, propagate params
       { removedFromClient: lidarrResult.removedFromClient, blocklisted: lidarrResult.blocklisted, skipRedownload: lidarrResult.skipRedownload, changeCategory: lidarrResult.changeCategory },
       { removedFromClient: false, blocklisted: true, skipRedownload: true, changeCategory: true },
     );
-    deleteReq = requests.filter((r) => r.method === "DELETE").at(-1);
+    deleteReq = lastDelete(requests);
     assert.equal(deleteReq.path, "/api/v1/queue/123", "lidarr handler must hit the Lidarr (v1) endpoint");
-    assert.equal(deleteReq.params.get("removeFromClient"), null);
+    assert.equal(deleteReq.params.get("removeFromClient"), "false", "the app must receive the false the caller asked for");
     assert.equal(deleteReq.params.get("blocklist"), "true");
     assert.equal(deleteReq.params.get("skipRedownload"), "true");
     assert.equal(deleteReq.params.get("changeCategory"), "true");
 
-    // Radarr keeps working and now forwards the new options.
+    // Radarr keeps working and forwards every option.
     const radarrResult = await callTool(port, "radarr_delete_queue_item", {
       queueId: 123, removeFromClient: true, blocklist: true, skipRedownload: true, changeCategory: false,
     });
     assert.equal(radarrResult.blocklisted, true);
     assert.equal(radarrResult.skipRedownload, true);
-    deleteReq = requests.filter((r) => r.method === "DELETE").at(-1);
+    deleteReq = lastDelete(requests);
     assert.equal(deleteReq.path, "/api/v3/queue/123", "radarr handler must hit the Radarr (v3) endpoint");
     assert.equal(deleteReq.params.get("removeFromClient"), "true");
     assert.equal(deleteReq.params.get("blocklist"), "true");
     assert.equal(deleteReq.params.get("skipRedownload"), "true");
-    assert.equal(deleteReq.params.get("changeCategory"), null);
+    assert.equal(deleteReq.params.get("changeCategory"), "false");
 
     // No API keys leak into the MCP tool responses.
     const allText = JSON.stringify([sonarrDefaults, lidarrResult, radarrResult]);
     assert.doesNotMatch(allText, /sonarr-key|radarr-key|lidarr-key/);
-  } finally {
-    child.kill("SIGTERM");
-    await once(child, "exit").catch(() => {});
-    stub.close();
-  }
+  });
+});
 
-  assert.doesNotMatch(stderr, /Fatal error/);
+test("MCP removeFromClient=false reaches the native app end to end (lidarr)", async () => {
+  await withServer(async (port, requests) => {
+    const result = await callTool(port, "lidarr_delete_queue_item", {
+      queueId: 123,
+      removeFromClient: false,
+      blocklist: true,
+    });
+
+    // The MCP response says what the caller asked for…
+    assert.deepEqual(
+      { removedFromClient: result.removedFromClient, blocklisted: result.blocklisted },
+      { removedFromClient: false, blocklisted: true },
+    );
+
+    // …and the native HTTP request agrees with it.
+    const deleteReq = lastDelete(requests);
+    assert.equal(deleteReq.method, "DELETE");
+    assert.equal(deleteReq.path, "/api/v1/queue/123");
+    assert.equal(deleteReq.params.get("removeFromClient"), "false");
+    assert.equal(deleteReq.params.get("blocklist"), "true");
+
+    // Response and request cannot disagree on any reported flag.
+    assert.equal(deleteReq.params.get("skipRedownload"), String(result.skipRedownload));
+    assert.equal(deleteReq.params.get("changeCategory"), String(result.changeCategory));
+  });
 });
