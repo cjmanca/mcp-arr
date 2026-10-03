@@ -274,6 +274,8 @@ The existing service-specific tools remain available for richer local or power-u
 | `arr_search_all` | Search across all configured services simultaneously |
 | `search` | Generic discovery tool for remote MCP clients such as ChatGPT |
 | `fetch` | Generic detail-fetch tool for items returned by `search` |
+| `arr_get_operation` | Poll a long-running preview by its `operationId` (running / completed / failed / timed_out / cancelled) |
+| `arr_cancel_operation` | Cancel a running preview operation by its `operationId` |
 
 ### Sonarr Tools (TV)
 
@@ -287,7 +289,7 @@ The existing service-specific tools remain available for richer local or power-u
 | `sonarr_get_queue` | View current download queue with `limit` and `offset` pagination|
 | `sonarr_delete_queue_item` | Remove a queue item; `removeFromClient` (default true), `blocklist`, `skipRedownload`, `changeCategory` |
 | `sonarr_get_manual_import_candidates` | List Sonarr's native manual-import candidates for a `downloadId` (read-only, no paths accepted) |
-| `sonarr_preview_manual_import` | Reprocess candidate mappings via Sonarr's native endpoint **without importing**; shows recalculated episodes and rejections; unmapped candidates return `mappingRequired` (never sent with a 0 `seriesId`) |
+| `sonarr_preview_manual_import` | Reprocess candidate mappings via Sonarr's native endpoint **without importing**; shows recalculated episodes and rejections; unmapped candidates return `mappingRequired` (never sent with a 0 `seriesId`); a slow preview returns a pollable `operationId` handle |
 | `sonarr_execute_manual_import` | Queue Sonarr's native `ManualImport` command; explicit `importMode` (default `auto`), per-item `allowRejected=true` to override that candidate's rejections |
 | `sonarr_get_calendar` | See upcoming episodes |
 | `sonarr_get_episodes` | List episodes for a series (shows missing vs available) |
@@ -311,7 +313,7 @@ The existing service-specific tools remain available for richer local or power-u
 | `radarr_update_movie` | Update a movie's quality profile, monitored status, minimum availability, tags, or path |
 | `radarr_delete_queue_item` | Remove a queue item; `removeFromClient` (default true), `blocklist`, `skipRedownload`, `changeCategory` |
 | `radarr_get_manual_import_candidates` | List Radarr's native manual-import candidates for a `downloadId` (read-only, no paths accepted) |
-| `radarr_preview_manual_import` | Reprocess candidate mappings via Radarr's native endpoint **without importing**; shows recalculated movie mapping and rejections; unmapped candidates return `mappingRequired` (never sent with a 0 `movieId`) |
+| `radarr_preview_manual_import` | Reprocess candidate mappings via Radarr's native endpoint **without importing**; shows recalculated movie mapping and rejections; unmapped candidates return `mappingRequired` (never sent with a 0 `movieId`); a slow preview returns a pollable `operationId` handle |
 | `radarr_execute_manual_import` | Queue Radarr's native `ManualImport` command; explicit `importMode` (default `auto`), per-item `allowRejected=true` to override that candidate's rejections |
 | `radarr_refresh_movie` | Trigger a metadata refresh for a specific movie in Radarr |
 
@@ -328,7 +330,7 @@ The existing service-specific tools remain available for richer local or power-u
 | `lidarr_get_queue` | View current download queue with `limit` and `offset` pagination |
 | `lidarr_delete_queue_item` | Remove a queue item; `removeFromClient` (default true), `blocklist`, `skipRedownload`, `changeCategory` |
 | `lidarr_get_manual_import_candidates` | List Lidarr's native manual-import candidates for a `downloadId` (read-only, no paths accepted) |
-| `lidarr_preview_manual_import` | Reprocess candidate mappings via Lidarr's native update endpoint **without importing**; Lidarr recomputes track mappings server-side; explicit `trackIds` are validated against the selected album release and preserved (`tracksSource` shows which mapping will import); overrides follow the native hierarchy artist → album → album release → tracks (a parent change clears inherited children — `mappingOverridesApplied`), and explicit `albumId`/`albumReleaseId` are validated against the album's native artist/release membership (`relationshipValidation`); an explicit `albumReleaseId` defaults `disableReleaseSwitching` to true (native UI behavior) |
+| `lidarr_preview_manual_import` | Reprocess candidate mappings via Lidarr's native update endpoint **without importing**; Lidarr recomputes track mappings server-side; explicit `trackIds` are validated against the selected album release and preserved (`tracksSource` shows which mapping will import); overrides follow the native hierarchy artist → album → album release → tracks (a parent change clears inherited children — `mappingOverridesApplied`), and explicit `albumId`/`albumReleaseId` are validated against the album's native artist/release membership (`relationshipValidation`); an explicit `albumReleaseId` defaults `disableReleaseSwitching` to true (native UI behavior); a slow preview returns a pollable `operationId` handle |
 | `lidarr_execute_manual_import` | Queue Lidarr's native `ManualImport` command; explicit `importMode` (default `auto`) and `replaceExistingFiles` (default `false`), per-item `allowRejected=true` to override that candidate's rejections; explicit `trackIds` overrides survive into the command; hierarchy violations (stale children, cross-artist albums, cross-album releases) are refused before any request |
 | `lidarr_get_albums` | List albums for an artist (shows missing vs available) |
 | `lidarr_search_album` | Trigger search for a specific album |
@@ -407,6 +409,7 @@ When Sonarr/Radarr/Lidarr finish a download but cannot import it automatically �
 **Behavioral rules.**
 
 - `preview` is **non-importing** — it never moves, copies, or imports files.
+- `preview` normally returns its result directly. If the app's native analysis runs longer than a short response budget (most often Lidarr), it returns a `running` handle with an `operationId` and a `pollAfterMs` interval; poll `arr_get_operation` with that id (it returns the exact preview result once `completed`) instead of starting a duplicate preview. `arr_cancel_operation` stops a running preview. Identical previews started while one is running are deduplicated to the same `operationId`.
 - `execute` always sends `importMode` explicitly; the default is `auto`, matching the queue-driven Interactive Import behavior of the *arr UIs.
 - Candidates with remaining native rejections are **refused** unless **that item** sets `allowRejected=true`. Authorization is per candidate: in a multi-file release you can force-import file B despite its rejection while file A (rejected, not authorized) stays blocked — the whole command is refused while any blocked candidate remains. The server never decides that a specific rejection (e.g. the sample check) is safe — the agent/human reviews the rejections from the preview and opts in explicitly. Overridden rejections are reported in the response for auditability.
 - Candidates with **no valid entity mapping** (Sonarr series / Radarr movie) are reported as `mappingRequired` with `canPreview: false` and are **never sent to the native reprocess endpoint** — Sonarr/Radarr resolve the supplied id server-side and throw for unknown ids, so a fabricated `0` is never submitted. Supply a real `seriesId`/`movieId` override (found via `sonarr_get_series` / `radarr_get_movies`) first.

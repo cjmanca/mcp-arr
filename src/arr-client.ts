@@ -5,6 +5,8 @@
  * the same REST API pattern with X-Api-Key header authentication.
  */
 
+import { arrApiTimeoutMs, manualImportApiTimeoutMs } from "./config.js";
+
 export type ArrService = 'sonarr' | 'radarr' | 'lidarr' | 'prowlarr';
 
 export interface ArrConfig {
@@ -736,9 +738,20 @@ export class ArrClient {
   }
 
   /**
-   * Make an API request
+   * Make an API request.
+   *
+   * Every request is abortable on three independent axes, composed into a
+   * single signal handed to `fetch()`:
+   *   - a per-request timeout (`timeoutMs`, default `ARR_API_TIMEOUT_MS`) so a
+   *     hung native endpoint cannot stay pending forever;
+   *   - a caller-supplied `options.signal` (an operation's AbortController), so
+   *     cancelling a preview aborts the in-flight request;
+   *   - the caller's own abort reason is preserved when it fires.
+   *
+   * `AbortSignal.any()` is Node 20+, and this package supports Node 18, so the
+   * signals are composed manually with a small listener bridge.
    */
-  protected async request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+  protected async request<T>(endpoint: string, options: RequestInit = {}, timeoutMs?: number): Promise<T> {
     const url = `${this.config.url}/api/${this.apiVersion}${endpoint}`;
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
@@ -746,27 +759,60 @@ export class ArrClient {
       ...(options.headers as Record<string, string> || {}),
     };
 
-    const response = await fetch(url, {
-      ...options,
-      headers,
-    });
+    const effectiveTimeout = timeoutMs ?? arrApiTimeoutMs();
+    const controller = new AbortController();
+    const callerSignal = options.signal ?? undefined;
 
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`${this.serviceName} API error: ${response.status} ${response.statusText} - ${text}`);
+    let timedOut = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    if (effectiveTimeout > 0) {
+      timer = setTimeout(() => {
+        timedOut = true;
+        controller.abort(new Error(`${this.serviceName} request timed out after ${effectiveTimeout}ms: ${endpoint}`));
+      }, effectiveTimeout);
     }
 
-    // Endpoints such as the queue DELETE return 200/204 with an empty body;
-    // response.json() would throw on those, so return undefined for them.
-    const contentLength = response.headers.get('content-length');
-    if (response.status === 204 || contentLength === '0') {
-      return undefined as T;
+    const onCallerAbort = () => controller.abort(callerSignal?.reason);
+    if (callerSignal) {
+      if (callerSignal.aborted) controller.abort(callerSignal.reason);
+      else callerSignal.addEventListener("abort", onCallerAbort, { once: true });
     }
-    const body = await response.text();
-    if (body.length === 0) {
-      return undefined as T;
+
+    try {
+      const response = await fetch(url, {
+        ...options,
+        headers,
+        signal: controller.signal,
+      });
+
+      if (!response.ok) {
+        const text = await response.text();
+        throw new Error(`${this.serviceName} API error: ${response.status} ${response.statusText} - ${text}`);
+      }
+
+      // Endpoints such as the queue DELETE return 200/204 with an empty body;
+      // response.json() would throw on those, so return undefined for them.
+      const contentLength = response.headers.get('content-length');
+      if (response.status === 204 || contentLength === '0') {
+        return undefined as T;
+      }
+      const body = await response.text();
+      if (body.length === 0) {
+        return undefined as T;
+      }
+      return JSON.parse(body) as T;
+    } catch (error) {
+      // A per-request timeout aborts the fetch with a generic AbortError;
+      // surface the timeout explicitly so callers can distinguish it from a
+      // caller-initiated cancellation.
+      if (timedOut) {
+        throw new Error(`${this.serviceName} request timed out after ${effectiveTimeout}ms: ${endpoint}`);
+      }
+      throw error;
+    } finally {
+      if (timer) clearTimeout(timer);
+      if (callerSignal) callerSignal.removeEventListener("abort", onCallerAbort);
     }
-    return JSON.parse(body) as T;
   }
 
   /**
@@ -779,14 +825,14 @@ export class ArrClient {
   /**
    * Get download queue
    */
-  async getQueue(page = 1, pageSize = 100): Promise<{ records: QueueItem[]; totalRecords: number }> {
+  async getQueue(page = 1, pageSize = 100, signal?: AbortSignal): Promise<{ records: QueueItem[]; totalRecords: number }> {
     const params = new URLSearchParams({
       includeUnknownSeriesItems: "true",
       includeUnknownMovieItems: "true",
       page: String(page),
       pageSize: String(pageSize),
     });
-    return this.request<{ records: QueueItem[]; totalRecords: number }>(`/queue?${params.toString()}`);
+    return this.request<{ records: QueueItem[]; totalRecords: number }>(`/queue?${params.toString()}`, { signal });
   }
 
   /**
@@ -856,8 +902,8 @@ export class ArrClient {
   /**
    * Get quality profiles
    */
-  async getQualityProfiles(): Promise<QualityProfile[]> {
-    return this.request<QualityProfile[]>('/qualityprofile');
+  async getQualityProfiles(signal?: AbortSignal): Promise<QualityProfile[]> {
+    return this.request<QualityProfile[]>('/qualityprofile', { signal });
   }
 
   /**
@@ -934,8 +980,8 @@ export class SonarrClient extends ArrClient {
   /**
    * Get a specific series
    */
-  async getSeriesById(id: number): Promise<Series> {
-    return this['request']<Series>(`/series/${id}`);
+  async getSeriesById(id: number, signal?: AbortSignal): Promise<Series> {
+    return this['request']<Series>(`/series/${id}`, { signal });
   }
 
   /**
@@ -1022,12 +1068,12 @@ export class SonarrClient extends ArrClient {
     seriesId?: number;
     seasonNumber?: number;
     filterExistingFiles?: boolean;
-  }): Promise<SonarrManualImportCandidate[]> {
+  }, signal?: AbortSignal): Promise<SonarrManualImportCandidate[]> {
     const query = new URLSearchParams({ downloadId: params.downloadId });
     if (params.seriesId !== undefined) query.append('seriesId', String(params.seriesId));
     if (params.seasonNumber !== undefined) query.append('seasonNumber', String(params.seasonNumber));
     if (params.filterExistingFiles !== undefined) query.append('filterExistingFiles', String(params.filterExistingFiles));
-    return this['request']<SonarrManualImportCandidate[]>(`/manualimport?${query.toString()}`);
+    return this['request']<SonarrManualImportCandidate[]>(`/manualimport?${query.toString()}`, { signal }, manualImportApiTimeoutMs());
   }
 
   /**
@@ -1035,27 +1081,28 @@ export class SonarrClient extends ArrClient {
    * (POST /api/v3/manualimport). Returns the same items with Sonarr's
    * recalculated season/episode mapping, quality, languages and rejections.
    */
-  async reprocessManualImport(items: SonarrManualImportReprocessItem[]): Promise<SonarrManualImportCandidate[]> {
+  async reprocessManualImport(items: SonarrManualImportReprocessItem[], signal?: AbortSignal): Promise<SonarrManualImportCandidate[]> {
     return this['request']<SonarrManualImportCandidate[]>('/manualimport', {
       method: 'POST',
       body: JSON.stringify(items),
-    });
+      signal,
+    }, manualImportApiTimeoutMs());
   }
 
   /**
    * Get episodes for a season (GET /api/v3/episode?seriesId=&seasonNumber=).
    * Each episode carries `episodeFileId` — the join key to `getEpisodeFiles`.
    */
-  async getEpisodesWithFiles(seriesId: number, seasonNumber: number): Promise<SonarrEpisodeWithFile[]> {
-    return this['request']<SonarrEpisodeWithFile[]>(`/episode?seriesId=${seriesId}&seasonNumber=${seasonNumber}`);
+  async getEpisodesWithFiles(seriesId: number, seasonNumber: number, signal?: AbortSignal): Promise<SonarrEpisodeWithFile[]> {
+    return this['request']<SonarrEpisodeWithFile[]>(`/episode?seriesId=${seriesId}&seasonNumber=${seasonNumber}`, { signal });
   }
 
   /**
    * Get all episode files for a series (GET /api/v3/episodefile?seriesId=…).
    * The file list has no episode linkage; join via episode.episodeFileId.
    */
-  async getEpisodeFiles(seriesId: number): Promise<SonarrEpisodeFile[]> {
-    return this['request']<SonarrEpisodeFile[]>(`/episodefile?seriesId=${seriesId}`);
+  async getEpisodeFiles(seriesId: number, signal?: AbortSignal): Promise<SonarrEpisodeFile[]> {
+    return this['request']<SonarrEpisodeFile[]>(`/episodefile?seriesId=${seriesId}`, { signal });
   }
 
   /**
@@ -1089,8 +1136,8 @@ export class RadarrClient extends ArrClient {
   /**
    * Get a specific movie
    */
-  async getMovieById(id: number): Promise<Movie> {
-    return this['request']<Movie>(`/movie/${id}`);
+  async getMovieById(id: number, signal?: AbortSignal): Promise<Movie> {
+    return this['request']<Movie>(`/movie/${id}`, { signal });
   }
 
   /**
@@ -1174,11 +1221,11 @@ export class RadarrClient extends ArrClient {
     downloadId: string;
     movieId?: number;
     filterExistingFiles?: boolean;
-  }): Promise<RadarrManualImportCandidate[]> {
+  }, signal?: AbortSignal): Promise<RadarrManualImportCandidate[]> {
     const query = new URLSearchParams({ downloadId: params.downloadId });
     if (params.movieId !== undefined) query.append('movieId', String(params.movieId));
     if (params.filterExistingFiles !== undefined) query.append('filterExistingFiles', String(params.filterExistingFiles));
-    return this['request']<RadarrManualImportCandidate[]>(`/manualimport?${query.toString()}`);
+    return this['request']<RadarrManualImportCandidate[]>(`/manualimport?${query.toString()}`, { signal }, manualImportApiTimeoutMs());
   }
 
   /**
@@ -1186,11 +1233,12 @@ export class RadarrClient extends ArrClient {
    * (POST /api/v3/manualimport). Returns the same items with Radarr's
    * recalculated movie mapping, quality, languages and rejections.
    */
-  async reprocessManualImport(items: RadarrManualImportReprocessItem[]): Promise<RadarrManualImportCandidate[]> {
+  async reprocessManualImport(items: RadarrManualImportReprocessItem[], signal?: AbortSignal): Promise<RadarrManualImportCandidate[]> {
     return this['request']<RadarrManualImportCandidate[]>('/manualimport', {
       method: 'POST',
       body: JSON.stringify(items),
-    });
+      signal,
+    }, manualImportApiTimeoutMs());
   }
 
   /**
@@ -1263,8 +1311,8 @@ export class LidarrClient extends ArrClient {
   /**
    * Get a specific album
    */
-  async getAlbumById(id: number): Promise<Album> {
-    return this['request']<Album>(`/album/${id}`);
+  async getAlbumById(id: number, signal?: AbortSignal): Promise<Album> {
+    return this['request']<Album>(`/album/${id}`, { signal });
   }
 
   /**
@@ -1322,12 +1370,12 @@ export class LidarrClient extends ArrClient {
     artistId?: number;
     filterExistingFiles?: boolean;
     replaceExistingFiles?: boolean;
-  }): Promise<LidarrManualImportCandidate[]> {
+  }, signal?: AbortSignal): Promise<LidarrManualImportCandidate[]> {
     const query = new URLSearchParams({ downloadId: params.downloadId });
     if (params.artistId !== undefined) query.append('artistId', String(params.artistId));
     if (params.filterExistingFiles !== undefined) query.append('filterExistingFiles', String(params.filterExistingFiles));
     if (params.replaceExistingFiles !== undefined) query.append('replaceExistingFiles', String(params.replaceExistingFiles));
-    return this['request']<LidarrManualImportCandidate[]>(`/manualimport?${query.toString()}`);
+    return this['request']<LidarrManualImportCandidate[]>(`/manualimport?${query.toString()}`, { signal }, manualImportApiTimeoutMs());
   }
 
   /**
@@ -1340,11 +1388,12 @@ export class LidarrClient extends ArrClient {
    * mapping; an explicit caller track override is applied separately (see
    * `getTracks` for validation).
    */
-  async updateManualImport(items: LidarrManualImportUpdateItem[]): Promise<LidarrManualImportCandidate[]> {
+  async updateManualImport(items: LidarrManualImportUpdateItem[], signal?: AbortSignal): Promise<LidarrManualImportCandidate[]> {
     return this['request']<LidarrManualImportCandidate[]>('/manualimport', {
       method: 'POST',
       body: JSON.stringify(items),
-    });
+      signal,
+    }, manualImportApiTimeoutMs());
   }
 
   /**
@@ -1354,11 +1403,11 @@ export class LidarrClient extends ArrClient {
    * the ManualImport command — mirroring the native Interactive Import track
    * selector, which fetches the selectable tracks with the albumReleaseId.
    */
-  async getTracks(params: { albumReleaseId?: number; albumId?: number }): Promise<LidarrTrack[]> {
+  async getTracks(params: { albumReleaseId?: number; albumId?: number }, signal?: AbortSignal): Promise<LidarrTrack[]> {
     const query = new URLSearchParams();
     if (params.albumReleaseId !== undefined) query.append('albumReleaseId', String(params.albumReleaseId));
     if (params.albumId !== undefined) query.append('albumId', String(params.albumId));
-    return this['request']<LidarrTrack[]>(`/track?${query.toString()}`);
+    return this['request']<LidarrTrack[]>(`/track?${query.toString()}`, { signal }, manualImportApiTimeoutMs());
   }
 
   /**

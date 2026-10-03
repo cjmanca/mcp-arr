@@ -52,6 +52,28 @@ import type {
   LidarrTrack,
 } from "./arr-client.js";
 import { trashClient, TrashService } from "./trash-client.js";
+import {
+  previewOperations,
+  kindLabel,
+  type PreviewExecutionContext,
+  type PreviewOperation,
+  type PreviewOperationKind,
+} from "./preview-operations.js";
+import {
+  previewSyncBudgetMs,
+  operationPollIntervalMs,
+} from "./config.js";
+
+/**
+ * A context for the synchronous (non-async-wrapped) execute path: a signal that
+ * is never aborted (so only the per-request API timeouts apply) and a no-op
+ * stage reporter. Execute is deliberately NOT registered as a preview
+ * operation — it is destructive and revalidates from native state on every
+ * call, so it must stay independent of the preview registry.
+ */
+function standaloneContext(): PreviewExecutionContext {
+  return { signal: new AbortController().signal, setStage: () => {} };
+}
 
 // Read from package.json rather than hardcoding, so the version reported to
 // clients can never drift from the released version. package.json sits at the
@@ -135,6 +157,28 @@ const TOOLS: Tool[] = [
       type: "object" as const,
       properties: {},
       required: [],
+    },
+  },
+  {
+    name: "arr_get_operation",
+    description: "Poll a long-running preview operation by operationId. A *_preview_manual_import that outlives the synchronous response budget returns a running handle with an operationId; poll this tool at the handle's pollAfterMs. Statuses: running (stage + pollAfterMs), completed (the exact normal preview result), failed (error), timed_out (preview exceeded its operation deadline), cancelled. An unknown/expired id returns status expired-or-unknown. Operations live only in this running mcp-arr process.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        operationId: { type: "string", description: "The operationId from a *_preview_manual_import running handle" },
+      },
+      required: ["operationId"],
+    },
+  },
+  {
+    name: "arr_cancel_operation",
+    description: "Cancel a running preview operation by operationId (e.g. you previewed the wrong candidates). Applies only to operations owned by this running mcp-arr process. A running operation is aborted and marked cancelled; a completed/failed/timed_out/cancelled operation keeps its terminal status unchanged; an unknown id returns expired-or-unknown. Aborting stops mcp-arr waiting and aborts the in-flight API request, but cannot guarantee the app stops CPU-side work already in progress.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        operationId: { type: "string", description: "The operationId from a *_preview_manual_import running handle" },
+      },
+      required: ["operationId"],
     },
   },
   {
@@ -361,7 +405,7 @@ if (clients.sonarr) {
     },
     {
       name: "sonarr_preview_manual_import",
-      description: "Preview (reprocess) a manual import in Sonarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (seriesId/seasonNumber/episodeIds/releaseGroup), sends Sonarr's native manual-import reprocess request, and returns Sonarr's recalculated mapping, quality, languages and rejections. Candidates with no valid series mapping (and no seriesId override) are returned as mappingRequired/canPreview=false and are never sent to Sonarr — a 0 seriesId is never submitted, because Sonarr's reprocess resolves the series and throws for unknown ids. Overrides follow the native hierarchy series -> season -> episodes: a seriesId override clears the inherited seasonNumber and episodes, and a seasonNumber override clears the inherited episodes, so supply the full corrected selection rather than only the parent. Explicit episodeIds are validated against GET /api/v3/episode?seriesId=&seasonNumber= and reported in episodeValidation. The reported series is the EFFECTIVE series (its real id and title), never the original candidate's title under an overridden id. Use this to fix unparseable filenames or wrong episode mappings and inspect the result; then run sonarr_execute_manual_import with the same overrides. Non-destructive: never moves, copies, or imports files. The preview's upgradeAssessment merges the tracked release's queue custom-format context with the file's own CF context (deduplicated by custom-format id, scored against the effective series' quality profile) to assess the pending candidate against existing files — a per-file CF rejection that the release-level evidence contradicts is reported as cf-upgrade-with-native-rejection, not a hard do-not-import, and a release-only negative CF that the per-file evaluation cannot see is reported as cf-downgrade-despite-native-acceptance even when Sonarr raised no rejection. Quality/revision/already-imported rejections are always hard not-an-upgrade refusals. When release-level CF provenance is relevant but cannot be evaluated safely (invalid/unresolvable attribution, effective-series mismatch, or a season pack with no queue context), the verdict is cf-assessment-ambiguous rather than an acceptance, so 'no-upgrade-rejection' never overstates certainty.",
+      description: "Preview (reprocess) a manual import in Sonarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (seriesId/seasonNumber/episodeIds/releaseGroup), sends Sonarr's native manual-import reprocess request, and returns Sonarr's recalculated mapping, quality, languages and rejections. Candidates with no valid series mapping (and no seriesId override) are returned as mappingRequired/canPreview=false and are never sent to Sonarr — a 0 seriesId is never submitted, because Sonarr's reprocess resolves the series and throws for unknown ids. Overrides follow the native hierarchy series -> season -> episodes: a seriesId override clears the inherited seasonNumber and episodes, and a seasonNumber override clears the inherited episodes, so supply the full corrected selection rather than only the parent. Explicit episodeIds are validated against GET /api/v3/episode?seriesId=&seasonNumber= and reported in episodeValidation. The reported series is the EFFECTIVE series (its real id and title), never the original candidate's title under an overridden id. Use this to fix unparseable filenames or wrong episode mappings and inspect the result; then run sonarr_execute_manual_import with the same overrides. Non-destructive: never moves, copies, or imports files. Normally returns the result directly; if native analysis takes longer than the synchronous response budget, it returns a running operationId handle instead — poll arr_get_operation at the indicated interval rather than starting a duplicate preview. The preview's upgradeAssessment merges the tracked release's queue custom-format context with the file's own CF context (deduplicated by custom-format id, scored against the effective series' quality profile) to assess the pending candidate against existing files — a per-file CF rejection that the release-level evidence contradicts is reported as cf-upgrade-with-native-rejection, not a hard do-not-import, and a release-only negative CF that the per-file evaluation cannot see is reported as cf-downgrade-despite-native-acceptance even when Sonarr raised no rejection. Quality/revision/already-imported rejections are always hard not-an-upgrade refusals. When release-level CF provenance is relevant but cannot be evaluated safely (invalid/unresolvable attribution, effective-series mismatch, or a season pack with no queue context), the verdict is cf-assessment-ambiguous rather than an acceptance, so 'no-upgrade-rejection' never overstates certainty.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -807,7 +851,7 @@ if (clients.radarr) {
     },
     {
       name: "radarr_preview_manual_import",
-      description: "Preview (reprocess) a manual import in Radarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (movieId/releaseGroup), sends Radarr's native manual-import reprocess request, and returns Radarr's recalculated mapping, quality, languages and rejections. Candidates with no valid movie mapping (and no movieId override) are returned as mappingRequired/canPreview=false and are never sent to Radarr — a 0 movieId is never submitted, because Radarr's reprocess resolves the movie and throws for unknown ids. Use this to fix unparseable filenames or wrong movie mappings and inspect the result; then run radarr_execute_manual_import with the same overrides. Non-destructive: never moves, copies, or imports files.",
+      description: "Preview (reprocess) a manual import in Radarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (movieId/releaseGroup), sends Radarr's native manual-import reprocess request, and returns Radarr's recalculated mapping, quality, languages and rejections. Candidates with no valid movie mapping (and no movieId override) are returned as mappingRequired/canPreview=false and are never sent to Radarr — a 0 movieId is never submitted, because Radarr's reprocess resolves the movie and throws for unknown ids. Use this to fix unparseable filenames or wrong movie mappings and inspect the result; then run radarr_execute_manual_import with the same overrides. Non-destructive: never moves, copies, or imports files. Normally returns the result directly; if native analysis takes longer than the synchronous response budget, it returns a running operationId handle instead — poll arr_get_operation at the indicated interval rather than starting a duplicate preview.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -1129,7 +1173,7 @@ if (clients.lidarr) {
     },
     {
       name: "lidarr_preview_manual_import",
-      description: "Preview (update/reprocess) a manual import in Lidarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (artistId/albumId/albumReleaseId/trackIds/disableReleaseSwitching), sends Lidarr's native POST /manualimport update, and returns the resulting mapping and rejections. IMPORTANT Lidarr semantics: the backend re-runs its import decision with the artist/album/release overrides and RECOMPUTES the track mapping itself — the native update endpoint drops the resource's Tracks/TrackIds when building the item. Supplied trackIds are validated against the selected album release's track list (GET /track?albumReleaseId=…) and PRESERVED: the preview response shows exactly the tracks that lidarr_execute_manual_import will import (tracksSource marks caller-override vs lidarr-recomputed). The mapping is a hierarchy artist → album → album release → tracks: an artistId override clears the inherited album/release/tracks, an albumId override clears the inherited release/tracks, an albumReleaseId override clears the inherited tracks (native Interactive Import behavior — the native reprocess resolves supplied ids with precedence AlbumRelease > Album > Artist and NO ownership check, so the MCP clears dependents and validates explicit overrides: albumId→artist via GET /album/{id}.artistId, albumReleaseId→album via GET /album/{id} and that album's embedded releases[], trackIds→release via GET /track?albumReleaseId=). Items whose explicit ids break the hierarchy are reported with canPreview=false and are NOT sent to the native reprocess (Lidarr throws on the lookup first). mappingOverridesApplied reports which inherited children a parent change cleared; dependencyProblems/relationshipValidation report a broken hierarchy. An explicit albumReleaseId defaults disableReleaseSwitching to true (native UI; persists as album.AnyReleaseOk=false on import) — set it false explicitly to keep automatic release selection. Non-destructive: never moves, copies, or imports files.",
+      description: "Preview (update/reprocess) a manual import in Lidarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (artistId/albumId/albumReleaseId/trackIds/disableReleaseSwitching), sends Lidarr's native POST /manualimport update, and returns the resulting mapping and rejections. IMPORTANT Lidarr semantics: the backend re-runs its import decision with the artist/album/release overrides and RECOMPUTES the track mapping itself — the native update endpoint drops the resource's Tracks/TrackIds when building the item. Supplied trackIds are validated against the selected album release's track list (GET /track?albumReleaseId=…) and PRESERVED: the preview response shows exactly the tracks that lidarr_execute_manual_import will import (tracksSource marks caller-override vs lidarr-recomputed). The mapping is a hierarchy artist → album → album release → tracks: an artistId override clears the inherited album/release/tracks, an albumId override clears the inherited release/tracks, an albumReleaseId override clears the inherited tracks (native Interactive Import behavior — the native reprocess resolves supplied ids with precedence AlbumRelease > Album > Artist and NO ownership check, so the MCP clears dependents and validates explicit overrides: albumId→artist via GET /album/{id}.artistId, albumReleaseId→album via GET /album/{id} and that album's embedded releases[], trackIds→release via GET /track?albumReleaseId=). Items whose explicit ids break the hierarchy are reported with canPreview=false and are NOT sent to the native reprocess (Lidarr throws on the lookup first). mappingOverridesApplied reports which inherited children a parent change cleared; dependencyProblems/relationshipValidation report a broken hierarchy. An explicit albumReleaseId defaults disableReleaseSwitching to true (native UI; persists as album.AnyReleaseOk=false on import) — set it false explicitly to keep automatic release selection. Non-destructive: never moves, copies, or imports files. Normally returns the result directly; if native analysis takes longer than the synchronous response budget, it returns a running operationId handle instead — poll arr_get_operation at the indicated interval rather than starting a duplicate preview.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -2195,11 +2239,12 @@ async function getSonarrSeasonEpisodes(
   seriesId: number,
   seasonNumber: number,
   cache: Map<string, SonarrEpisodeWithFile[]>,
+  ctx: PreviewExecutionContext,
 ): Promise<SonarrEpisodeWithFile[]> {
   const key = `${seriesId}:${seasonNumber}`;
   const cached = cache.get(key);
   if (cached) return cached;
-  const episodes = await client.getEpisodesWithFiles(seriesId, seasonNumber);
+  const episodes = await client.getEpisodesWithFiles(seriesId, seasonNumber, ctx.signal);
   cache.set(key, episodes);
   return episodes;
 }
@@ -2215,11 +2260,12 @@ async function joinSonarrSeasonEpisodeFiles(
   seasonNumber: number,
   episodeCache: Map<string, SonarrEpisodeWithFile[]>,
   fileCache: Map<number, SonarrEpisodeFile[]>,
+  ctx: PreviewExecutionContext,
 ): Promise<Array<SonarrEpisodeWithFile & { _file?: SonarrEpisodeFile }>> {
-  const episodes = await getSonarrSeasonEpisodes(client, seriesId, seasonNumber, episodeCache);
+  const episodes = await getSonarrSeasonEpisodes(client, seriesId, seasonNumber, episodeCache, ctx);
 
   const cachedFiles = fileCache.get(seriesId);
-  const files = cachedFiles ?? await client.getEpisodeFiles(seriesId);
+  const files = cachedFiles ?? await client.getEpisodeFiles(seriesId, ctx.signal);
   if (!cachedFiles) fileCache.set(seriesId, files);
 
   const fileById = new Map(files.map((f) => [f.id, f]));
@@ -2241,6 +2287,7 @@ async function validateSonarrEpisodeIds(
   mapping: SonarrEffectiveMapping,
   callerSupplied: boolean,
   cache: Map<string, SonarrEpisodeWithFile[]>,
+  ctx: PreviewExecutionContext,
 ): Promise<Record<string, unknown>> {
   const { seriesId, seasonNumber, episodeIds } = mapping;
   const base = {
@@ -2265,7 +2312,7 @@ async function validateSonarrEpisodeIds(
     };
   }
 
-  const seasonEpisodes = await getSonarrSeasonEpisodes(client, seriesId, season, cache);
+  const seasonEpisodes = await getSonarrSeasonEpisodes(client, seriesId, season, cache, ctx);
   const knownIds = new Set(seasonEpisodes.map((e) => e.id));
   const unknownEpisodeIds = episodeIds.filter((id) => !knownIds.has(id));
 
@@ -2297,6 +2344,7 @@ async function sonarrEffectiveSeries(
   seriesId: number,
   candidate: SonarrManualImportCandidate,
   cache: Map<number, { id: number; title: string | null }>,
+  ctx: PreviewExecutionContext,
 ): Promise<{ id: number; title: string | null }> {
   if (seriesId <= 0) return { id: seriesId, title: null };
 
@@ -2309,7 +2357,7 @@ async function sonarrEffectiveSeries(
 
   let resolved: { id: number; title: string | null };
   try {
-    const series = await client.getSeriesById(seriesId);
+    const series = await client.getSeriesById(seriesId, ctx.signal);
     resolved = { id: seriesId, title: series?.title ?? null };
   } catch {
     resolved = { id: seriesId, title: null };
@@ -2335,13 +2383,13 @@ interface SonarrReleaseContext {
   reason: string | null;
 }
 
-async function findSonarrReleaseContext(client: SonarrClient, downloadId: string): Promise<SonarrReleaseContext> {
+async function findSonarrReleaseContext(client: SonarrClient, downloadId: string, ctx: PreviewExecutionContext): Promise<SonarrReleaseContext> {
   const pageSize = 100;
   let page = 1;
   while (true) {
     let queue: { records: QueueItem[]; totalRecords: number };
     try {
-      queue = await client.getQueue(page, pageSize);
+      queue = await client.getQueue(page, pageSize, ctx.signal);
     } catch {
       return { available: false, title: null, customFormats: [], nativeScore: null, seriesId: null, reason: "queue-unavailable" };
     }
@@ -2377,14 +2425,15 @@ async function resolveSonarrProfileCFScores(
   client: SonarrClient,
   seriesId: number,
   profileCache: Map<number, Map<number, { name: string; score: number }> | null>,
+  ctx: PreviewExecutionContext,
 ): Promise<Map<number, { name: string; score: number }> | null> {
   if (seriesId <= 0) return null;
   if (profileCache.has(seriesId)) return profileCache.get(seriesId) ?? null;
 
   let map: Map<number, { name: string; score: number }> | null = null;
   try {
-    const series = await client.getSeriesById(seriesId);
-    const profiles = await client.getQualityProfiles();
+    const series = await client.getSeriesById(seriesId, ctx.signal);
+    const profiles = await client.getQualityProfiles(ctx.signal);
     const profile: QualityProfile | undefined = profiles.find((p) => p.id === series.qualityProfileId);
     if (profile) {
       map = new Map();
@@ -2556,6 +2605,7 @@ async function assessSonarrUpgrade(
   fileCache: Map<number, SonarrEpisodeFile[]>,
   releaseContext: SonarrReleaseContext,
   profileCache: Map<number, Map<number, { name: string; score: number }> | null>,
+  ctx: PreviewExecutionContext,
 ): Promise<Record<string, unknown>> {
   const newQualityWeight = reprocessed.qualityWeight ?? candidate.qualityWeight ?? 0;
   const fileCustomFormats = reprocessed.customFormats ?? candidate.customFormats ?? [];
@@ -2571,7 +2621,7 @@ async function assessSonarrUpgrade(
   const seasonNumber = reprocessed.seasonNumber ?? candidate.seasonNumber;
   const existingFiles: Array<Record<string, unknown>> = [];
   if (typeof seasonNumber === "number") {
-    const eps = await joinSonarrSeasonEpisodeFiles(client, seriesId, seasonNumber, episodeCache, fileCache);
+    const eps = await joinSonarrSeasonEpisodeFiles(client, seriesId, seasonNumber, episodeCache, fileCache, ctx);
     for (const e of episodes) {
       const ep = eps.find((x) => x.id === e.id);
       const f = (ep as { _file?: SonarrEpisodeFile } | undefined)?._file;
@@ -2595,7 +2645,7 @@ async function assessSonarrUpgrade(
   let customFormatAssessment: Record<string, unknown> | null = null;
   let comparison: "upgrade" | "neutral" | "downgrade" | "mixed" | "unavailable" = "unavailable";
   if (releaseContext.available) {
-    const profileScores = await resolveSonarrProfileCFScores(client, seriesId, profileCache);
+    const profileScores = await resolveSonarrProfileCFScores(client, seriesId, profileCache, ctx);
     const merged = usableForEffectiveScore && profileScores
       ? mergeSonarrCustomFormats(
           releaseContext.customFormats,
@@ -2749,15 +2799,16 @@ function mappingRequiredEntry(candidateId: number, name: string | null, path: st
   };
 }
 
-async function previewSonarrManualImport(client: SonarrClient, args: unknown) {
+async function previewSonarrManualImport(client: SonarrClient, args: unknown, ctx: PreviewExecutionContext) {
   const { downloadId, items } = parseManualImportArgs(args, "sonarr");
   const a = (args ?? {}) as ManualImportToolArgs;
 
+  ctx.setStage("discovering-candidates");
   const candidates = await client.getManualImportCandidates({
     downloadId,
     seriesId: a.seriesId,
     filterExistingFiles: a.filterExistingFiles,
-  });
+  }, ctx.signal);
   if (candidates.length === 0) {
     throw new Error(
       `Sonarr returned no manual-import candidates for downloadId '${downloadId}'. The download is likely no longer tracked — check sonarr_get_queue.`,
@@ -2768,18 +2819,20 @@ async function previewSonarrManualImport(client: SonarrClient, args: unknown) {
   const previewable = resolved.filter(({ candidate, override }) => sonarrEffectiveSeriesId(candidate, override) > 0);
   const unmapped = resolved.filter(({ candidate, override }) => sonarrEffectiveSeriesId(candidate, override) <= 0);
 
+  ctx.setStage("native-reprocess");
   const reprocessed = previewable.length > 0
-    ? await client.reprocessManualImport(previewable.map(({ candidate, override }) => buildSonarrReprocessItem(candidate, override, downloadId)))
+    ? await client.reprocessManualImport(previewable.map(({ candidate, override }) => buildSonarrReprocessItem(candidate, override, downloadId)), ctx.signal)
     : [];
   const byId = new Map(reprocessed.map((r) => [r.id, r]));
 
+  ctx.setStage("resolving-related-data");
   const previews: Array<Record<string, unknown>> = [];
   const episodeCache = new Map<string, SonarrEpisodeWithFile[]>();
   const fileCache = new Map<number, SonarrEpisodeFile[]>();
   const seriesCache = new Map<number, { id: number; title: string | null }>();
   // Tracked-release CF context and quality-profile scores are resolved once per
   // preview call and reused for every candidate from the same download.
-  const releaseContext = await findSonarrReleaseContext(client, downloadId);
+  const releaseContext = await findSonarrReleaseContext(client, downloadId, ctx);
   const profileCache = new Map<number, Map<number, { name: string; score: number }> | null>();
   for (const { candidate, override } of previewable) {
     const r = byId.get(candidate.id);
@@ -2798,9 +2851,10 @@ async function previewSonarrManualImport(client: SonarrClient, args: unknown) {
       { ...mapping, seriesId },
       override.episodeIds !== undefined,
       episodeCache,
+      ctx,
     );
     const upgradeAssessment = mappingValid && episodeValidation.ok !== false
-      ? await assessSonarrUpgrade(client, candidate, r, seriesId, episodes, rejections, episodeCache, fileCache, releaseContext, profileCache)
+      ? await assessSonarrUpgrade(client, candidate, r, seriesId, episodes, rejections, episodeCache, fileCache, releaseContext, profileCache, ctx)
       : null;
     previews.push({
       candidateId: candidate.id,
@@ -2810,7 +2864,7 @@ async function previewSonarrManualImport(client: SonarrClient, args: unknown) {
       mappingRequired: false,
       // Effective identity, resolved from the effective id — never the
       // original candidate's title under an overridden id.
-      series: await sonarrEffectiveSeries(client, seriesId, candidate, seriesCache),
+      series: await sonarrEffectiveSeries(client, seriesId, candidate, seriesCache, ctx),
       seasonNumber: r.seasonNumber ?? null,
       episodes: episodes.map((e) => ({
         id: e.id,
@@ -2909,10 +2963,11 @@ async function executeSonarrManualImport(client: SonarrClient, args: unknown) {
   // command — the native app offers no protection against it.
   const episodeCache = new Map<string, SonarrEpisodeWithFile[]>();
   const invalidSelections: Array<Record<string, unknown>> = [];
+  const execCtx = standaloneContext();
   for (const { candidate, override } of resolved) {
     if (override.episodeIds === undefined) continue;
     const mapping = sonarrEffectiveMapping(candidate, override);
-    const validation = await validateSonarrEpisodeIds(client, mapping, true, episodeCache);
+    const validation = await validateSonarrEpisodeIds(client, mapping, true, episodeCache, execCtx);
     if (validation.ok === false) {
       invalidSelections.push({
         candidateId: candidate.id,
@@ -3078,6 +3133,7 @@ async function radarrEffectiveMovie(
   candidate: RadarrManualImportCandidate,
   reprocessed: RadarrManualImportCandidate,
   cache: Map<number, { id: number; title: string | null; year: number | null }>,
+  ctx: PreviewExecutionContext,
 ): Promise<{ id: number; title: string | null; year: number | null }> {
   if (movieId <= 0) return { id: movieId, title: null, year: null };
 
@@ -3093,7 +3149,7 @@ async function radarrEffectiveMovie(
 
   let resolved: { id: number; title: string | null; year: number | null };
   try {
-    const movie = await client.getMovieById(movieId);
+    const movie = await client.getMovieById(movieId, ctx.signal);
     resolved = { id: movieId, title: movie?.title ?? null, year: movie?.year ?? null };
   } catch {
     resolved = { id: movieId, title: null, year: null };
@@ -3119,15 +3175,16 @@ function buildRadarrReprocessItem(
   };
 }
 
-async function previewRadarrManualImport(client: RadarrClient, args: unknown) {
+async function previewRadarrManualImport(client: RadarrClient, args: unknown, ctx: PreviewExecutionContext) {
   const { downloadId, items } = parseManualImportArgs(args, "radarr");
   const a = (args ?? {}) as ManualImportToolArgs;
 
+  ctx.setStage("discovering-candidates");
   const candidates = await client.getManualImportCandidates({
     downloadId,
     movieId: a.movieId,
     filterExistingFiles: a.filterExistingFiles,
-  });
+  }, ctx.signal);
   if (candidates.length === 0) {
     throw new Error(
       `Radarr returned no manual-import candidates for downloadId '${downloadId}'. The download is likely no longer tracked — check radarr_get_queue.`,
@@ -3138,11 +3195,13 @@ async function previewRadarrManualImport(client: RadarrClient, args: unknown) {
   const previewable = resolved.filter(({ candidate, override }) => radarrEffectiveMovieId(candidate, override) > 0);
   const unmapped = resolved.filter(({ candidate, override }) => radarrEffectiveMovieId(candidate, override) <= 0);
 
+  ctx.setStage("native-reprocess");
   const reprocessed = previewable.length > 0
-    ? await client.reprocessManualImport(previewable.map(({ candidate, override }) => buildRadarrReprocessItem(candidate, override, downloadId)))
+    ? await client.reprocessManualImport(previewable.map(({ candidate, override }) => buildRadarrReprocessItem(candidate, override, downloadId)), ctx.signal)
     : [];
   const byId = new Map(reprocessed.map((r) => [r.id, r]));
 
+  ctx.setStage("resolving-related-data");
   const movieCache = new Map<number, { id: number; title: string | null; year: number | null }>();
   const previews: Array<Record<string, unknown>> = [];
   for (const { candidate, override } of previewable) {
@@ -3163,7 +3222,7 @@ async function previewRadarrManualImport(client: RadarrClient, args: unknown) {
       mappingRequired: false,
       // Effective identity, resolved from the effective id — never the
       // original candidate's title under an overridden id.
-      movie: movieId > 0 ? await radarrEffectiveMovie(client, movieId, candidate, r, movieCache) : null,
+      movie: movieId > 0 ? await radarrEffectiveMovie(client, movieId, candidate, r, movieCache, ctx) : null,
       movieFileId: candidate.movieFileId ?? null,
       quality: r.quality ?? null,
       languages: r.languages ?? [],
@@ -3466,11 +3525,12 @@ async function getLidarrAlbumIdentity(
   client: LidarrClient,
   albumId: number,
   cache: Map<number, LidarrAlbumIdentity | null>,
+  ctx: PreviewExecutionContext,
 ): Promise<LidarrAlbumIdentity | null> {
   if (cache.has(albumId)) return cache.get(albumId) ?? null;
   let resolved: LidarrAlbumIdentity | null;
   try {
-    const album = await client.getAlbumById(albumId);
+    const album = await client.getAlbumById(albumId, ctx.signal);
     resolved = album && album.id > 0
       ? { id: album.id, artistId: album.artistId, releases: album.releases ?? [] }
       : null;
@@ -3497,13 +3557,14 @@ async function validateLidarrRelationships(
   mapping: LidarrEffectiveMapping,
   override: ManualImportOverrideItem,
   albumCache: Map<number, LidarrAlbumIdentity | null>,
+  ctx: PreviewExecutionContext,
 ): Promise<{ checked: boolean; ok: boolean; problems: string[] }> {
   const problems: string[] = [];
   const checked = override.albumId !== undefined || override.albumReleaseId !== undefined;
   if (!checked) return { checked: false, ok: true, problems: [] };
 
   if ((override.albumId !== undefined || override.albumReleaseId !== undefined) && mapping.albumId > 0) {
-    const album = await getLidarrAlbumIdentity(client, mapping.albumId, albumCache);
+    const album = await getLidarrAlbumIdentity(client, mapping.albumId, albumCache, ctx);
     if (!album) {
       problems.push(`album ${mapping.albumId} could not be fetched from Lidarr; its artist and release membership are unverifiable`);
     } else {
@@ -3542,6 +3603,7 @@ async function resolveLidarrTrackIds(
   reprocessed: LidarrManualImportCandidate,
   override: ManualImportOverrideItem,
   releaseTrackCache: Map<number, LidarrTrack[]>,
+  ctx: PreviewExecutionContext,
 ): Promise<{
   trackIds: number[];
   source: "caller-override" | "lidarr-recomputed";
@@ -3561,7 +3623,7 @@ async function resolveLidarrTrackIds(
   }
   let releaseTracks = releaseTrackCache.get(albumReleaseId);
   if (!releaseTracks) {
-    releaseTracks = await client.getTracks({ albumReleaseId });
+    releaseTracks = await client.getTracks({ albumReleaseId }, ctx.signal);
     releaseTrackCache.set(albumReleaseId, releaseTracks);
   }
   const validIds = new Set(releaseTracks.map((t) => t.id));
@@ -3583,16 +3645,17 @@ async function resolveLidarrTrackIds(
   };
 }
 
-async function previewLidarrManualImport(client: LidarrClient, args: unknown) {
+async function previewLidarrManualImport(client: LidarrClient, args: unknown, ctx: PreviewExecutionContext) {
   const { downloadId, items, replaceExistingFiles } = parseManualImportArgs(args, "lidarr");
   const a = (args ?? {}) as ManualImportToolArgs;
 
+  ctx.setStage("discovering-candidates");
   const candidates = await client.getManualImportCandidates({
     downloadId,
     artistId: a.artistId,
     filterExistingFiles: a.filterExistingFiles,
     replaceExistingFiles,
-  });
+  }, ctx.signal);
   if (candidates.length === 0) {
     throw new Error(
       `Lidarr returned no manual-import candidates for downloadId '${downloadId}'. The download is likely no longer tracked — check lidarr_get_queue.`,
@@ -3607,6 +3670,7 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown) {
   // so an item whose caller-supplied ids are structurally broken is never
   // POSTed — it is returned as a diagnostic entry instead. Only explicit
   // override ids are checked; inherited ids came from Lidarr's own mapping.
+  ctx.setStage("validating-mappings");
   const albumIdentityCache = new Map<number, LidarrAlbumIdentity | null>();
   const mappings: Array<{
     candidate: LidarrManualImportCandidate;
@@ -3619,7 +3683,7 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown) {
     const mapping = lidarrEffectiveMapping(candidate, override);
     const dependencyProblems = lidarrDependencyProblems(mapping, override);
     const relationshipValidation = await validateLidarrRelationships(
-      client, mapping, override, albumIdentityCache,
+      client, mapping, override, albumIdentityCache, ctx,
     );
     mappings.push({ candidate, override, mapping, dependencyProblems, relationshipValidation });
   }
@@ -3634,11 +3698,13 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown) {
   const payload = previewable.map(({ candidate, override }) =>
     buildLidarrUpdateItem(candidate, override, downloadId, replaceExistingFiles),
   );
+  ctx.setStage("native-reprocess");
   const reprocessed = payload.length > 0
-    ? await client.updateManualImport(payload)
+    ? await client.updateManualImport(payload, ctx.signal)
     : [];
   const byId = new Map(reprocessed.map((r) => [r.id, r]));
 
+  ctx.setStage("resolving-tracks");
   const releaseTrackCache = new Map<number, LidarrTrack[]>();
   // Keyed by candidateId, then emitted in the caller's original item order
   // below — a mixed valid/invalid request reads in the order it was sent.
@@ -3651,7 +3717,7 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown) {
         `Lidarr did not return candidate ${candidate.id} after updating; the candidate changed — re-run lidarr_get_manual_import_candidates.`,
       );
     }
-    const resolvedTracks = await resolveLidarrTrackIds(client, r, override, releaseTrackCache);
+    const resolvedTracks = await resolveLidarrTrackIds(client, r, override, releaseTrackCache, ctx);
     if (resolvedTracks.releaseTrackMismatch.length > 0) {
       mismatches.push({ candidateId: candidate.id, tracksOutsideRelease: resolvedTracks.releaseTrackMismatch });
     }
@@ -3789,11 +3855,12 @@ async function executeLidarrManualImport(client: LidarrClient, args: unknown) {
   // does not own it — would survive reprocessing and reach the import command.
   const albumIdentityCache = new Map<number, LidarrAlbumIdentity | null>();
   const invalidMappings: Array<Record<string, unknown>> = [];
+  const execCtx = standaloneContext();
   for (const { candidate, override } of resolved) {
     const mapping = lidarrEffectiveMapping(candidate, override);
     const dependencyProblems = lidarrDependencyProblems(mapping, override);
     const relationshipValidation = await validateLidarrRelationships(
-      client, mapping, override, albumIdentityCache,
+      client, mapping, override, albumIdentityCache, execCtx,
     );
     if (dependencyProblems.length > 0 || !relationshipValidation.ok) {
       invalidMappings.push({
@@ -3868,7 +3935,7 @@ async function executeLidarrManualImport(client: LidarrClient, args: unknown) {
     // Caller track overrides survive reprocessing (validated strictly against
     // the selected album release); otherwise Lidarr's recomputed mapping is
     // used.
-    const resolvedTracks = await resolveLidarrTrackIds(client, r, override, releaseTrackCache);
+    const resolvedTracks = await resolveLidarrTrackIds(client, r, override, releaseTrackCache, execCtx);
     if (resolvedTracks.releaseTrackMismatch.length > 0) {
       mismatches.push({ candidateId: candidate.id, tracksOutsideRelease: resolvedTracks.releaseTrackMismatch });
     }
@@ -3960,6 +4027,125 @@ async function executeLidarrManualImport(client: LidarrClient, args: unknown) {
   });
 }
 
+// --- Preview operation registry (soft-budget fast path + async handle) -----
+
+/**
+ * Deterministic fingerprint of a preview request: service, downloadId, the
+ * normalized items (caller order preserved — it is semantically part of the
+ * request), mapping overrides, and the preview-affecting discovery flags. Used
+ * only to deduplicate an identical preview that is ALREADY running; terminal
+ * results are never reused as a cache, so a re-run always re-fetches native
+ * state.
+ */
+function previewFingerprint(service: "sonarr" | "radarr" | "lidarr", args: unknown): string {
+  const a = (args ?? {}) as ManualImportToolArgs & Record<string, unknown>;
+  const rawItems = Array.isArray(a.items) ? a.items : [];
+  const items = rawItems.map((it) => {
+    const o: Record<string, unknown> = { candidateId: it.candidateId };
+    for (const k of [
+      "seriesId", "seasonNumber", "episodeIds", "movieId", "artistId",
+      "albumId", "albumReleaseId", "trackIds", "disableReleaseSwitching",
+      "releaseGroup", "allowRejected",
+    ] as const) {
+      if (it[k] !== undefined) o[k] = it[k];
+    }
+    return o;
+  });
+  const norm: Record<string, unknown> = {
+    service,
+    downloadId: typeof a.downloadId === "string" ? a.downloadId.trim() : a.downloadId,
+    items,
+    replaceExistingFiles: a.replaceExistingFiles === true,
+  };
+  for (const k of ["seriesId", "seasonNumber", "movieId", "artistId", "filterExistingFiles"] as const) {
+    if (a[k] !== undefined) norm[k] = a[k];
+  }
+  return JSON.stringify(norm);
+}
+
+function runningHandle(op: PreviewOperation, deduplicated: boolean) {
+  const handle: Record<string, unknown> = {
+    status: "running",
+    operationId: op.id,
+    operation: op.kind,
+    stage: op.stage ?? "starting",
+    startedAt: new Date(op.startedAt).toISOString(),
+    hardTimeoutAt: new Date(op.deadlineAt).toISOString(),
+    elapsedMs: Date.now() - op.startedAt,
+    pollAfterMs: operationPollIntervalMs(),
+    guidance: `The ${kindLabel(op.kind)} is still running in the app. Poll arr_get_operation with this operationId at the indicated interval instead of starting another identical preview.`,
+  };
+  if (deduplicated) handle.deduplicated = true;
+  return handle;
+}
+
+/**
+ * Run a preview with a soft synchronous response budget. Fast previews return
+ * the exact normal preview result (unchanged shape, no wrapper). A preview
+ * still running when the budget expires returns a pollable handle; the work
+ * continues in the module-level registry, independent of this MCP request.
+ */
+async function runPreviewTool<C>(
+  kind: PreviewOperationKind,
+  service: "sonarr" | "radarr" | "lidarr",
+  client: C,
+  args: unknown,
+  executor: (client: C, args: unknown, ctx: PreviewExecutionContext) => Promise<unknown>,
+): Promise<ReturnType<typeof jsonText> | ReturnType<typeof textError>> {
+  const fingerprint = previewFingerprint(service, args);
+  const existing = previewOperations.findRunning(fingerprint);
+  if (existing) {
+    return jsonText(runningHandle(existing, true));
+  }
+
+  const op = previewOperations.start(kind, fingerprint, (ctx) => executor(client, args, ctx));
+  const settled = await previewOperations.awaitWithBudget(op, previewSyncBudgetMs());
+
+  if (settled.status === "running") {
+    return jsonText(runningHandle(settled, false));
+  }
+  if (settled.status === "completed") {
+    return jsonText(settled.result);
+  }
+  if (settled.status === "failed") {
+    return textError(`Error: ${settled.error}`);
+  }
+  // timed_out / cancelled reached within the synchronous budget (rare).
+  return jsonText({
+    status: settled.status,
+    operationId: settled.id,
+    operation: settled.kind,
+    error: settled.error ?? null,
+  });
+}
+
+function operationPollView(op: PreviewOperation) {
+  const base = { operationId: op.id, status: op.status, operation: op.kind };
+  if (op.status === "running") {
+    return {
+      ...base,
+      stage: op.stage ?? "starting",
+      elapsedMs: Date.now() - op.startedAt,
+      pollAfterMs: operationPollIntervalMs(),
+    };
+  }
+  if (op.status === "completed") {
+    return { ...base, result: op.result };
+  }
+  if (op.status === "failed") {
+    return { ...base, error: op.error ?? null };
+  }
+  if (op.status === "timed_out") {
+    return {
+      ...base,
+      stage: op.stage ?? null,
+      elapsedMs: (op.completedAt ?? Date.now()) - op.startedAt,
+      error: op.error ?? "preview exceeded the configured operation timeout.",
+    };
+  }
+  return { ...base };
+}
+
 // Registers the MCP request handlers on a server instance. Called by
 // buildServer() for every server created (one per HTTP request, plus the
 // module-level stdio instance).
@@ -3985,6 +4171,45 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const id = (args as { id: string }).id;
         const result = await fetchSearchEntry(id);
         return jsonText(result);
+      }
+
+      case "arr_get_operation": {
+        const operationId = (args as { operationId?: string })?.operationId;
+        if (typeof operationId !== "string" || operationId.trim() === "") {
+          throw new Error("operationId is required (from a *_preview_manual_import running handle).");
+        }
+        const op = previewOperations.get(operationId.trim());
+        if (!op) {
+          return jsonText({
+            status: "expired-or-unknown",
+            operationId,
+            guidance: "This operation is no longer available (completed and expired, cancelled, or never existed). Run the preview again.",
+          });
+        }
+        return jsonText(operationPollView(op));
+      }
+
+      case "arr_cancel_operation": {
+        const operationId = (args as { operationId?: string })?.operationId;
+        if (typeof operationId !== "string" || operationId.trim() === "") {
+          throw new Error("operationId is required (from a *_preview_manual_import running handle).");
+        }
+        const op = previewOperations.cancel(operationId.trim());
+        if (!op) {
+          return jsonText({
+            status: "expired-or-unknown",
+            operationId,
+            guidance: "This operation is no longer available. Run the preview again.",
+          });
+        }
+        return jsonText({
+          operationId: op.id,
+          status: op.status,
+          operation: op.kind,
+          note: op.status === "cancelled"
+            ? "Cancellation requested. mcp-arr has stopped waiting and aborted the in-flight request; the app may still finish CPU-side work already in progress."
+            : "The operation was already terminal; its status is unchanged.",
+        });
       }
 
       case "arr_status": {
@@ -4391,7 +4616,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "sonarr_preview_manual_import": {
         if (!clients.sonarr) throw new Error("Sonarr not configured");
-        return jsonText(await previewSonarrManualImport(clients.sonarr, args));
+        return await runPreviewTool("sonarr-manual-import-preview", "sonarr", clients.sonarr, args, previewSonarrManualImport);
       }
 
       case "sonarr_execute_manual_import": {
@@ -4753,7 +4978,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "radarr_preview_manual_import": {
         if (!clients.radarr) throw new Error("Radarr not configured");
-        return jsonText(await previewRadarrManualImport(clients.radarr, args));
+        return await runPreviewTool("radarr-manual-import-preview", "radarr", clients.radarr, args, previewRadarrManualImport);
       }
 
       case "radarr_execute_manual_import": {
@@ -4875,7 +5100,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "lidarr_preview_manual_import": {
         if (!clients.lidarr) throw new Error("Lidarr not configured");
-        return jsonText(await previewLidarrManualImport(clients.lidarr, args));
+        return await runPreviewTool("lidarr-manual-import-preview", "lidarr", clients.lidarr, args, previewLidarrManualImport);
       }
 
       case "lidarr_execute_manual_import": {
