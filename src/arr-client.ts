@@ -75,6 +75,14 @@ export interface QueueItem {
    * the one a live Sonarr response carries.
    */
   seasonNumber?: number | null;
+  /**
+   * Sonarr's queue resource exposes the tracked release's custom-format match
+   * set and its score (derived from `model.RemoteEpisode.CustomFormats` and
+   * scored against the series quality profile). Optional so Radarr/Lidarr
+   * responses pass through untouched — the MCP never fabricates these.
+   */
+  customFormats?: Array<{ id?: number; name?: string; [key: string]: unknown }> | null;
+  customFormatScore?: number | null;
   /** Embedded resources the queue endpoints include with each item. */
   episode?: { seasonNumber?: number } | null;
   series?: { id?: number; title?: string } | null;

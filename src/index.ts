@@ -31,6 +31,8 @@ import {
 } from "./arr-client.js";
 import type {
   QueueStatusMessage,
+  QueueItem,
+  QualityProfile,
   ManualImportQuality,
   ManualImportLanguage,
   ManualImportRejection,
@@ -283,7 +285,7 @@ if (clients.sonarr) {
     },
     {
       name: "sonarr_get_queue",
-      description: "Get Sonarr download queue, including import diagnostics: structured statusMessages (per-file import rejection reasons), errorMessage, trackedDownloadStatus/State, downloadId, outputPath, indexer, and seriesId/episodeId/seasonNumber for correlating with the library. Use these to understand why a completed download was not imported automatically. Supports pagination with limit and offset.",
+      description: "Get Sonarr download queue, including import diagnostics: structured statusMessages (per-file import rejection reasons), errorMessage, trackedDownloadStatus/State, downloadId, outputPath, indexer, seriesId/episodeId/seasonNumber, and the tracked release's customFormats/customFormatScore for correlating with the library. Use these to understand why a completed download was not imported automatically. Supports pagination with limit and offset.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -359,7 +361,7 @@ if (clients.sonarr) {
     },
     {
       name: "sonarr_preview_manual_import",
-      description: "Preview (reprocess) a manual import in Sonarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (seriesId/seasonNumber/episodeIds/releaseGroup), sends Sonarr's native manual-import reprocess request, and returns Sonarr's recalculated mapping, quality, languages and rejections. Candidates with no valid series mapping (and no seriesId override) are returned as mappingRequired/canPreview=false and are never sent to Sonarr — a 0 seriesId is never submitted, because Sonarr's reprocess resolves the series and throws for unknown ids. Overrides follow the native hierarchy series -> season -> episodes: a seriesId override clears the inherited seasonNumber and episodes, and a seasonNumber override clears the inherited episodes, so supply the full corrected selection rather than only the parent. Explicit episodeIds are validated against GET /api/v3/episode?seriesId=&seasonNumber= and reported in episodeValidation. The reported series is the EFFECTIVE series (its real id and title), never the original candidate's title under an overridden id. Use this to fix unparseable filenames or wrong episode mappings and inspect the result; then run sonarr_execute_manual_import with the same overrides. Non-destructive: never moves, copies, or imports files.",
+      description: "Preview (reprocess) a manual import in Sonarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (seriesId/seasonNumber/episodeIds/releaseGroup), sends Sonarr's native manual-import reprocess request, and returns Sonarr's recalculated mapping, quality, languages and rejections. Candidates with no valid series mapping (and no seriesId override) are returned as mappingRequired/canPreview=false and are never sent to Sonarr — a 0 seriesId is never submitted, because Sonarr's reprocess resolves the series and throws for unknown ids. Overrides follow the native hierarchy series -> season -> episodes: a seriesId override clears the inherited seasonNumber and episodes, and a seasonNumber override clears the inherited episodes, so supply the full corrected selection rather than only the parent. Explicit episodeIds are validated against GET /api/v3/episode?seriesId=&seasonNumber= and reported in episodeValidation. The reported series is the EFFECTIVE series (its real id and title), never the original candidate's title under an overridden id. Use this to fix unparseable filenames or wrong episode mappings and inspect the result; then run sonarr_execute_manual_import with the same overrides. Non-destructive: never moves, copies, or imports files. The preview's upgradeAssessment merges the tracked release's queue custom-format context with the file's own CF context (deduplicated by custom-format id, scored against the effective series' quality profile) to assess the pending candidate against existing files — a per-file CF rejection that the release-level evidence contradicts is reported as cf-upgrade-with-native-rejection, not a hard do-not-import.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -1681,6 +1683,8 @@ interface MappedQueueItem {
   movieId?: number;
   artistId?: number;
   albumId?: number;
+  customFormats?: Array<{ id: number | null; name: string | null }>;
+  customFormatScore?: number;
 }
 
 async function getPaginatedQueue(
@@ -1737,6 +1741,12 @@ async function getPaginatedQueue(
     if (q.movieId != null) item.movieId = q.movieId;
     if (q.artistId != null) item.artistId = q.artistId;
     if (q.albumId != null) item.albumId = q.albumId;
+    // Tracked-release custom-format context (Sonarr queue only). Passed through
+    // from the native values — the MCP never recomputes the score here.
+    if (q.customFormats != null) {
+      item.customFormats = q.customFormats.map((cf) => ({ id: cf.id ?? null, name: cf.name ?? null }));
+    }
+    if (q.customFormatScore != null) item.customFormatScore = q.customFormatScore;
     return item;
   });
 
@@ -2052,7 +2062,7 @@ const SONARR_VERIFY_DIRECTIVE = [
   "Sonarr's mapping and rejection reasons are a parse PROPOSAL derived from the release name — not verified facts. mappingValid: true means the proposal is complete, not that it is correct; a rejection is Sonarr's opinion, not ground truth.",
   "Before execute — especially before allowRejected=true — verify the proposal against the library: series identity, season/episode identity (sonarr_get_episodes), the release title and numbering where the name supplies them, and existing-file state.",
   "Titles and numbering are both evidence, and neither is conclusive alone. A number mismatch does not by itself prove the mapping wrong (TheTVDB/TMDB/absolute-numbering conventions differ); a title that matches none of the detected episodes does not by itself prove it right (translations and fan-sub titles differ from official ones). When the evidence conflicts, treat the mapping as AMBIGUOUS and investigate — including seasonNumber=0 for specials — rather than automatically trusting Sonarr's proposal or overriding it.",
-  "An existing file on the target episode is not by itself a reason to skip: read the preview's upgradeAssessment. 'not-an-upgrade' → do not import; 'no-existing-file' → fills a gap; 'no-upgrade-rejection' → equal to or better than the existing file (compare quality name and customFormatScore against newQualityWeight/newCustomFormatScore). Re-check it after any remap — the preview evaluates against the NEW target's file.",
+  "An existing file on the target episode is not by itself a reason to skip: read the preview's upgradeAssessment. 'no-existing-file' → fills a gap; 'no-upgrade-rejection' → equal to or better than the existing file (compare quality name and customFormatScore against newQualityWeight/newCustomFormatScore); 'not-an-upgrade' → Sonarr rejects it as not better (quality/revision, already-imported, or a CF downgrade confirmed by release+file evidence); 'cf-upgrade-with-native-rejection' → the tracked release + file CF evidence scores the candidate ABOVE the existing file(s) even though Sonarr's per-file CF check rejected it; 'cf-assessment-ambiguous' → the CF comparison cannot be computed safely. A per-file native CF rejection is NOT sufficient evidence to remove/blocklist a tracked release when release-level CF provenance conflicts with it — blocklisting acts on the whole release. Re-check after any remap — the preview evaluates against the NEW target's file.",
 ];
 
 const RADARR_VERIFY_DIRECTIVE = [
@@ -2066,13 +2076,19 @@ const LIDARR_VERIFY_DIRECTIVE = [
 ];
 
 function manualImportGuidance(service: string, downloadId: string) {
-  return [
+  const lines = [
     `Preview is non-importing: nothing has been moved, copied, or imported.`,
     `To import, call ${service}_execute_manual_import with the same downloadId and items (candidateId + any mapping overrides).`,
     `Candidates with remaining rejections are refused by the execute tool unless that item sets allowRejected=true — decide per candidate, from the rejections above, whether overriding is appropriate.`,
     `Candidates with no valid entity mapping (series/movie/artist+album) are reported as mappingRequired and are never sent to the native reprocess endpoint; supply an explicit id override first.`,
     `Queue imports default to importMode=auto; command acceptance is asynchronous, so re-check ${service}_get_queue afterwards.`,
   ];
+  if (service === "sonarr") {
+    lines.push(
+      "A per-file native Custom Format rejection is NOT sufficient evidence to remove/blocklist the tracked release: blocklisting acts on the whole release, so weigh the release-level CF provenance in upgradeAssessment.customFormatAssessment first. This tool never removes or blocklists queue items.",
+    );
+  }
+  return lines;
 }
 
 function jsonTextError(data: unknown) {
@@ -2303,16 +2319,208 @@ async function sonarrEffectiveSeries(
 }
 
 /**
+ * Tracked-release custom-format context carried by Sonarr's queue resource
+ * (`customFormats` / `customFormatScore`, derived from `RemoteEpisode` and
+ * scored against the series quality profile). This is the native release-level
+ * evidence the manual-import file evaluation can miss (e.g. season packs whose
+ * per-file names strip the release metadata). Never reconstructed from the
+ * title — if no queue item matches the downloadId, the context is unavailable.
+ */
+interface SonarrReleaseContext {
+  available: boolean;
+  title: string | null;
+  customFormats: Array<{ id: number; name: string | null }>;
+  nativeScore: number | null;
+  seriesId: number | null;
+  reason: string | null;
+}
+
+async function findSonarrReleaseContext(client: SonarrClient, downloadId: string): Promise<SonarrReleaseContext> {
+  const pageSize = 100;
+  let page = 1;
+  while (true) {
+    let queue: { records: QueueItem[]; totalRecords: number };
+    try {
+      queue = await client.getQueue(page, pageSize);
+    } catch {
+      return { available: false, title: null, customFormats: [], nativeScore: null, seriesId: null, reason: "queue-unavailable" };
+    }
+    const match = (queue.records ?? []).find((q) => q.downloadId === downloadId);
+    if (match) {
+      return {
+        available: true,
+        title: match.title ?? null,
+        customFormats: (match.customFormats ?? [])
+          .filter((cf) => typeof cf.id === "number")
+          .map((cf) => ({ id: cf.id as number, name: cf.name ?? null })),
+        nativeScore: match.customFormatScore ?? null,
+        seriesId: match.seriesId ?? null,
+        reason: null,
+      };
+    }
+    const fetched = page * pageSize;
+    if ((queue.records?.length ?? 0) === 0 || fetched >= (queue.totalRecords ?? 0)) {
+      return { available: false, title: null, customFormats: [], nativeScore: null, seriesId: null, reason: "queue-item-not-found" };
+    }
+    page += 1;
+  }
+}
+
+/**
+ * `customFormatId -> { name, score }` for the effective series' quality
+ * profile. Cached per preview call (keyed by seriesId) so a multi-file season
+ * pack resolves the profile once, not once per candidate. Returns null when
+ * the series/profile cannot be resolved — the caller must then treat CF
+ * attribution as unavailable rather than inventing a total.
+ */
+async function resolveSonarrProfileCFScores(
+  client: SonarrClient,
+  seriesId: number,
+  profileCache: Map<number, Map<number, { name: string; score: number }> | null>,
+): Promise<Map<number, { name: string; score: number }> | null> {
+  if (seriesId <= 0) return null;
+  if (profileCache.has(seriesId)) return profileCache.get(seriesId) ?? null;
+
+  let map: Map<number, { name: string; score: number }> | null = null;
+  try {
+    const series = await client.getSeriesById(seriesId);
+    const profiles = await client.getQualityProfiles();
+    const profile: QualityProfile | undefined = profiles.find((p) => p.id === series.qualityProfileId);
+    if (profile) {
+      map = new Map();
+      for (const f of profile.formatItems ?? []) {
+        map.set(f.format, { name: f.name, score: f.score });
+      }
+    }
+  } catch {
+    map = null;
+  }
+  profileCache.set(seriesId, map);
+  return map;
+}
+
+interface SonarrCFContributor {
+  id: number;
+  name: string | null;
+  score: number;
+  matchedAt: Array<"release" | "file">;
+}
+
+/**
+ * Merge the tracked-release and file/import custom-format match sets into one
+ * effective pending-candidate set, deduplicated strictly by custom-format id
+ * (a format matched at both levels contributes once, never twice). Each unique
+ * id's score comes from the effective quality profile. The native totals are
+ * kept as consistency checks: when the profile-attributed sums disagree with
+ * them, attribution is reported invalid so no hard verdict is built on it.
+ */
+function mergeSonarrCustomFormats(
+  releaseCFs: Array<{ id: number; name: string | null }>,
+  fileCFs: Array<{ id?: number; name?: string; score?: number }>,
+  profileScores: Map<number, { name: string; score: number }>,
+  nativeReleaseScore: number | null,
+  nativeFileScore: number | null,
+): {
+  contributors: SonarrCFContributor[];
+  releaseScore: number;
+  fileScore: number;
+  effectiveScore: number;
+  scoreAttributionValid: boolean;
+  attributionProblems: string[];
+} {
+  const byId = new Map<number, SonarrCFContributor>();
+  const add = (id: number, name: string | null, at: "release" | "file") => {
+    let entry = byId.get(id);
+    if (!entry) {
+      entry = { id, name: name ?? null, score: 0, matchedAt: [] };
+      byId.set(id, entry);
+    }
+    if (name && !entry.name) entry.name = name;
+    if (!entry.matchedAt.includes(at)) entry.matchedAt.push(at);
+  };
+  for (const cf of releaseCFs) add(cf.id, cf.name, "release");
+  for (const cf of fileCFs) {
+    if (typeof cf.id === "number") add(cf.id, cf.name ?? null, "file");
+  }
+
+  const problems: string[] = [];
+  let releaseScore = 0;
+  let fileScore = 0;
+  let effectiveScore = 0;
+  let valid = true;
+  for (const entry of byId.values()) {
+    const profile = profileScores.get(entry.id);
+    if (!profile) {
+      valid = false;
+      problems.push(`custom format id ${entry.id}${entry.name ? ` (${entry.name})` : ""} is not present in the effective series quality profile`);
+      entry.score = 0;
+    } else {
+      entry.score = profile.score;
+      entry.name = profile.name;
+    }
+    effectiveScore += entry.score;
+    if (entry.matchedAt.includes("release")) releaseScore += entry.score;
+    if (entry.matchedAt.includes("file")) fileScore += entry.score;
+  }
+
+  if (nativeReleaseScore != null && nativeReleaseScore !== releaseScore) {
+    valid = false;
+    problems.push(`native release score ${nativeReleaseScore} does not equal the profile-attributed release CF sum ${releaseScore}`);
+  }
+  if (nativeFileScore != null && nativeFileScore !== fileScore) {
+    valid = false;
+    problems.push(`native file score ${nativeFileScore} does not equal the profile-attributed file CF sum ${fileScore}`);
+  }
+
+  return {
+    contributors: [...byId.values()].sort((a, b) => b.score - a.score),
+    releaseScore,
+    fileScore,
+    effectiveScore,
+    scoreAttributionValid: valid,
+    attributionProblems: problems,
+  };
+}
+
+/**
+ * Classify Sonarr's manual-import upgrade rejection. A quality/revision
+ * downgrade is a hard native rejection that a high CF score must NOT override;
+ * a custom-format rejection is the case where release-level CF provenance can
+ * legitimately conflict with the per-file evaluation.
+ */
+function classifySonarrUpgradeRejection(reason: string | null | undefined): "custom-format" | "quality" | "already-imported" | null {
+  const text = reason ?? "";
+  if (/custom format upgrade/i.test(text)) return "custom-format";
+  if (/already imported/i.test(text)) return "already-imported";
+  if (/not an upgrade/i.test(text)) return "quality";
+  return null;
+}
+
+function compareSonarrCFScore(effectiveScore: number, existingScores: number[]): "upgrade" | "neutral" | "downgrade" | "mixed" {
+  if (existingScores.length === 0) return "neutral";
+  if (existingScores.every((s) => effectiveScore === s)) return "neutral";
+  if (existingScores.every((s) => effectiveScore >= s)) return "upgrade";
+  if (existingScores.every((s) => effectiveScore < s)) return "downgrade";
+  return "mixed";
+}
+
+/**
  * Compare a manual-import candidate against the files already on disk for its
  * mapped episodes. Sonarr's own reprocess evaluates the existing file and
  * raises "Not an upgrade for existing episode file(s)" (quality profile) /
  * "Not a Custom Format upgrade for existing episode file(s)" (CF score) /
  * "Episode already imported" when the new file is not better — including
- * after a remap in preview. That rejection is the authoritative signal, so it
- * drives the verdict. The native episode-file list (quality name + CF score
- * per mapped episode) is included as data; a numeric qualityWeight comparison
- * is only attempted when the server exposes qualityWeight on the files (it
- * often does not).
+ * after a remap in preview.
+ *
+ * Sonarr's per-file CF evaluation uses only the file/import context, so a
+ * season pack whose release-level metadata (source, audio, …) lives only in the
+ * release name scores 0 per file and is rejected as "not a CF upgrade" even
+ * when the tracked release clearly beats the existing file. The tracked
+ * release's queue CF context is merged with the file CF context (deduplicated
+ * by custom-format id, scored against the effective quality profile) to build
+ * the effective pending-candidate CF score. A quality/revision rejection stays
+ * a hard refusal; a per-file CF rejection alone is not treated as proof the
+ * release should be removed.
  */
 async function assessSonarrUpgrade(
   client: SonarrClient,
@@ -2323,11 +2531,18 @@ async function assessSonarrUpgrade(
   rejections: ManualImportRejection[],
   episodeCache: Map<string, SonarrEpisodeWithFile[]>,
   fileCache: Map<number, SonarrEpisodeFile[]>,
+  releaseContext: SonarrReleaseContext,
+  profileCache: Map<number, Map<number, { name: string; score: number }> | null>,
 ): Promise<Record<string, unknown>> {
   const newQualityWeight = reprocessed.qualityWeight ?? candidate.qualityWeight ?? 0;
-  const newCustomFormatScore = reprocessed.customFormatScore ?? candidate.customFormatScore ?? 0;
+  const fileCustomFormats = reprocessed.customFormats ?? candidate.customFormats ?? [];
+  const fileNativeScore = reprocessed.customFormatScore ?? candidate.customFormatScore ?? 0;
+  const releaseType = reprocessed.releaseType ?? candidate.releaseType ?? null;
+  const seasonPack = releaseType === "seasonPack";
+
   const upgradeRejection = rejections.find((r) =>
     /not an upgrade|not a custom format upgrade|already imported/i.test(r.reason ?? ""));
+  const rejectionType = upgradeRejection ? classifySonarrUpgradeRejection(upgradeRejection.reason) : null;
 
   const seasonNumber = reprocessed.seasonNumber ?? candidate.seasonNumber;
   const existingFiles: Array<Record<string, unknown>> = [];
@@ -2348,11 +2563,83 @@ async function assessSonarrUpgrade(
     }
   }
 
+  // Effective-series guard: the tracked queue CF set was computed for the
+  // tracked release's series. A remap to a different series must not inherit it.
+  const effectiveSeriesMatchesQueue = releaseContext.seriesId == null || releaseContext.seriesId === seriesId;
+  const usableForEffectiveScore = releaseContext.available && effectiveSeriesMatchesQueue;
+
+  let customFormatAssessment: Record<string, unknown> | null = null;
+  let comparison: "upgrade" | "neutral" | "downgrade" | "mixed" | "unavailable" = "unavailable";
+  if (releaseContext.available) {
+    const profileScores = await resolveSonarrProfileCFScores(client, seriesId, profileCache);
+    const merged = usableForEffectiveScore && profileScores
+      ? mergeSonarrCustomFormats(
+          releaseContext.customFormats,
+          fileCustomFormats,
+          profileScores,
+          releaseContext.nativeScore,
+          fileNativeScore,
+        )
+      : null;
+    if (merged) {
+      comparison = compareSonarrCFScore(merged.effectiveScore, existingFiles.map((f) => f.customFormatScore as number));
+    }
+    customFormatAssessment = {
+      release: {
+        title: releaseContext.title,
+        nativeScore: releaseContext.nativeScore,
+        formats: releaseContext.customFormats,
+      },
+      file: {
+        nativeScore: fileNativeScore,
+        formats: fileCustomFormats.map((cf) => ({ id: cf.id ?? null, name: cf.name ?? null })),
+      },
+      effectiveCandidate: merged
+        ? { score: merged.effectiveScore, contributors: merged.contributors }
+        : null,
+      scoreAttributionValid: merged ? merged.scoreAttributionValid : false,
+      attributionProblems: merged
+        ? merged.attributionProblems
+        : (usableForEffectiveScore
+          ? ["the effective series' quality profile could not be resolved"]
+          : ["effective-series-mismatch: the tracked release's CF matches do not safely apply to the remapped series"]),
+      comparison,
+    };
+  }
+
   let verdict: string;
   let note: string;
   if (upgradeRejection) {
-    verdict = "not-an-upgrade";
-    note = `Sonarr's own decision rejects this mapping ("${upgradeRejection.reason}") — the new file is NOT better than the existing episode file(s). Do not import.`;
+    if (rejectionType === "quality") {
+      verdict = "not-an-upgrade";
+      note = `Sonarr's own decision rejects this mapping on quality/revision grounds ("${upgradeRejection.reason}") — the new file is NOT better than the existing episode file(s). A higher custom-format score does not override a lower quality. Do not import.`;
+    } else if (rejectionType === "already-imported") {
+      verdict = "not-an-upgrade";
+      note = `Sonarr reports the episode is already imported ("${upgradeRejection.reason}"). Do not import.`;
+    } else if (!releaseContext.available) {
+      if (seasonPack) {
+        verdict = "cf-assessment-ambiguous";
+        note = "Sonarr rejected the individual file on a per-file Custom Format basis, and this is a season pack whose release-level CF metadata is not present in the file names. The tracked release's custom-format context is unavailable, so the pending-candidate CF comparison cannot be computed. This is NOT sufficient evidence to remove/blocklist the release — resolve the queue context (sonarr_get_queue) and re-preview. Execution requires explicit allowRejected=true.";
+      } else {
+        verdict = "not-an-upgrade";
+        note = `Sonarr's own decision rejects this mapping ("${upgradeRejection.reason}") — the new file is NOT better than the existing episode file(s). Do not import.`;
+      }
+    } else if (!effectiveSeriesMatchesQueue) {
+      verdict = "cf-assessment-ambiguous";
+      note = "The candidate was remapped to a series other than the tracked release's series, so the tracked release's custom-format matches do not safely apply to the effective series. The CF comparison is ambiguous — verify the target series' quality profile before deciding. Execution requires explicit allowRejected=true.";
+    } else if (!customFormatAssessment || !customFormatAssessment.scoreAttributionValid || !(customFormatAssessment.effectiveCandidate as { score: number } | null)) {
+      verdict = "cf-assessment-ambiguous";
+      note = "The tracked-release and file custom-format IDs could not be fully attributed to the effective series' quality profile, so the pending-candidate CF score is not reliable for a hard verdict. This is NOT sufficient evidence to remove/blocklist the release. Execution requires explicit allowRejected=true.";
+    } else if (comparison === "upgrade") {
+      verdict = "cf-upgrade-with-native-rejection";
+      note = "The tracked release + file CF evidence scores this pending candidate above the existing file(s), but Sonarr's native manual-import decision rejected the individual file using its file/import CF context. Do not remove or blocklist this release solely because of that per-file CF rejection. Execution still requires explicit allowRejected=true.";
+    } else if (comparison === "downgrade" || comparison === "neutral") {
+      verdict = "not-an-upgrade";
+      note = `Sonarr's own decision rejects this mapping ("${upgradeRejection.reason}") and the tracked-release + file CF evidence confirms the pending candidate does not improve on the existing file(s). Do not import.`;
+    } else {
+      verdict = "cf-assessment-ambiguous";
+      note = "The pending candidate's effective CF score is better than some existing files and worse than others (mixed). Decide per episode; a per-file CF rejection is not sufficient evidence to blocklist the whole release. Execution requires explicit allowRejected=true.";
+    }
   } else if (existingFiles.length === 0) {
     verdict = "no-existing-file";
     note = "No existing file for the mapped episodes — importing fills a gap.";
@@ -2360,7 +2647,22 @@ async function assessSonarrUpgrade(
     verdict = "no-upgrade-rejection";
     note = "Sonarr evaluated this mapping and raised NO upgrade rejection — the new file is equal to or better than the existing file(s) (equal quality + equal CF surfaces no warning: neutral, allowed replacement). Compare the listed existing quality names and custom format scores against the candidate (newQualityWeight/newCustomFormatScore) to judge upgrade vs neutral.";
   }
-  return { verdict, newQualityWeight, newCustomFormatScore, existingFiles, note };
+
+  return {
+    verdict,
+    newQualityWeight,
+    newCustomFormatScore: fileNativeScore,
+    existingFiles,
+    note,
+    customFormatAssessment,
+    releaseContext: {
+      available: releaseContext.available,
+      usableForEffectiveScore,
+      reason: effectiveSeriesMatchesQueue ? releaseContext.reason : "effective-series-mismatch",
+      metadataInheritanceLikely: seasonPack,
+    },
+    nativeImportRejection: upgradeRejection?.reason ?? null,
+  };
 }
 
 function mappingRequiredEntry(candidateId: number, name: string | null, path: string, missing: string[]) {
@@ -2402,6 +2704,10 @@ async function previewSonarrManualImport(client: SonarrClient, args: unknown) {
   const episodeCache = new Map<string, SonarrEpisodeWithFile[]>();
   const fileCache = new Map<number, SonarrEpisodeFile[]>();
   const seriesCache = new Map<number, { id: number; title: string | null }>();
+  // Tracked-release CF context and quality-profile scores are resolved once per
+  // preview call and reused for every candidate from the same download.
+  const releaseContext = await findSonarrReleaseContext(client, downloadId);
+  const profileCache = new Map<number, Map<number, { name: string; score: number }> | null>();
   for (const { candidate, override } of previewable) {
     const r = byId.get(candidate.id);
     if (!r) {
@@ -2421,7 +2727,7 @@ async function previewSonarrManualImport(client: SonarrClient, args: unknown) {
       episodeCache,
     );
     const upgradeAssessment = mappingValid && episodeValidation.ok !== false
-      ? await assessSonarrUpgrade(client, candidate, r, seriesId, episodes, rejections, episodeCache, fileCache)
+      ? await assessSonarrUpgrade(client, candidate, r, seriesId, episodes, rejections, episodeCache, fileCache, releaseContext, profileCache)
       : null;
     previews.push({
       candidateId: candidate.id,
