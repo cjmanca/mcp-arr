@@ -29,7 +29,26 @@ import {
   ProwlarrClient,
   ArrService,
 } from "./arr-client.js";
-import type { QueueStatusMessage } from "./arr-client.js";
+import type {
+  QueueStatusMessage,
+  ManualImportQuality,
+  ManualImportLanguage,
+  ManualImportRejection,
+  LidarrManualImportRejection,
+  SonarrManualImportCandidate,
+  SonarrManualImportReprocessItem,
+  SonarrManualImportCommandFile,
+  SonarrManualImportEpisode,
+  SonarrEpisodeFile,
+  SonarrEpisodeWithFile,
+  RadarrManualImportCandidate,
+  RadarrManualImportReprocessItem,
+  RadarrManualImportCommandFile,
+  LidarrManualImportCandidate,
+  LidarrManualImportUpdateItem,
+  LidarrManualImportCommandFile,
+  LidarrTrack,
+} from "./arr-client.js";
 import { trashClient, TrashService } from "./trash-client.js";
 
 // Read from package.json rather than hardcoding, so the version reported to
@@ -308,6 +327,131 @@ if (clients.sonarr) {
           },
         },
         required: ["queueId"],
+      },
+    },
+    {
+      name: "sonarr_get_manual_import_candidates",
+      description: "Discover Sonarr's native manual-import candidates for a tracked download (read-only). Sonarr resolves the download location from the downloadId — never supply a path. Returns each candidate's candidateId (the native manual-import resource id), display path, quality, languages, mapped series/season/episodes, custom formats, and structured rejections (e.g. 'Unable to determine if file is a sample'). IMPORTANT: the returned mapping and rejection reasons are Sonarr's PARSE GUESSES from the release name — NOT facts. Verify against sonarr_get_episodes before recommending execute/allowRejected. The release name's TITLE is the verification key: number mismatches alone are expected mapping-source differences (TheTVDB/TMDB/absolute numbering), not errors; the mapping is suspect only when the name contains an episode title that does not match the detected episodes' titles (match by meaning, not exact string — fan-sub/anime translations differ). On a title mismatch, search seasons in order: Sonarr's guessed season, the release title's season, Specials (seasonNumber=0), then other seasons nearest-outward. Use sonarr_get_queue first to find the downloadId. Workflow: get candidates -> preview corrected mapping if needed -> execute manual import -> re-check queue.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          downloadId: {
+            type: "string",
+            description: "Tracked download ID from sonarr_get_queue (required)",
+          },
+          seriesId: {
+            type: "number",
+            description: "Optional series hint passed to the native endpoint",
+          },
+          seasonNumber: {
+            type: "number",
+            description: "Optional season hint passed to the native endpoint",
+          },
+          filterExistingFiles: {
+            type: "boolean",
+            description: "Filter out files that already map to existing episode files (native filterExistingFiles, default: true)",
+          },
+        },
+        required: ["downloadId"],
+      },
+    },
+    {
+      name: "sonarr_preview_manual_import",
+      description: "Preview (reprocess) a manual import in Sonarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (seriesId/seasonNumber/episodeIds/releaseGroup), sends Sonarr's native manual-import reprocess request, and returns Sonarr's recalculated mapping, quality, languages and rejections. Candidates with no valid series mapping (and no seriesId override) are returned as mappingRequired/canPreview=false and are never sent to Sonarr — a 0 seriesId is never submitted, because Sonarr's reprocess resolves the series and throws for unknown ids. Use this to fix unparseable filenames or wrong episode mappings and inspect the result; then run sonarr_execute_manual_import with the same overrides. Non-destructive: never moves, copies, or imports files.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          downloadId: {
+            type: "string",
+            description: "Tracked download ID from sonarr_get_queue (required)",
+          },
+          items: {
+            type: "array",
+            description: "Candidates to preview, each identified by candidateId from sonarr_get_manual_import_candidates. Mapping overrides are optional; omitted fields keep Sonarr's current values.",
+            items: {
+              type: "object",
+              properties: {
+                candidateId: {
+                  type: "number",
+                  description: "Candidate id from sonarr_get_manual_import_candidates (required)",
+                },
+                seriesId: {
+                  type: "number",
+                  description: "Override the series this file should import as",
+                },
+                seasonNumber: {
+                  type: "number",
+                  description: "Override the season number",
+                },
+                episodeIds: {
+                  type: "array",
+                  items: { type: "number" },
+                  description: "Override the episode IDs to map this file to (from sonarr_get_episodes)",
+                },
+                releaseGroup: {
+                  type: "string",
+                  description: "Override the release group",
+                },
+              },
+              required: ["candidateId"],
+            },
+          },
+        },
+        required: ["downloadId", "items"],
+      },
+    },
+    {
+      name: "sonarr_execute_manual_import",
+      description: "Execute a manual import in Sonarr (DESTRUCTIVE: moves/copies media files). Always re-validates from scratch: re-fetches native candidates for the downloadId, resolves each candidateId (fails if a candidate disappeared or is ambiguous), merges only permitted mapping overrides, reprocesses through Sonarr's native endpoint, verifies series/episode/quality mapping, then queues Sonarr's native ManualImport command with an explicit importMode. Caller-supplied paths are never accepted — paths come only from native candidates. Candidates with no valid series mapping are refused before any native request (never sent with a fabricated 0). Candidates with remaining rejections are refused unless that item sets allowRejected=true (mirrors the Interactive Import 'import anyway' override; authorization is per candidate, so a multi-file release can import one file despite its rejection while a rejected file you did not authorize stays blocked). VERIFY BEFORE EXECUTING: Sonarr's suggested mapping and rejections are parse guesses, not facts — confirm the mapping against sonarr_get_episodes (check Specials when the release name carries a title) before authorizing an import. Returns the command id — the import runs asynchronously, so re-check sonarr_get_queue afterwards. Does NOT delete queue items.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          downloadId: {
+            type: "string",
+            description: "Tracked download ID from sonarr_get_queue (required)",
+          },
+          items: {
+            type: "array",
+            description: "Candidates to import, each identified by candidateId, with the same optional mapping overrides as sonarr_preview_manual_import. Preview first when the mapping needs correcting.",
+            items: {
+              type: "object",
+              properties: {
+                candidateId: {
+                  type: "number",
+                  description: "Candidate id from sonarr_get_manual_import_candidates (required)",
+                },
+                seriesId: {
+                  type: "number",
+                  description: "Override the series this file should import as (positive id; 0 is never sent to Sonarr)",
+                },
+                seasonNumber: {
+                  type: "number",
+                  description: "Override the season number",
+                },
+                episodeIds: {
+                  type: "array",
+                  items: { type: "number" },
+                  description: "Override the episode IDs to map this file to (from sonarr_get_episodes)",
+                },
+                releaseGroup: {
+                  type: "string",
+                  description: "Override the release group",
+                },
+                allowRejected: {
+                  type: "boolean",
+                  description: "Import THIS candidate even when Sonarr reports remaining rejections for it (default: false). Only set true after reasoning about each rejection from the preview result.",
+                },
+              },
+              required: ["candidateId"],
+            },
+          },
+          importMode: {
+            type: "string",
+            enum: ["auto", "copy", "move"],
+            description: "Import mode sent explicitly to Sonarr's ManualImport command (default: auto, matching queue-driven Interactive Import)",
+          },
+        },
+        required: ["downloadId", "items"],
       },
     },
     {
@@ -633,6 +777,109 @@ if (clients.radarr) {
       },
     },
     {
+      name: "radarr_get_manual_import_candidates",
+      description: "Discover Radarr's native manual-import candidates for a tracked download (read-only). Radarr resolves the download location from the downloadId — never supply a path. Returns each candidate's candidateId (the native manual-import resource id), display path, quality, languages, mapped movie, custom formats, and structured rejections. Use radarr_get_queue first to find the downloadId. Workflow: get candidates -> preview corrected mapping if needed -> execute manual import -> re-check queue.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          downloadId: {
+            type: "string",
+            description: "Tracked download ID from radarr_get_queue (required)",
+          },
+          movieId: {
+            type: "number",
+            description: "Optional movie hint passed to the native endpoint",
+          },
+          filterExistingFiles: {
+            type: "boolean",
+            description: "Filter out files that already map to existing movie files (native filterExistingFiles, default: true)",
+          },
+        },
+        required: ["downloadId"],
+      },
+    },
+    {
+      name: "radarr_preview_manual_import",
+      description: "Preview (reprocess) a manual import in Radarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (movieId/releaseGroup), sends Radarr's native manual-import reprocess request, and returns Radarr's recalculated mapping, quality, languages and rejections. Candidates with no valid movie mapping (and no movieId override) are returned as mappingRequired/canPreview=false and are never sent to Radarr — a 0 movieId is never submitted, because Radarr's reprocess resolves the movie and throws for unknown ids. Use this to fix unparseable filenames or wrong movie mappings and inspect the result; then run radarr_execute_manual_import with the same overrides. Non-destructive: never moves, copies, or imports files.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          downloadId: {
+            type: "string",
+            description: "Tracked download ID from radarr_get_queue (required)",
+          },
+          items: {
+            type: "array",
+            description: "Candidates to preview, each identified by candidateId from radarr_get_manual_import_candidates. Mapping overrides are optional; omitted fields keep Radarr's current values.",
+            items: {
+              type: "object",
+              properties: {
+                candidateId: {
+                  type: "number",
+                  description: "Candidate id from radarr_get_manual_import_candidates (required)",
+                },
+                movieId: {
+                  type: "number",
+                  description: "Override the movie this file should import as",
+                },
+                releaseGroup: {
+                  type: "string",
+                  description: "Override the release group",
+                },
+              },
+              required: ["candidateId"],
+            },
+          },
+        },
+        required: ["downloadId", "items"],
+      },
+    },
+    {
+      name: "radarr_execute_manual_import",
+      description: "Execute a manual import in Radarr (DESTRUCTIVE: moves/copies media files). Always re-validates from scratch: re-fetches native candidates for the downloadId, resolves each candidateId (fails if a candidate disappeared or is ambiguous), merges only permitted mapping overrides, reprocesses through Radarr's native endpoint, verifies movie/quality mapping, then queues Radarr's native ManualImport command with an explicit importMode. Caller-supplied paths are never accepted — paths come only from native candidates. Candidates with no valid movie mapping are refused before any native request (never sent with a fabricated 0). Candidates with remaining rejections are refused unless that item sets allowRejected=true (mirrors the Interactive Import 'import anyway' override; authorization is per candidate). VERIFY BEFORE EXECUTING: Radarr's suggested mapping and rejections are parse guesses, not facts — confirm the movie (title/year/edition) against radarr_get_movies before authorizing an import. Returns the command id — the import runs asynchronously, so re-check radarr_get_queue afterwards. Does NOT delete queue items.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          downloadId: {
+            type: "string",
+            description: "Tracked download ID from radarr_get_queue (required)",
+          },
+          items: {
+            type: "array",
+            description: "Candidates to import, each identified by candidateId, with the same optional mapping overrides as radarr_preview_manual_import. Preview first when the mapping needs correcting.",
+            items: {
+              type: "object",
+              properties: {
+                candidateId: {
+                  type: "number",
+                  description: "Candidate id from radarr_get_manual_import_candidates (required)",
+                },
+                movieId: {
+                  type: "number",
+                  description: "Override the movie this file should import as (positive id; 0 is never sent to Radarr)",
+                },
+                releaseGroup: {
+                  type: "string",
+                  description: "Override the release group",
+                },
+                allowRejected: {
+                  type: "boolean",
+                  description: "Import THIS candidate even when Radarr reports remaining rejections for it (default: false). Only set true after reasoning about each rejection from the preview result.",
+                },
+              },
+              required: ["candidateId"],
+            },
+          },
+          importMode: {
+            type: "string",
+            enum: ["auto", "copy", "move"],
+            description: "Import mode sent explicitly to Radarr's ManualImport command (default: auto, matching queue-driven Interactive Import)",
+          },
+        },
+        required: ["downloadId", "items"],
+      },
+    },
+    {
       name: "radarr_search_movies",
       description: "Trigger a search for multiple movies at once. Accepts an array of movie IDs. Use this for bulk upgrade requests instead of calling radarr_search_movie one at a time.",
       inputSchema: {
@@ -844,6 +1091,147 @@ if (clients.lidarr) {
           },
         },
         required: ["queueId"],
+      },
+    },
+    {
+      name: "lidarr_get_manual_import_candidates",
+      description: "Discover Lidarr's native manual-import candidates for a tracked download (read-only). Lidarr resolves the download location from the downloadId — never supply a path. Returns each candidate's candidateId (the native manual-import resource id), display path, quality, mapped artist/album/albumReleaseId/tracks, additionalFile/replaceExistingFiles/disableReleaseSwitching flags, and rejections (Lidarr serializes them as {message} objects). An untracked downloadId yields an empty list. Use lidarr_get_queue first to find the downloadId. Workflow: get candidates -> preview corrected mapping if needed -> execute manual import -> re-check queue.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          downloadId: {
+            type: "string",
+            description: "Tracked download ID from lidarr_get_queue (required)",
+          },
+          artistId: {
+            type: "number",
+            description: "Optional artist hint passed to the native endpoint",
+          },
+          filterExistingFiles: {
+            type: "boolean",
+            description: "Filter to files matching the tracked release (native filterExistingFiles, default: true)",
+          },
+          replaceExistingFiles: {
+            type: "boolean",
+            description: "Native replaceExistingFiles discovery option (default: false, matching the Interactive Import UI)",
+          },
+        },
+        required: ["downloadId"],
+      },
+    },
+    {
+      name: "lidarr_preview_manual_import",
+      description: "Preview (update/reprocess) a manual import in Lidarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (artistId/albumId/albumReleaseId/trackIds/disableReleaseSwitching), sends Lidarr's native POST /manualimport update, and returns the resulting mapping and rejections. IMPORTANT Lidarr semantics: the backend re-runs its import decision with the artist/album/release overrides and RECOMPUTES the track mapping itself — the native update request has no trackIds field. Supplied trackIds are validated against the selected album release's track list (GET /track?albumReleaseId=…) and PRESERVED: the preview response shows exactly the tracks that lidarr_execute_manual_import will import (tracksSource marks caller-override vs lidarr-recomputed). Non-destructive: never moves, copies, or imports files.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          downloadId: {
+            type: "string",
+            description: "Tracked download ID from lidarr_get_queue (required)",
+          },
+          items: {
+            type: "array",
+            description: "Candidates to preview, each identified by candidateId from lidarr_get_manual_import_candidates. Mapping overrides are optional; omitted fields keep Lidarr's current values.",
+            items: {
+              type: "object",
+              properties: {
+                candidateId: {
+                  type: "number",
+                  description: "Candidate id from lidarr_get_manual_import_candidates (required)",
+                },
+                artistId: {
+                  type: "number",
+                  description: "Override the artist this file should import as",
+                },
+                albumId: {
+                  type: "number",
+                  description: "Override the album this file should import as",
+                },
+                albumReleaseId: {
+                  type: "number",
+                  description: "Override the album release (from the album's releases)",
+                },
+                trackIds: {
+                  type: "array",
+                  items: { type: "number" },
+                  description: "Explicit track mapping override: validated against the selected album release's track list and preserved into the preview result (and the eventual command). Omit to use Lidarr's server-side recomputed tracks.",
+                },
+                disableReleaseSwitching: {
+                  type: "boolean",
+                  description: "Turn off anyReleaseOk for the album when importing (native disableReleaseSwitching)",
+                },
+              },
+              required: ["candidateId"],
+            },
+          },
+          replaceExistingFiles: {
+            type: "boolean",
+            description: "Consider replacing existing track files during reprocessing (default: false, matching the Interactive Import UI)",
+          },
+        },
+        required: ["downloadId", "items"],
+      },
+    },
+    {
+      name: "lidarr_execute_manual_import",
+      description: "Execute a manual import in Lidarr (DESTRUCTIVE: moves/copies media files). Always re-validates from scratch: re-fetches native candidates for the downloadId, resolves each candidateId (fails if a candidate disappeared or is ambiguous), merges only permitted mapping overrides, reprocesses through Lidarr's native POST /manualimport (which recomputes the track mapping server-side), verifies artist/album/release/track/quality mapping against the reprocessed result, then queues Lidarr's native ManualImport command with explicit importMode and replaceExistingFiles. Caller-supplied paths are never accepted — paths come only from native candidates. Explicit trackIds overrides are validated against the selected album release's track list (GET /track?albumReleaseId=…) and PRESERVED into the final command (Lidarr's server-side recomputation is used only when trackIds is omitted) — this is how a corrected track mapping survives reprocessing. Candidates with remaining rejections are refused unless that item sets allowRejected=true (the override decision is yours, per candidate). VERIFY BEFORE EXECUTING: Lidarr's suggested artist/album/release/track mapping and rejections are parse guesses, not facts — confirm the album and track list against lidarr_get_albums before authorizing an import. Returns the command id — the import runs asynchronously, so re-check lidarr_get_queue afterwards. Does NOT delete queue items.",
+      inputSchema: {
+        type: "object" as const,
+        properties: {
+          downloadId: {
+            type: "string",
+            description: "Tracked download ID from lidarr_get_queue (required)",
+          },
+          items: {
+            type: "array",
+            description: "Candidates to import, each identified by candidateId, with the same optional mapping overrides as lidarr_preview_manual_import. Preview first when the mapping needs correcting.",
+            items: {
+              type: "object",
+              properties: {
+                candidateId: {
+                  type: "number",
+                  description: "Candidate id from lidarr_get_manual_import_candidates (required)",
+                },
+                artistId: {
+                  type: "number",
+                  description: "Override the artist this file should import as",
+                },
+                albumId: {
+                  type: "number",
+                  description: "Override the album this file should import as",
+                },
+                albumReleaseId: {
+                  type: "number",
+                  description: "Override the album release (from the album's releases)",
+                },
+                trackIds: {
+                  type: "array",
+                  items: { type: "number" },
+                  description: "Explicit track mapping override: validated strictly against the selected album release's track list (GET /track?albumReleaseId=…) and used as-is in the final ManualImport command. Tracks from other releases of the same album are refused. Omit to use Lidarr's server-side recomputed tracks.",
+                },
+                disableReleaseSwitching: {
+                  type: "boolean",
+                  description: "Turn off anyReleaseOk for the album when importing (native disableReleaseSwitching)",
+                },
+                allowRejected: {
+                  type: "boolean",
+                  description: "Import THIS candidate even when Lidarr reports remaining rejections for it (default: false). Only set true after reasoning about each rejection from the preview result.",
+                },
+              },
+              required: ["candidateId"],
+            },
+          },
+          importMode: {
+            type: "string",
+            enum: ["auto", "copy", "move"],
+            description: "Import mode sent explicitly to Lidarr's ManualImport command (default: auto, matching queue-driven Interactive Import)",
+          },
+          replaceExistingFiles: {
+            type: "boolean",
+            description: "Allow the import to replace existing track files (default: false — the safer non-destructive behavior used by the Interactive Import UI)",
+          },
+        },
+        required: ["downloadId", "items"],
       },
     }
   );
@@ -1354,6 +1742,1186 @@ async function getPaginatedQueue(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Manual / Interactive Import orchestration
+//
+// Security model (intentionally narrower than raw authenticated API access):
+//
+//   downloadId → native /manualimport candidate discovery → candidateId
+//     → optional mapping overrides → native reprocessing → ManualImport command
+//
+// A candidate may only be previewed or imported if it was returned by the
+// native manual-import endpoint for the specified downloadId. The model never
+// supplies a filesystem path: paths are taken exclusively from freshly fetched
+// native candidates. No candidate state is cached between MCP calls — every
+// preview and every execute re-fetches and re-reprocesses from scratch.
+// ---------------------------------------------------------------------------
+
+type ManualImportMode = "auto" | "copy" | "move";
+const MANUAL_IMPORT_MODES: ManualImportMode[] = ["auto", "copy", "move"];
+
+interface ManualImportOverrideItem {
+  candidateId: number;
+  // Sonarr
+  seriesId?: number;
+  seasonNumber?: number;
+  episodeIds?: number[];
+  // Radarr
+  movieId?: number;
+  // Lidarr
+  artistId?: number;
+  albumId?: number;
+  albumReleaseId?: number;
+  trackIds?: number[];
+  disableReleaseSwitching?: boolean;
+  // Sonarr/Radarr/Lidarr
+  releaseGroup?: string;
+  /**
+   * Per-candidate rejection bypass (execute tools only). Authorization is
+   * deliberately scoped to the single candidate it is set on — a request-wide
+   * boolean would grant broader authority than necessary for multi-file
+   * releases.
+   */
+  allowRejected?: boolean;
+}
+
+interface ManualImportToolArgs {
+  downloadId?: string;
+  items?: ManualImportOverrideItem[];
+  importMode?: ManualImportMode;
+  replaceExistingFiles?: boolean;
+  // discovery hints
+  seriesId?: number;
+  seasonNumber?: number;
+  movieId?: number;
+  artistId?: number;
+  filterExistingFiles?: boolean;
+}
+
+function parseManualImportArgs(args: unknown): {
+  downloadId: string;
+  items: ManualImportOverrideItem[];
+  importMode: ManualImportMode;
+  replaceExistingFiles: boolean;
+} {
+  const a = (args ?? {}) as ManualImportToolArgs;
+  if (typeof a.downloadId !== "string" || a.downloadId.trim() === "") {
+    throw new Error(
+      "downloadId is required (from *_get_queue). Manual import operates only on a tracked download — a caller-supplied filesystem path is never accepted.",
+    );
+  }
+  if (!Array.isArray(a.items) || a.items.length === 0) {
+    throw new Error(
+      "items is required: at least one { candidateId, ... } entry taken from *_get_manual_import_candidates for this downloadId.",
+    );
+  }
+  for (const item of a.items) {
+    if (!item || typeof item.candidateId !== "number" || !Number.isInteger(item.candidateId)) {
+      throw new Error("every item must include a numeric candidateId from *_get_manual_import_candidates.");
+    }
+    // Entity ids, when supplied, must be real positive ids. 0/negative values
+    // are never valid native entity ids and must not be forwarded to the
+    // *arr APIs (Sonarr/Radarr/Lidarr all throw on id 0 lookups).
+    for (const key of ["seriesId", "movieId", "artistId", "albumId", "albumReleaseId"] as const) {
+      const value = item[key];
+      if (value !== undefined && (typeof value !== "number" || !Number.isInteger(value) || value <= 0)) {
+        throw new Error(`item ${key} must be a positive integer id when supplied (0 is never a valid native id).`);
+      }
+    }
+    for (const key of ["episodeIds", "trackIds"] as const) {
+      const value = item[key];
+      if (value !== undefined) {
+        if (!Array.isArray(value) || value.length === 0 || value.some((id) => typeof id !== "number" || !Number.isInteger(id) || id <= 0)) {
+          throw new Error(`item ${key} must be a non-empty array of positive integer ids when supplied.`);
+        }
+      }
+    }
+  }
+  const importMode = a.importMode ?? "auto";
+  if (!MANUAL_IMPORT_MODES.includes(importMode)) {
+    throw new Error(`importMode must be one of: ${MANUAL_IMPORT_MODES.join(", ")}.`);
+  }
+  return {
+    downloadId: a.downloadId.trim(),
+    items: a.items,
+    // importMode is ALWAYS sent explicitly to the native command; "auto"
+    // mirrors the queue-driven Interactive Import behavior of the *arr UIs.
+    importMode,
+    // Lidarr's Interactive Import UI defaults replaceExistingFiles to false
+    // (the safer, non-destructive behavior); match it.
+    replaceExistingFiles: a.replaceExistingFiles === true,
+  };
+}
+
+/**
+ * Resolve caller-supplied candidateIds against a freshly fetched native
+ * candidate list. A candidateId that is not currently present is a hard
+ * failure — this is what keeps execute from importing stale or fabricated
+ * state.
+ *
+ * Resolution requires EXACTLY ONE match. Native candidate ids are 31-bit
+ * hashes of the file path (HashConverter.GetHashInt31), so collisions are
+ * possible; when two current candidates share an id, choosing one
+ * automatically (e.g. `.find()`) could import the wrong file. We refuse and
+ * tell the caller to disambiguate by re-running discovery — never by
+ * supplying a path, which the execute API intentionally does not trust.
+ */
+function resolveManualImportCandidates<T extends { id: number; path: string }>(
+  service: string,
+  candidates: T[],
+  items: ManualImportOverrideItem[],
+): Array<{ candidate: T; override: ManualImportOverrideItem }> {
+  return items.map((override) => {
+    const matches = candidates.filter((c) => c.id === override.candidateId);
+    if (matches.length === 0) {
+      const available = candidates.map((c) => c.id).join(", ") || "none";
+      throw new Error(
+        `candidateId ${override.candidateId} is not among ${service}'s current manual-import candidates for this download (available candidateIds: ${available}). The files or queue state changed since discovery — re-run the *_get_manual_import_candidates tool before previewing or executing.`,
+      );
+    }
+    if (matches.length > 1) {
+      throw new Error(
+        `candidateId ${override.candidateId} matches ${matches.length} current manual-import candidates (${matches.map((c) => c.path).join("; ")}). ${service}'s native candidate ids are path hashes and can collide; refusing to choose one automatically. Re-run ${service}_get_manual_import_candidates and select the intended file — do not supply a path to disambiguate.`,
+      );
+    }
+    return { candidate: matches[0], override };
+  });
+}
+
+/** The native UI requires a quality object on every imported file. */
+function hasManualImportQuality(quality?: ManualImportQuality | null): boolean {
+  return !!quality && !!quality.quality;
+}
+
+function compactSonarrCandidate(c: SonarrManualImportCandidate) {
+  return {
+    candidateId: c.id,
+    // path/relativePath are for DISPLAY ONLY; execute never accepts a caller path.
+    path: c.path,
+    relativePath: c.relativePath ?? null,
+    folderName: c.folderName ?? null,
+    name: c.name ?? null,
+    size: c.size ?? null,
+    downloadId: c.downloadId ?? null,
+    series: c.series ? { id: c.series.id, title: c.series.title } : null,
+    seasonNumber: c.seasonNumber ?? null,
+    episodes: (c.episodes ?? []).map((e) => ({
+      id: e.id,
+      seasonNumber: e.seasonNumber ?? null,
+      episodeNumber: e.episodeNumber ?? null,
+      title: e.title ?? null,
+    })),
+    episodeFileId: c.episodeFileId ?? null,
+    quality: c.quality ?? null,
+    languages: c.languages ?? [],
+    qualityWeight: c.qualityWeight ?? null,
+    releaseGroup: c.releaseGroup ?? null,
+    indexerFlags: c.indexerFlags ?? 0,
+    releaseType: c.releaseType ?? null,
+    customFormats: (c.customFormats ?? []).map((cf) => ({ id: cf.id ?? null, name: cf.name ?? null, score: cf.score ?? null })),
+    customFormatScore: c.customFormatScore ?? null,
+    rejections: (c.rejections ?? []).map((r) => ({ reason: r.reason, type: r.type ?? null })),
+  };
+}
+
+function compactRadarrCandidate(c: RadarrManualImportCandidate) {
+  return {
+    candidateId: c.id,
+    path: c.path,
+    relativePath: c.relativePath ?? null,
+    folderName: c.folderName ?? null,
+    name: c.name ?? null,
+    size: c.size ?? null,
+    downloadId: c.downloadId ?? null,
+    movie: c.movie ? { id: c.movie.id, title: c.movie.title, year: c.movie.year ?? null } : null,
+    movieFileId: c.movieFileId ?? null,
+    quality: c.quality ?? null,
+    languages: c.languages ?? [],
+    qualityWeight: c.qualityWeight ?? null,
+    releaseGroup: c.releaseGroup ?? null,
+    indexerFlags: c.indexerFlags ?? 0,
+    customFormats: (c.customFormats ?? []).map((cf) => ({ id: cf.id ?? null, name: cf.name ?? null, score: cf.score ?? null })),
+    customFormatScore: c.customFormatScore ?? null,
+    rejections: (c.rejections ?? []).map((r) => ({ reason: r.reason, type: r.type ?? null })),
+  };
+}
+
+function compactLidarrCandidate(c: LidarrManualImportCandidate) {
+  return {
+    candidateId: c.id,
+    path: c.path,
+    name: c.name ?? null,
+    size: c.size ?? null,
+    downloadId: c.downloadId ?? null,
+    artist: c.artist ? { id: c.artist.id, artistName: c.artist.artistName } : null,
+    album: c.album ? { id: c.album.id, title: c.album.title } : null,
+    albumReleaseId: c.albumReleaseId ?? 0,
+    tracks: (c.tracks ?? []).map((t) => ({
+      id: t.id,
+      title: t.title ?? null,
+      trackNumber: t.trackNumber ?? null,
+      position: t.position ?? null,
+      mediumNumber: t.mediumNumber ?? null,
+    })),
+    quality: c.quality ?? null,
+    releaseGroup: c.releaseGroup ?? null,
+    qualityWeight: c.qualityWeight ?? null,
+    indexerFlags: c.indexerFlags ?? 0,
+    // Lidarr's core Rejection serializes as { reason, type } like Sonarr/Radarr
+    // (reason may be null; type omitted when default — {} is valid).
+    rejections: (c.rejections ?? []).map((r) => ({ reason: r.reason ?? null, type: r.type ?? null })),
+    additionalFile: c.additionalFile ?? false,
+    replaceExistingFiles: c.replaceExistingFiles ?? null,
+    disableReleaseSwitching: c.disableReleaseSwitching ?? false,
+  };
+}
+
+/**
+ * Prominent directive returned FIRST in Sonarr discovery/preview responses.
+ * Agents have repeatedly treated Sonarr's suggested mapping and rejection
+ * reasons as fact, recommended allowRejected=true, and imported files into
+ * the wrong episodes — a complete-looking mapping (mappingValid: true) is
+ * still only a parse guess. This must be verified, not trusted.
+ */
+const SONARR_VERIFY_DIRECTIVE = [
+  "Sonarr's suggested mapping and rejection reasons are PARSE GUESSES derived from the release name — NOT verified facts. A complete-looking mapping (mappingValid: true) can still point at the wrong episodes, and a rejection is Sonarr's opinion, not ground truth.",
+  "Before recommending execute — especially before setting allowRejected=true — independently VERIFY the mapping against the series' episode list (sonarr_get_episodes). Do not treat the suggested mapping as fact.",
+  "The TITLE is the verification key, not the numbers. When episode/season numbers in the release name differ from Sonarr's detected numbers, that is usually just a mapping-source difference (TheTVDB/TMDB/absolute-numbering conventions) — a number mismatch alone is NOT evidence of a wrong mapping. The mapping is considered wrong when the release name contains an episode TITLE that does not match the detected episodes' titles. On a title match (by MEANING, not exact string — fan-sub/region translations, especially anime, differ from official titles), trust the mapping. On a title mismatch, search seasons in this order: 1) the season of the episode Sonarr guessed (may differ from the release title's season due to Sonarr's mapping); 2) the season specified in the release title, if different; 3) Specials (seasonNumber=0); 4) other seasons, closest to the specified season working outwards. If the name has only numbers, there is nothing to match — trust the mapping.",
+  "Rejection-specific rule: 'Single episode file contains all episodes in seasons' is almost NEVER a correctly mapped release. It usually means the file is named incorrectly, or the release is intended as a SPECIAL (and the release name will usually include the special's name). Treat Sonarr's multi-episode mapping in this case as suspect by default: run the title check above, and expect the answer to be a special (seasonNumber=0) or a corrected single-episode mapping — not the season-spanning episode list Sonarr proposes.",
+  "An existing file on the target episode is NOT by itself a reason to skip the import — COMPARE QUALITY. The preview's `upgradeAssessment` does this: Sonarr's own reprocess evaluates the existing file and raises 'Not an upgrade for existing episode file(s)' (quality profile), 'Not a Custom Format upgrade for existing episode file(s)' (CF score), or 'Episode already imported' when the new file is not better — including after a remap — so verdict 'not-an-upgrade' → DO NOT import. Verdict 'no-existing-file' → fills a gap. Verdict 'no-upgrade-rejection' means Sonarr evaluated the mapping and raised no upgrade rejection — the file is equal to or better than the existing one (equal quality + equal CF surfaces NO warning and is a neutral, allowed replacement); the existing file(s) are listed with quality name and CF score — compare them against the candidate's newQualityWeight/newCustomFormatScore to judge upgrade vs neutral. After remapping a mis-parsed release, the preview re-evaluates against the NEW target's existing file, so check the assessment POST-remap.",
+  "Worked example of a complete-looking mapping that was WRONG: 'Letterkenny S04 The Haunting of MoDean's II' — Sonarr mapped the file to S04E01–06 (six real season-4 episodes with unrelated titles) and the preview reported mappingValid: true. The signal was NOT the S04 number: it was that the name's title 'The Haunting of MoDean's II' matches none of the detected episode titles — it is the season-0 special of that title (episode 62640). Remap with seasonNumber=0 + episodeIds=[62640]; the special already has a file, so the import decision is the preview's `upgradeAssessment` verdict for that episode (equal quality + equal CF → no warning, neutral replacement; strictly worse → 'not an upgrade' rejection → skip).",
+];
+
+const RADARR_VERIFY_DIRECTIVE = [
+  "Radarr's suggested movie mapping and rejection reasons are PARSE GUESSES derived from the release name — NOT verified facts. A complete-looking mapping can point at the wrong movie (wrong year, wrong edition, sequel/confusion).",
+  "Before recommending execute — especially before setting allowRejected=true — independently VERIFY the mapping against your library (radarr_get_movies / radarr_search): title, year, and edition must plausibly match the release. Do not treat the suggested mapping as fact.",
+];
+
+const LIDARR_VERIFY_DIRECTIVE = [
+  "Lidarr's suggested artist/album/release mapping, track mapping, and rejection reasons are PARSE GUESSES derived from the files — NOT verified facts. A complete-looking mapping can point at the wrong album (wrong year, wrong edition, comp vs studio album).",
+  "Before recommending execute — especially before setting allowRejected=true — independently VERIFY the mapping (lidarr_get_artists / lidarr_get_albums): artist, album title, year/edition, and the track list must plausibly correspond to the files. Do not treat the suggested mapping as fact.",
+];
+
+function manualImportGuidance(service: string, downloadId: string) {
+  return [
+    `Preview is non-importing: nothing has been moved, copied, or imported.`,
+    `To import, call ${service}_execute_manual_import with the same downloadId and items (candidateId + any mapping overrides).`,
+    `Candidates with remaining rejections are refused by the execute tool unless that item sets allowRejected=true — decide per candidate, from the rejections above, whether overriding is appropriate.`,
+    `Candidates with no valid entity mapping (series/movie/artist+album) are reported as mappingRequired and are never sent to the native reprocess endpoint; supply an explicit id override first.`,
+    `Queue imports default to importMode=auto; command acceptance is asynchronous, so re-check ${service}_get_queue afterwards.`,
+  ];
+}
+
+function jsonTextError(data: unknown) {
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }],
+    isError: true,
+  };
+}
+
+// --- Sonarr -----------------------------------------------------------------
+
+function buildSonarrReprocessItem(
+  candidate: SonarrManualImportCandidate,
+  override: ManualImportOverrideItem,
+  downloadId: string,
+): SonarrManualImportReprocessItem {
+  // Only identity/mapping fields may be overridden; everything Sonarr already
+  // determined (quality, languages, indexer flags, release type) is taken from
+  // the freshly fetched candidate, mirroring the Interactive Import UI.
+  return {
+    id: candidate.id,
+    path: candidate.path,
+    seriesId: override.seriesId ?? candidate.series?.id ?? 0,
+    seasonNumber: override.seasonNumber ?? candidate.seasonNumber ?? null,
+    episodeIds:
+      override.episodeIds && override.episodeIds.length > 0
+        ? override.episodeIds
+        : (candidate.episodes ?? []).map((e) => e.id),
+    quality: candidate.quality ?? null,
+    languages: candidate.languages ?? [],
+    releaseGroup: override.releaseGroup ?? candidate.releaseGroup ?? null,
+    indexerFlags: candidate.indexerFlags ?? 0,
+    releaseType: candidate.releaseType ?? null,
+    downloadId: candidate.downloadId ?? downloadId,
+  };
+}
+
+/**
+ * Sonarr's reprocess service resolves the series via `seriesService.GetSeries`
+ * and throws for a missing id, so an unmapped candidate must never be sent to
+ * POST /manualimport with a fabricated 0. The caller must supply a real
+ * seriesId (discovered via sonarr_get_series) first.
+ */
+function sonarrEffectiveSeriesId(candidate: SonarrManualImportCandidate, override: ManualImportOverrideItem): number {
+  return override.seriesId ?? candidate.series?.id ?? candidate.seriesId ?? 0;
+}
+
+/**
+ * Compare a manual-import candidate against the files already on disk for its
+ * mapped episodes. Sonarr's own reprocess evaluates the existing file and
+ * raises "Not an upgrade for existing episode file(s)" (quality profile) /
+ * "Not a Custom Format upgrade for existing episode file(s)" (CF score) /
+ * "Episode already imported" when the new file is not better — including
+ * after a remap in preview. That rejection is the authoritative signal, so it
+ * drives the verdict. The native episode-file list (quality name + CF score
+ * per mapped episode) is included as data; a numeric qualityWeight comparison
+ * is only attempted when the server exposes qualityWeight on the files (it
+ * often does not).
+ */
+async function assessSonarrUpgrade(
+  client: SonarrClient,
+  candidate: SonarrManualImportCandidate,
+  reprocessed: SonarrManualImportCandidate,
+  seriesId: number,
+  episodes: SonarrManualImportEpisode[],
+  rejections: ManualImportRejection[],
+  episodeCache: Map<string, SonarrEpisodeWithFile[]>,
+): Promise<Record<string, unknown>> {
+  const newQualityWeight = reprocessed.qualityWeight ?? candidate.qualityWeight ?? 0;
+  const newCustomFormatScore = reprocessed.customFormatScore ?? candidate.customFormatScore ?? 0;
+  const upgradeRejection = rejections.find((r) =>
+    /not an upgrade|not a custom format upgrade|already imported/i.test(r.reason ?? ""));
+
+  const seasonNumber = reprocessed.seasonNumber ?? candidate.seasonNumber;
+  const existingFiles: Array<Record<string, unknown>> = [];
+  if (typeof seasonNumber === "number") {
+    const key = `${seriesId}:${seasonNumber}`;
+    let eps = episodeCache.get(key);
+    if (!eps) {
+      // Episode → episodeFileId → file list id: the episode resource is the
+      // only native shape that links files to episodes; the file list itself
+      // has no episode linkage.
+      const [episodesWithFiles, files] = await Promise.all([
+        client.getEpisodesWithFiles(seriesId, seasonNumber),
+        client.getEpisodeFiles(seriesId),
+      ]);
+      const fileById = new Map(files.map((f) => [f.id, f]));
+      eps = episodesWithFiles.map((ep) => ({ ...ep, _file: fileById.get(ep.episodeFileId ?? 0) })) as SonarrEpisodeWithFile[];
+      episodeCache.set(key, eps);
+    }
+    for (const e of episodes) {
+      const ep = eps.find((x) => x.id === e.id);
+      const f = (ep as { _file?: SonarrEpisodeFile } | undefined)?._file;
+      if (ep?.hasFile && f) {
+        existingFiles.push({
+          episodeId: e.id,
+          quality: f.quality?.quality?.name ?? null,
+          customFormatScore: f.customFormatScore ?? 0,
+          qualityCutoffNotMet: f.qualityCutoffNotMet ?? null,
+          releaseGroup: f.releaseGroup ?? null,
+        });
+      }
+    }
+  }
+
+  let verdict: string;
+  let note: string;
+  if (upgradeRejection) {
+    verdict = "not-an-upgrade";
+    note = `Sonarr's own decision rejects this mapping ("${upgradeRejection.reason}") — the new file is NOT better than the existing episode file(s). Do not import.`;
+  } else if (existingFiles.length === 0) {
+    verdict = "no-existing-file";
+    note = "No existing file for the mapped episodes — importing fills a gap.";
+  } else {
+    verdict = "no-upgrade-rejection";
+    note = "Sonarr evaluated this mapping and raised NO upgrade rejection — the new file is equal to or better than the existing file(s) (equal quality + equal CF surfaces no warning: neutral, allowed replacement). Compare the listed existing quality names and custom format scores against the candidate (newQualityWeight/newCustomFormatScore) to judge upgrade vs neutral.";
+  }
+  return { verdict, newQualityWeight, newCustomFormatScore, existingFiles, note };
+}
+
+function mappingRequiredEntry(candidateId: number, name: string | null, path: string, missing: string[]) {
+  return {
+    candidateId,
+    name,
+    path,
+    canPreview: false,
+    mappingRequired: true,
+    missing,
+  };
+}
+
+async function previewSonarrManualImport(client: SonarrClient, args: unknown) {
+  const { downloadId, items } = parseManualImportArgs(args);
+  const a = (args ?? {}) as ManualImportToolArgs;
+
+  const candidates = await client.getManualImportCandidates({
+    downloadId,
+    seriesId: a.seriesId,
+    filterExistingFiles: a.filterExistingFiles,
+  });
+  if (candidates.length === 0) {
+    throw new Error(
+      `Sonarr returned no manual-import candidates for downloadId '${downloadId}'. The download is likely no longer tracked — check sonarr_get_queue.`,
+    );
+  }
+
+  const resolved = resolveManualImportCandidates("Sonarr", candidates, items);
+  const previewable = resolved.filter(({ candidate, override }) => sonarrEffectiveSeriesId(candidate, override) > 0);
+  const unmapped = resolved.filter(({ candidate, override }) => sonarrEffectiveSeriesId(candidate, override) <= 0);
+
+  const reprocessed = previewable.length > 0
+    ? await client.reprocessManualImport(previewable.map(({ candidate, override }) => buildSonarrReprocessItem(candidate, override, downloadId)))
+    : [];
+  const byId = new Map(reprocessed.map((r) => [r.id, r]));
+
+  const previews: Array<Record<string, unknown>> = [];
+  const episodeCache = new Map<string, SonarrEpisodeWithFile[]>();
+  for (const { candidate, override } of previewable) {
+    const r = byId.get(candidate.id);
+    if (!r) {
+      throw new Error(
+        `Sonarr did not return candidate ${candidate.id} after reprocessing; the candidate changed — re-run sonarr_get_manual_import_candidates.`,
+      );
+    }
+    const seriesId = r.seriesId ?? sonarrEffectiveSeriesId(candidate, override);
+    const episodes = r.episodes ?? [];
+    const rejections = r.rejections ?? [];
+    const mappingValid = seriesId > 0 && episodes.length > 0 && hasManualImportQuality(r.quality);
+    const upgradeAssessment = mappingValid
+      ? await assessSonarrUpgrade(client, candidate, r, seriesId, episodes, rejections, episodeCache)
+      : null;
+    previews.push({
+      candidateId: candidate.id,
+      name: candidate.name ?? null,
+      path: candidate.path,
+      canPreview: true,
+      mappingRequired: false,
+      series: seriesId > 0 ? { id: seriesId, title: candidate.series?.title ?? null } : null,
+      seasonNumber: r.seasonNumber ?? null,
+      episodes: episodes.map((e) => ({
+        id: e.id,
+        seasonNumber: e.seasonNumber ?? null,
+        episodeNumber: e.episodeNumber ?? null,
+        title: e.title ?? null,
+      })),
+      episodeFileId: candidate.episodeFileId ?? null,
+      quality: r.quality ?? null,
+      languages: r.languages ?? [],
+      releaseGroup: r.releaseGroup ?? null,
+      indexerFlags: r.indexerFlags ?? 0,
+      releaseType: r.releaseType ?? null,
+      customFormatScore: r.customFormatScore ?? null,
+      rejections: rejections.map((rej) => ({ reason: rej.reason, type: rej.type ?? null })),
+      mappingValid,
+      canExecuteWithoutOverride: mappingValid && rejections.length === 0,
+      upgradeAssessment,
+    });
+  }
+
+  for (const { candidate, override } of unmapped) {
+    previews.push(mappingRequiredEntry(candidate.id, candidate.name ?? null, candidate.path, ["seriesId"]));
+  }
+
+  return {
+    verifyBeforeActing: SONARR_VERIFY_DIRECTIVE,
+    downloadId,
+    count: previews.length,
+    items: previews,
+    notes: [
+      "See verifyBeforeActing above: the release name's TITLE is the verification key (number mismatches alone are expected mapping-source differences, not errors).",
+    ],
+    guidance: manualImportGuidance("sonarr", downloadId),
+  };
+}
+
+async function executeSonarrManualImport(client: SonarrClient, args: unknown) {
+  const { downloadId, items, importMode } = parseManualImportArgs(args);
+
+  // Always re-discover from the native endpoint — never trust an earlier
+  // preview's data, and never accept a caller-supplied path.
+  const candidates = await client.getManualImportCandidates({ downloadId });
+  if (candidates.length === 0) {
+    throw new Error(
+      `Sonarr returned no manual-import candidates for downloadId '${downloadId}'. The download is likely no longer tracked — check sonarr_get_queue.`,
+    );
+  }
+
+  const resolved = resolveManualImportCandidates("Sonarr", candidates, items);
+
+  // Fail cleanly BEFORE any native request when a candidate has no valid
+  // series mapping: Sonarr's reprocess service resolves seriesId via
+  // GetSeries and throws for 0, so an unmapped item must be reported as
+  // mapping-required, never sent with a fabricated id.
+  const unmapped = resolved.filter(({ candidate, override }) => sonarrEffectiveSeriesId(candidate, override) <= 0);
+  if (unmapped.length > 0) {
+    return jsonTextError({
+      error: "Sonarr candidates selected for import have no valid series mapping; refusing to send them to the native manual-import endpoint.",
+      downloadId,
+      mappingRequired: unmapped.map(({ candidate }) => ({
+        candidateId: candidate.id,
+        name: candidate.name ?? null,
+        path: candidate.path,
+        mappingRequired: true,
+        missing: ["seriesId"],
+      })),
+      guidance: [
+        "1. Find the series id (sonarr_get_series / sonarr_search) and re-run sonarr_preview_manual_import with an explicit seriesId override per candidate.",
+        "2. Then execute with the same overrides. A 0 seriesId is never sent to Sonarr.",
+      ],
+    });
+  }
+
+  const payload = resolved.map(({ candidate, override }) => buildSonarrReprocessItem(candidate, override, downloadId));
+  const reprocessed = await client.reprocessManualImport(payload);
+  const byId = new Map(reprocessed.map((r) => [r.id, r]));
+
+  const files: SonarrManualImportCommandFile[] = [];
+  const blocked: Array<{ candidateId: number; name: string | null; rejections: ManualImportRejection[] }> = [];
+  const overriddenRejections: Array<{ candidateId: number; name: string | null; rejections: ManualImportRejection[] }> = [];
+  const episodeOwners = new Map<number, number>();
+
+  for (const { candidate, override } of resolved) {
+    const r = byId.get(candidate.id);
+    if (!r) {
+      throw new Error(
+        `Candidate ${candidate.id} (${candidate.name ?? candidate.path}) disappeared during reprocessing — the download changed; re-run sonarr_get_manual_import_candidates.`,
+      );
+    }
+
+    const seriesId = r.seriesId ?? sonarrEffectiveSeriesId(candidate, override);
+    const episodes = r.episodes ?? [];
+    const rejections = r.rejections ?? [];
+
+    if (seriesId <= 0) {
+      throw new Error(
+        `Candidate ${candidate.id} has no valid series mapping after reprocessing. Run sonarr_preview_manual_import with an explicit seriesId (find one via sonarr_get_series) before executing.`,
+      );
+    }
+    if (episodes.length === 0) {
+      throw new Error(
+        `Candidate ${candidate.id} has no episode mapping after reprocessing. Run sonarr_preview_manual_import with explicit episodeIds (find them via sonarr_get_episodes) before executing.`,
+      );
+    }
+    if (!hasManualImportQuality(r.quality)) {
+      throw new Error(
+        `Candidate ${candidate.id} has no quality determined by Sonarr after reprocessing; the native import decision cannot proceed.`,
+      );
+    }
+
+    // Native UI safeguard: each episode is mapped to a single file.
+    for (const e of episodes) {
+      const owner = episodeOwners.get(e.id);
+      if (owner !== undefined && owner !== candidate.id) {
+        throw new Error(
+          `Episode ${e.id} is mapped to both candidate ${owner} and candidate ${candidate.id}. Sonarr's Interactive Import maps each episode to exactly one file — adjust episodeIds so the selections do not overlap.`,
+        );
+      }
+      episodeOwners.set(e.id, candidate.id);
+    }
+
+    // Rejection bypass is authorized per candidate: a multi-file release may
+    // contain files the caller intends to force-import alongside files they
+    // do NOT intend to import despite their rejections.
+    if (rejections.length > 0 && override.allowRejected !== true) {
+      blocked.push({ candidateId: candidate.id, name: candidate.name ?? null, rejections });
+      continue;
+    }
+    if (rejections.length > 0) {
+      overriddenRejections.push({ candidateId: candidate.id, name: candidate.name ?? null, rejections });
+    }
+
+    files.push({
+      path: r.path,
+      folderName: candidate.folderName,
+      seriesId,
+      episodeIds: episodes.map((e) => e.id),
+      episodeFileId: candidate.episodeFileId ?? null,
+      quality: r.quality as ManualImportQuality,
+      languages: r.languages ?? [],
+      releaseGroup: r.releaseGroup ?? null,
+      indexerFlags: r.indexerFlags ?? 0,
+      releaseType: r.releaseType ?? null,
+      downloadId: r.downloadId ?? downloadId,
+    });
+  }
+
+  if (blocked.length > 0) {
+    return jsonTextError({
+      error: "Sonarr reports import rejections for candidates whose item-level allowRejected is false; execution refused.",
+      downloadId,
+      blocked,
+      guidance: [
+        "1. Correct the mapping and preview again: sonarr_preview_manual_import with seriesId/seasonNumber/episodeIds overrides.",
+        "2. Or, after reviewing each rejection above, set allowRejected=true on exactly the item(s) you intend to import despite their rejections (this is the purpose of manual/interactive import). Candidates you leave at allowRejected=false stay blocked, and the whole command is refused while any blocked candidate remains.",
+      ],
+    });
+  }
+
+  const command = await client.executeManualImport(files, importMode);
+
+  return jsonText({
+    commandId: command.id,
+    status: "queued",
+    importMode,
+    downloadId,
+    files: files.map((f) => ({
+      path: f.path,
+      seriesId: f.seriesId,
+      episodeIds: f.episodeIds,
+      episodeFileId: f.episodeFileId ?? null,
+      quality: f.quality,
+      languages: f.languages,
+      releaseGroup: f.releaseGroup ?? null,
+      releaseType: f.releaseType ?? null,
+    })),
+    overriddenRejections,
+    message:
+      "Sonarr accepted the ManualImport command and queued it. The import runs asynchronously and is NOT guaranteed to succeed — do not treat this as completed. Re-check sonarr_get_queue to see whether the queue entry cleared or still needs attention. The queue item is intentionally left in place.",
+  });
+}
+
+// --- Radarr -----------------------------------------------------------------
+
+/**
+ * Radarr's reprocess service resolves the movie via `movieService.GetMovie`
+ * and throws for a missing id, so an unmapped candidate must never be sent to
+ * POST /manualimport with a fabricated 0.
+ */
+function radarrEffectiveMovieId(candidate: RadarrManualImportCandidate, override: ManualImportOverrideItem): number {
+  return override.movieId ?? candidate.movie?.id ?? 0;
+}
+
+function buildRadarrReprocessItem(
+  candidate: RadarrManualImportCandidate,
+  override: ManualImportOverrideItem,
+  downloadId: string,
+): RadarrManualImportReprocessItem {
+  return {
+    id: candidate.id,
+    path: candidate.path,
+    movieId: radarrEffectiveMovieId(candidate, override),
+    quality: candidate.quality ?? null,
+    languages: candidate.languages ?? [],
+    releaseGroup: override.releaseGroup ?? candidate.releaseGroup ?? null,
+    indexerFlags: candidate.indexerFlags ?? 0,
+    downloadId: candidate.downloadId ?? downloadId,
+  };
+}
+
+async function previewRadarrManualImport(client: RadarrClient, args: unknown) {
+  const { downloadId, items } = parseManualImportArgs(args);
+  const a = (args ?? {}) as ManualImportToolArgs;
+
+  const candidates = await client.getManualImportCandidates({
+    downloadId,
+    movieId: a.movieId,
+    filterExistingFiles: a.filterExistingFiles,
+  });
+  if (candidates.length === 0) {
+    throw new Error(
+      `Radarr returned no manual-import candidates for downloadId '${downloadId}'. The download is likely no longer tracked — check radarr_get_queue.`,
+    );
+  }
+
+  const resolved = resolveManualImportCandidates("Radarr", candidates, items);
+  const previewable = resolved.filter(({ candidate, override }) => radarrEffectiveMovieId(candidate, override) > 0);
+  const unmapped = resolved.filter(({ candidate, override }) => radarrEffectiveMovieId(candidate, override) <= 0);
+
+  const reprocessed = previewable.length > 0
+    ? await client.reprocessManualImport(previewable.map(({ candidate, override }) => buildRadarrReprocessItem(candidate, override, downloadId)))
+    : [];
+  const byId = new Map(reprocessed.map((r) => [r.id, r]));
+
+  const previews: Array<Record<string, unknown>> = previewable.map(({ candidate, override }) => {
+    const r = byId.get(candidate.id);
+    if (!r) {
+      throw new Error(
+        `Radarr did not return candidate ${candidate.id} after reprocessing; the candidate changed — re-run radarr_get_manual_import_candidates.`,
+      );
+    }
+    const movieId = r.movie?.id ?? radarrEffectiveMovieId(candidate, override);
+    const rejections = r.rejections ?? [];
+    const mappingValid = movieId > 0 && hasManualImportQuality(r.quality);
+    return {
+      candidateId: candidate.id,
+      name: candidate.name ?? null,
+      path: candidate.path,
+      canPreview: true,
+      mappingRequired: false,
+      movie: movieId > 0 ? { id: movieId, title: r.movie?.title ?? candidate.movie?.title ?? null, year: r.movie?.year ?? candidate.movie?.year ?? null } : null,
+      movieFileId: candidate.movieFileId ?? null,
+      quality: r.quality ?? null,
+      languages: r.languages ?? [],
+      releaseGroup: r.releaseGroup ?? null,
+      indexerFlags: r.indexerFlags ?? 0,
+      customFormatScore: r.customFormatScore ?? null,
+      rejections: rejections.map((rej) => ({ reason: rej.reason, type: rej.type ?? null })),
+      mappingValid,
+      canExecuteWithoutOverride: mappingValid && rejections.length === 0,
+    };
+  });
+
+  for (const { candidate } of unmapped) {
+    previews.push(mappingRequiredEntry(candidate.id, candidate.name ?? null, candidate.path, ["movieId"]));
+  }
+
+  return {
+    verifyBeforeActing: RADARR_VERIFY_DIRECTIVE,
+    downloadId,
+    count: previews.length,
+    items: previews,
+    guidance: manualImportGuidance("radarr", downloadId),
+  };
+}
+
+async function executeRadarrManualImport(client: RadarrClient, args: unknown) {
+  const { downloadId, items, importMode } = parseManualImportArgs(args);
+
+  const candidates = await client.getManualImportCandidates({ downloadId });
+  if (candidates.length === 0) {
+    throw new Error(
+      `Radarr returned no manual-import candidates for downloadId '${downloadId}'. The download is likely no longer tracked — check radarr_get_queue.`,
+    );
+  }
+
+  const resolved = resolveManualImportCandidates("Radarr", candidates, items);
+
+  // Fail cleanly BEFORE any native request when a candidate has no valid
+  // movie mapping: Radarr's reprocess service resolves movieId via GetMovie
+  // and throws for 0.
+  const unmapped = resolved.filter(({ candidate, override }) => radarrEffectiveMovieId(candidate, override) <= 0);
+  if (unmapped.length > 0) {
+    return jsonTextError({
+      error: "Radarr candidates selected for import have no valid movie mapping; refusing to send them to the native manual-import endpoint.",
+      downloadId,
+      mappingRequired: unmapped.map(({ candidate }) => ({
+        candidateId: candidate.id,
+        name: candidate.name ?? null,
+        path: candidate.path,
+        mappingRequired: true,
+        missing: ["movieId"],
+      })),
+      guidance: [
+        "1. Find the movie id (radarr_get_movies / radarr_search) and re-run radarr_preview_manual_import with an explicit movieId override per candidate.",
+        "2. Then execute with the same overrides. A 0 movieId is never sent to Radarr.",
+      ],
+    });
+  }
+
+  const payload = resolved.map(({ candidate, override }) => buildRadarrReprocessItem(candidate, override, downloadId));
+  const reprocessed = await client.reprocessManualImport(payload);
+  const byId = new Map(reprocessed.map((r) => [r.id, r]));
+
+  const files: RadarrManualImportCommandFile[] = [];
+  const blocked: Array<{ candidateId: number; name: string | null; rejections: ManualImportRejection[] }> = [];
+  const overriddenRejections: Array<{ candidateId: number; name: string | null; rejections: ManualImportRejection[] }> = [];
+
+  for (const { candidate, override } of resolved) {
+    const r = byId.get(candidate.id);
+    if (!r) {
+      throw new Error(
+        `Candidate ${candidate.id} (${candidate.name ?? candidate.path}) disappeared during reprocessing — the download changed; re-run radarr_get_manual_import_candidates.`,
+      );
+    }
+
+    const movieId = r.movie?.id ?? radarrEffectiveMovieId(candidate, override);
+    const rejections = r.rejections ?? [];
+
+    if (movieId <= 0) {
+      throw new Error(
+        `Candidate ${candidate.id} has no valid movie mapping after reprocessing. Run radarr_preview_manual_import with an explicit movieId (find one via radarr_get_movies) before executing.`,
+      );
+    }
+    if (!hasManualImportQuality(r.quality)) {
+      throw new Error(
+        `Candidate ${candidate.id} has no quality determined by Radarr after reprocessing; the native import decision cannot proceed.`,
+      );
+    }
+
+    // Rejection bypass is authorized per candidate (see Sonarr).
+    if (rejections.length > 0 && override.allowRejected !== true) {
+      blocked.push({ candidateId: candidate.id, name: candidate.name ?? null, rejections });
+      continue;
+    }
+    if (rejections.length > 0) {
+      overriddenRejections.push({ candidateId: candidate.id, name: candidate.name ?? null, rejections });
+    }
+
+    files.push({
+      path: r.path,
+      folderName: candidate.folderName,
+      movieId,
+      quality: r.quality as ManualImportQuality,
+      languages: r.languages ?? [],
+      releaseGroup: r.releaseGroup ?? null,
+      indexerFlags: r.indexerFlags ?? 0,
+      downloadId: r.downloadId ?? downloadId,
+    });
+  }
+
+  if (blocked.length > 0) {
+    return jsonTextError({
+      error: "Radarr reports import rejections for candidates whose item-level allowRejected is false; execution refused.",
+      downloadId,
+      blocked,
+      guidance: [
+        "1. Correct the mapping and preview again: radarr_preview_manual_import with a movieId override.",
+        "2. Or, after reviewing each rejection above, set allowRejected=true on exactly the item(s) you intend to import despite their rejections (this is the purpose of manual/interactive import). Candidates you leave at allowRejected=false stay blocked, and the whole command is refused while any blocked candidate remains.",
+      ],
+    });
+  }
+
+  const command = await client.executeManualImport(files, importMode);
+
+  return jsonText({
+    commandId: command.id,
+    status: "queued",
+    importMode,
+    downloadId,
+    files: files.map((f) => ({
+      path: f.path,
+      movieId: f.movieId,
+      quality: f.quality,
+      languages: f.languages,
+      releaseGroup: f.releaseGroup ?? null,
+    })),
+    overriddenRejections,
+    message:
+      "Radarr accepted the ManualImport command and queued it. The import runs asynchronously and is NOT guaranteed to succeed — do not treat this as completed. Re-check radarr_get_queue to see whether the queue entry cleared or still needs attention. The queue item is intentionally left in place.",
+  });
+}
+
+// --- Lidarr -----------------------------------------------------------------
+//
+// Lidarr's manual-import workflow differs materially from Sonarr/Radarr:
+// POST /api/v1/manualimport (UpdateItems) re-runs the native import decision
+// with artist/album/release overrides and RECOMPUTES the track mapping,
+// quality and rejections server-side; caller-sent trackIds are ignored by the
+// backend. The final ManualImport command consumes the reprocessed result.
+
+function buildLidarrUpdateItem(
+  candidate: LidarrManualImportCandidate,
+  override: ManualImportOverrideItem,
+  downloadId: string,
+  replaceExistingFiles: boolean,
+): LidarrManualImportUpdateItem {
+  const artistId = override.artistId ?? candidate.artist?.id ?? 0;
+  const albumId = override.albumId ?? candidate.album?.id ?? 0;
+  const albumReleaseId = override.albumReleaseId ?? candidate.albumReleaseId ?? 0;
+  return {
+    id: candidate.id,
+    path: candidate.path,
+    name: candidate.name ?? undefined,
+    // Lidarr looks these ids up natively (GetArtist/GetAlbum/GetRelease);
+    // sending 0 would throw, so omit unknown entities entirely.
+    artistId: artistId > 0 ? artistId : null,
+    albumId: albumId > 0 ? albumId : null,
+    albumReleaseId: albumReleaseId > 0 ? albumReleaseId : null,
+    // NOTE: the native ManualImportUpdateResource has no trackIds field —
+    // Lidarr recomputes tracks server-side. Caller track corrections are
+    // applied to the final command (validated via getTracks), not here.
+    quality: candidate.quality ?? null,
+    releaseGroup: candidate.releaseGroup ?? null,
+    indexerFlags: candidate.indexerFlags ?? 0,
+    downloadId: candidate.downloadId ?? downloadId,
+    additionalFile: candidate.additionalFile ?? false,
+    replaceExistingFiles,
+    disableReleaseSwitching: override.disableReleaseSwitching ?? candidate.disableReleaseSwitching ?? false,
+  };
+}
+
+/**
+ * Decide the track ids a candidate will import with.
+ *
+ * Lidarr's reprocess recomputes tracks server-side, so a caller-corrected
+ * mapping (the primary reason this feature exists — e.g. Lidarr guessed
+ * Track 6, the agent determined Track 7) must survive reprocessing and reach
+ * the final ManualImport command.
+ *
+ * An explicit override is validated STRICTLY against the selected album
+ * release's track list (`GET /track?albumReleaseId=…` → GetTracksByRelease),
+ * mirroring the native Interactive Import track selector, which only offers
+ * the selectable tracks of the chosen release. Tracks from other releases of
+ * the same album, from other albums, or from the candidate's current mapping
+ * are NOT authorization targets: the allowlist is the release query, never a
+ * union. If the reprocessed candidate contains tracks outside that release
+ * query, the inconsistency is surfaced (releaseTrackMismatch) rather than
+ * widening what the caller may select.
+ */
+async function resolveLidarrTrackIds(
+  client: LidarrClient,
+  reprocessed: LidarrManualImportCandidate,
+  override: ManualImportOverrideItem,
+  releaseTrackCache: Map<number, LidarrTrack[]>,
+): Promise<{
+  trackIds: number[];
+  source: "caller-override" | "lidarr-recomputed";
+  tracks: LidarrTrack[];
+  releaseTrackMismatch: number[];
+}> {
+  const recomputed = reprocessed.tracks ?? [];
+  if (!override.trackIds || override.trackIds.length === 0) {
+    return { trackIds: recomputed.map((t) => t.id), source: "lidarr-recomputed", tracks: recomputed, releaseTrackMismatch: [] };
+  }
+
+  const albumReleaseId = reprocessed.albumReleaseId ?? 0;
+  if (albumReleaseId <= 0) {
+    throw new Error(
+      `Candidate ${reprocessed.id} supplied trackIds without a resolvable album release; run lidarr_preview_manual_import with an explicit albumReleaseId (from the album's releases) first.`,
+    );
+  }
+  let releaseTracks = releaseTrackCache.get(albumReleaseId);
+  if (!releaseTracks) {
+    releaseTracks = await client.getTracks({ albumReleaseId });
+    releaseTrackCache.set(albumReleaseId, releaseTracks);
+  }
+  const validIds = new Set(releaseTracks.map((t) => t.id));
+  const invalid = override.trackIds.filter((id) => !validIds.has(id));
+  if (invalid.length > 0) {
+    throw new Error(
+      `Track ids ${invalid.join(", ")} are not tracks of album release ${albumReleaseId}; refusing to import tracks outside the selected release. Valid track ids for this release: ${releaseTracks.map((t) => t.id).join(", ") || "none"}.`,
+    );
+  }
+  // Surface (do not authorize) candidate tracks that the release query does
+  // not contain — a native mapping/release-list inconsistency the caller
+  // should know about.
+  const releaseTrackMismatch = recomputed.filter((t) => !validIds.has(t.id)).map((t) => t.id);
+  return {
+    trackIds: override.trackIds,
+    source: "caller-override",
+    tracks: override.trackIds.map((id) => releaseTracks.find((t) => t.id === id)).filter((t): t is LidarrTrack => !!t),
+    releaseTrackMismatch,
+  };
+}
+
+async function previewLidarrManualImport(client: LidarrClient, args: unknown) {
+  const { downloadId, items, replaceExistingFiles } = parseManualImportArgs(args);
+  const a = (args ?? {}) as ManualImportToolArgs;
+
+  const candidates = await client.getManualImportCandidates({
+    downloadId,
+    artistId: a.artistId,
+    filterExistingFiles: a.filterExistingFiles,
+    replaceExistingFiles,
+  });
+  if (candidates.length === 0) {
+    throw new Error(
+      `Lidarr returned no manual-import candidates for downloadId '${downloadId}'. The download is likely no longer tracked — check lidarr_get_queue.`,
+    );
+  }
+
+  const resolved = resolveManualImportCandidates("Lidarr", candidates, items);
+  const payload = resolved.map(({ candidate, override }) =>
+    buildLidarrUpdateItem(candidate, override, downloadId, replaceExistingFiles),
+  );
+  const reprocessed = await client.updateManualImport(payload);
+  const byId = new Map(reprocessed.map((r) => [r.id, r]));
+
+  const releaseTrackCache = new Map<number, LidarrTrack[]>();
+  const previews: Array<Record<string, unknown>> = [];
+  const mismatches: Array<{ candidateId: number; tracksOutsideRelease: number[] }> = [];
+  for (const { candidate, override } of resolved) {
+    const r = byId.get(candidate.id);
+    if (!r) {
+      throw new Error(
+        `Lidarr did not return candidate ${candidate.id} after updating; the candidate changed — re-run lidarr_get_manual_import_candidates.`,
+      );
+    }
+    const resolvedTracks = await resolveLidarrTrackIds(client, r, override, releaseTrackCache);
+    if (resolvedTracks.releaseTrackMismatch.length > 0) {
+      mismatches.push({ candidateId: candidate.id, tracksOutsideRelease: resolvedTracks.releaseTrackMismatch });
+    }
+    const rejections = r.rejections ?? [];
+    const mappingValid =
+      (r.artist?.id ?? 0) > 0 &&
+      (r.album?.id ?? 0) > 0 &&
+      (r.albumReleaseId ?? 0) > 0 &&
+      resolvedTracks.trackIds.length > 0 &&
+      hasManualImportQuality(r.quality);
+    previews.push({
+      candidateId: candidate.id,
+      name: candidate.name ?? null,
+      path: candidate.path,
+      canPreview: true,
+      mappingRequired: false,
+      artist: r.artist ? { id: r.artist.id, artistName: r.artist.artistName } : null,
+      album: r.album ? { id: r.album.id, title: r.album.title } : null,
+      albumReleaseId: r.albumReleaseId ?? 0,
+      tracks: resolvedTracks.tracks.map((t) => ({
+        id: t.id,
+        title: t.title ?? null,
+        trackNumber: t.trackNumber ?? null,
+        position: t.position ?? null,
+        mediumNumber: t.mediumNumber ?? null,
+      })),
+      tracksSource: resolvedTracks.source,
+      releaseTrackMismatch: resolvedTracks.releaseTrackMismatch,
+      quality: r.quality ?? null,
+      releaseGroup: r.releaseGroup ?? null,
+      indexerFlags: r.indexerFlags ?? 0,
+      rejections: rejections.map((rej) => ({ reason: rej.reason ?? null, type: rej.type ?? null })),
+      additionalFile: r.additionalFile ?? false,
+      replaceExistingFiles: r.replaceExistingFiles ?? replaceExistingFiles,
+      disableReleaseSwitching: r.disableReleaseSwitching ?? false,
+      mappingValid,
+      canExecuteWithoutOverride: mappingValid && rejections.length === 0,
+    });
+  }
+
+  return {
+    verifyBeforeActing: LIDARR_VERIFY_DIRECTIVE,
+    downloadId,
+    count: previews.length,
+    items: previews,
+    notes: [
+      "Lidarr recomputes the track mapping server-side from the artist/album/release overrides; the tracks shown here are what lidarr_execute_manual_import will import.",
+      "tracksSource=caller-override means your explicit trackIds were validated against the selected album release's track list (GET /track?albumReleaseId=…) and will be used as-is; tracksSource=lidarr-recomputed means Lidarr's server-side mapping is being used.",
+      ...(mismatches.length > 0
+        ? [`Inconsistency surfaced (not authorized): Lidarr's recomputed mapping for ${mismatches.map((m) => `candidate ${m.candidateId} [tracks ${m.tracksOutsideRelease.join(", ")}]`).join("; ")} includes tracks outside the selected release's track query. The caller-override allowlist stays the release list; review the release selection if this is unexpected.`]
+        : []),
+    ],
+    guidance: manualImportGuidance("lidarr", downloadId),
+  };
+}
+
+async function executeLidarrManualImport(client: LidarrClient, args: unknown) {
+  const { downloadId, items, importMode, replaceExistingFiles } = parseManualImportArgs(args);
+
+  const candidates = await client.getManualImportCandidates({ downloadId, replaceExistingFiles });
+  if (candidates.length === 0) {
+    throw new Error(
+      `Lidarr returned no manual-import candidates for downloadId '${downloadId}'. The download is likely no longer tracked — check lidarr_get_queue.`,
+    );
+  }
+
+  const resolved = resolveManualImportCandidates("Lidarr", candidates, items);
+  const payload = resolved.map(({ candidate, override }) =>
+    buildLidarrUpdateItem(candidate, override, downloadId, replaceExistingFiles),
+  );
+  const reprocessed = await client.updateManualImport(payload);
+  const byId = new Map(reprocessed.map((r) => [r.id, r]));
+
+  const files: LidarrManualImportCommandFile[] = [];
+  const blocked: Array<{ candidateId: number; name: string | null; rejections: LidarrManualImportRejection[] }> = [];
+  const overriddenRejections: Array<{ candidateId: number; name: string | null; rejections: LidarrManualImportRejection[] }> = [];
+  const trackOwners = new Map<number, number>();
+  const releaseTrackCache = new Map<number, LidarrTrack[]>();
+  const mismatches: Array<{ candidateId: number; tracksOutsideRelease: number[] }> = [];
+
+  for (const { candidate, override } of resolved) {
+    const r = byId.get(candidate.id);
+    if (!r) {
+      throw new Error(
+        `Candidate ${candidate.id} (${candidate.name ?? candidate.path}) disappeared during reprocessing — the download changed; re-run lidarr_get_manual_import_candidates.`,
+      );
+    }
+
+    const artistId = r.artist?.id ?? 0;
+    const albumId = r.album?.id ?? 0;
+    const albumReleaseId = r.albumReleaseId ?? 0;
+    const rejections = r.rejections ?? [];
+
+    if (artistId <= 0) {
+      throw new Error(
+        `Candidate ${candidate.id} has no valid artist mapping after reprocessing. Run lidarr_preview_manual_import with an explicit artistId (find one via lidarr_get_artists) before executing.`,
+      );
+    }
+    if (albumId <= 0) {
+      throw new Error(
+        `Candidate ${candidate.id} has no valid album mapping after reprocessing. Run lidarr_preview_manual_import with an explicit albumId (find one via lidarr_get_albums) before executing.`,
+      );
+    }
+    if (albumReleaseId <= 0) {
+      throw new Error(
+        `Candidate ${candidate.id} has no valid album release after reprocessing. Run lidarr_preview_manual_import with an explicit albumReleaseId (from the album's releases) before executing.`,
+      );
+    }
+    // Caller track overrides survive reprocessing (validated strictly against
+    // the selected album release); otherwise Lidarr's recomputed mapping is
+    // used.
+    const resolvedTracks = await resolveLidarrTrackIds(client, r, override, releaseTrackCache);
+    if (resolvedTracks.releaseTrackMismatch.length > 0) {
+      mismatches.push({ candidateId: candidate.id, tracksOutsideRelease: resolvedTracks.releaseTrackMismatch });
+    }
+    if (resolvedTracks.trackIds.length === 0) {
+      throw new Error(
+        `Candidate ${candidate.id} has no track mapping after reprocessing; Lidarr recomputes tracks server-side from the album/release — check the preview result.`,
+      );
+    }
+    if (!hasManualImportQuality(r.quality)) {
+      throw new Error(
+        `Candidate ${candidate.id} has no quality determined by Lidarr after reprocessing; the native import decision cannot proceed.`,
+      );
+    }
+
+    // Native UI safeguard: each track is mapped to a single file.
+    for (const id of resolvedTracks.trackIds) {
+      const owner = trackOwners.get(id);
+      if (owner !== undefined && owner !== candidate.id) {
+        throw new Error(
+          `Track ${id} is mapped to both candidate ${owner} and candidate ${candidate.id}. Lidarr's Interactive Import maps each track to exactly one file — adjust the album/release/track selection so the files do not overlap.`,
+        );
+      }
+      trackOwners.set(id, candidate.id);
+    }
+
+    // Rejection bypass is authorized per candidate (see Sonarr).
+    if (rejections.length > 0 && override.allowRejected !== true) {
+      blocked.push({ candidateId: candidate.id, name: candidate.name ?? null, rejections });
+      continue;
+    }
+    if (rejections.length > 0) {
+      overriddenRejections.push({ candidateId: candidate.id, name: candidate.name ?? null, rejections });
+    }
+
+    files.push({
+      path: r.path,
+      artistId,
+      albumId,
+      albumReleaseId,
+      trackIds: resolvedTracks.trackIds,
+      quality: r.quality as ManualImportQuality,
+      releaseGroup: r.releaseGroup ?? null,
+      indexerFlags: r.indexerFlags ?? 0,
+      downloadId: r.downloadId ?? downloadId,
+      disableReleaseSwitching: r.disableReleaseSwitching ?? false,
+    });
+  }
+
+  if (blocked.length > 0) {
+    return jsonTextError({
+      error: "Lidarr reports import rejections for candidates whose item-level allowRejected is false; execution refused.",
+      downloadId,
+      blocked,
+      guidance: [
+        "1. Correct the mapping and preview again: lidarr_preview_manual_import with artistId/albumId/albumReleaseId/trackIds overrides.",
+        "2. Or, after reviewing each rejection above, set allowRejected=true on exactly the item(s) you intend to import despite their rejections (this is the purpose of manual/interactive import). Candidates you leave at allowRejected=false stay blocked, and the whole command is refused while any blocked candidate remains.",
+      ],
+    });
+  }
+
+  const command = await client.executeManualImport(files, importMode, replaceExistingFiles);
+
+  return jsonText({
+    commandId: command.id,
+    status: "queued",
+    importMode,
+    replaceExistingFiles,
+    downloadId,
+    files: files.map((f) => ({
+      path: f.path,
+      artistId: f.artistId,
+      albumId: f.albumId,
+      albumReleaseId: f.albumReleaseId,
+      trackIds: f.trackIds,
+      quality: f.quality,
+      releaseGroup: f.releaseGroup ?? null,
+      disableReleaseSwitching: f.disableReleaseSwitching ?? false,
+    })),
+    overriddenRejections,
+    ...(mismatches.length > 0
+      ? {
+          notes: [
+            `Inconsistency surfaced: Lidarr's recomputed mapping for ${mismatches.map((m) => `candidate ${m.candidateId} [tracks ${m.tracksOutsideRelease.join(", ")}]`).join("; ")} includes tracks outside the selected release's track query. The import used the validated caller override; review the release selection if this is unexpected.`,
+          ],
+        }
+      : {}),
+    message:
+      "Lidarr accepted the ManualImport command and queued it. The import runs asynchronously and is NOT guaranteed to succeed — do not treat this as completed. Re-check lidarr_get_queue to see whether the queue entry cleared or still needs attention. The queue item is intentionally left in place.",
+  });
+}
+
 // Registers the MCP request handlers on a server instance. Called by
 // buildServer() for every server created (one per HTTP request, plus the
 // module-level stdio instance).
@@ -1755,6 +3323,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         });
       }
 
+      case "sonarr_get_manual_import_candidates": {
+        if (!clients.sonarr) throw new Error("Sonarr not configured");
+        const a = (args ?? {}) as ManualImportToolArgs;
+        if (typeof a.downloadId !== "string" || a.downloadId.trim() === "") {
+          throw new Error("downloadId is required (from sonarr_get_queue). Candidates are discovered from the tracked download, never from a caller-supplied path.");
+        }
+        const candidates = await clients.sonarr.getManualImportCandidates({
+          downloadId: a.downloadId.trim(),
+          seriesId: a.seriesId,
+          seasonNumber: a.seasonNumber,
+          filterExistingFiles: a.filterExistingFiles,
+        });
+        return jsonText({
+          verifyBeforeActing: SONARR_VERIFY_DIRECTIVE,
+          downloadId: a.downloadId.trim(),
+          count: candidates.length,
+          candidates: candidates.map(compactSonarrCandidate),
+          notes: [
+            "candidateId is the native manual-import resource id; pass it to sonarr_preview_manual_import / sonarr_execute_manual_import.",
+            "Paths are shown for diagnosis only — the import tools resolve paths from native candidates and never accept caller-supplied paths.",
+            "See verifyBeforeActing above: the release name's TITLE is the verification key (number mismatches alone are expected mapping-source differences, not errors).",
+            "If a candidate has rejections, decide via preview whether overriding them (allowRejected=true on that item in execute) is appropriate.",
+          ],
+        });
+      }
+
+      case "sonarr_preview_manual_import": {
+        if (!clients.sonarr) throw new Error("Sonarr not configured");
+        return jsonText(await previewSonarrManualImport(clients.sonarr, args));
+      }
+
+      case "sonarr_execute_manual_import": {
+        if (!clients.sonarr) throw new Error("Sonarr not configured");
+        return await executeSonarrManualImport(clients.sonarr, args);
+      }
+
       case "sonarr_get_calendar": {
         if (!clients.sonarr) throw new Error("Sonarr not configured");
         const days = (args as { days?: number })?.days || 7;
@@ -2082,6 +3686,40 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         };
       }
 
+      case "radarr_get_manual_import_candidates": {
+        if (!clients.radarr) throw new Error("Radarr not configured");
+        const a = (args ?? {}) as ManualImportToolArgs;
+        if (typeof a.downloadId !== "string" || a.downloadId.trim() === "") {
+          throw new Error("downloadId is required (from radarr_get_queue). Candidates are discovered from the tracked download, never from a caller-supplied path.");
+        }
+        const candidates = await clients.radarr.getManualImportCandidates({
+          downloadId: a.downloadId.trim(),
+          movieId: a.movieId,
+          filterExistingFiles: a.filterExistingFiles,
+        });
+        return jsonText({
+          verifyBeforeActing: RADARR_VERIFY_DIRECTIVE,
+          downloadId: a.downloadId.trim(),
+          count: candidates.length,
+          candidates: candidates.map(compactRadarrCandidate),
+          notes: [
+            "candidateId is the native manual-import resource id; pass it to radarr_preview_manual_import / radarr_execute_manual_import.",
+            "Paths are shown for diagnosis only — the import tools resolve paths from native candidates and never accept caller-supplied paths.",
+            "If a candidate has rejections, decide via preview whether overriding them (allowRejected=true on that item in execute) is appropriate.",
+          ],
+        });
+      }
+
+      case "radarr_preview_manual_import": {
+        if (!clients.radarr) throw new Error("Radarr not configured");
+        return jsonText(await previewRadarrManualImport(clients.radarr, args));
+      }
+
+      case "radarr_execute_manual_import": {
+        if (!clients.radarr) throw new Error("Radarr not configured");
+        return await executeRadarrManualImport(clients.radarr, args);
+      }
+
       case "radarr_search_movies": {
         if (!clients.radarr) throw new Error("Radarr not configured");
         const { movieIds } = args as { movieIds: number[] };
@@ -2165,6 +3803,42 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           skipRedownload,
           changeCategory,
         });
+      }
+
+      case "lidarr_get_manual_import_candidates": {
+        if (!clients.lidarr) throw new Error("Lidarr not configured");
+        const a = (args ?? {}) as ManualImportToolArgs;
+        if (typeof a.downloadId !== "string" || a.downloadId.trim() === "") {
+          throw new Error("downloadId is required (from lidarr_get_queue). Candidates are discovered from the tracked download, never from a caller-supplied path.");
+        }
+        const candidates = await clients.lidarr.getManualImportCandidates({
+          downloadId: a.downloadId.trim(),
+          artistId: a.artistId,
+          filterExistingFiles: a.filterExistingFiles,
+          replaceExistingFiles: a.replaceExistingFiles ?? false,
+        });
+        return jsonText({
+          verifyBeforeActing: LIDARR_VERIFY_DIRECTIVE,
+          downloadId: a.downloadId.trim(),
+          count: candidates.length,
+          candidates: candidates.map(compactLidarrCandidate),
+          notes: [
+            "candidateId is the native manual-import resource id; pass it to lidarr_preview_manual_import / lidarr_execute_manual_import.",
+            "Paths are shown for diagnosis only — the import tools resolve paths from native candidates and never accept caller-supplied paths.",
+            "Lidarr recomputes the track mapping server-side during preview; the preview result is authoritative for what execute will import.",
+            "If a candidate has rejections, decide via preview whether overriding them (allowRejected=true on that item in execute) is appropriate.",
+          ],
+        });
+      }
+
+      case "lidarr_preview_manual_import": {
+        if (!clients.lidarr) throw new Error("Lidarr not configured");
+        return jsonText(await previewLidarrManualImport(clients.lidarr, args));
+      }
+
+      case "lidarr_execute_manual_import": {
+        if (!clients.lidarr) throw new Error("Lidarr not configured");
+        return await executeLidarrManualImport(clients.lidarr, args);
       }
 
       case "lidarr_get_albums": {

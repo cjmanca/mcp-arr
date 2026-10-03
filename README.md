@@ -284,8 +284,11 @@ The existing service-specific tools remain available for richer local or power-u
 | `sonarr_add_series` | Add a TV series to Sonarr (supports tags) |
 | `sonarr_get_root_folders` | Get available root folders for adding series |
 | `sonarr_get_quality_profiles` | Get available quality profiles for adding series |
-| `sonarr_get_queue` | View current download queue with `limit`/`offset` pagination; includes import diagnostics (`statusMessages`, `errorMessage`, `downloadId`, `outputPath`, `indexer`, `seriesId`/`episodeId`/`seasonNumber`) |
+| `sonarr_get_queue` | View current download queue with `limit` and `offset` pagination|
 | `sonarr_delete_queue_item` | Remove a queue item; `removeFromClient` (default true), `blocklist`, `skipRedownload`, `changeCategory` |
+| `sonarr_get_manual_import_candidates` | List Sonarr's native manual-import candidates for a `downloadId` (read-only, no paths accepted) |
+| `sonarr_preview_manual_import` | Reprocess candidate mappings via Sonarr's native endpoint **without importing**; shows recalculated episodes and rejections; unmapped candidates return `mappingRequired` (never sent with a 0 `seriesId`) |
+| `sonarr_execute_manual_import` | Queue Sonarr's native `ManualImport` command; explicit `importMode` (default `auto`), per-item `allowRejected=true` to override that candidate's rejections |
 | `sonarr_get_calendar` | See upcoming episodes |
 | `sonarr_get_episodes` | List episodes for a series (shows missing vs available) |
 | `sonarr_search_missing` | Trigger search for all missing episodes in a series |
@@ -301,12 +304,15 @@ The existing service-specific tools remain available for richer local or power-u
 | `radarr_add_movie` | Add a movie to Radarr (supports tags) |
 | `radarr_get_root_folders` | Get available root folders for adding movies |
 | `radarr_get_quality_profiles` | Get available quality profiles for adding movies |
-| `radarr_get_queue` | View current download queue with `limit`/`offset` pagination; includes import diagnostics (`statusMessages`, `errorMessage`, `downloadId`, `outputPath`, `indexer`, `movieId`) |
+| `radarr_get_queue` | View current download queue with `limit` and `offset` pagination |
 | `radarr_get_calendar` | See upcoming releases |
 | `radarr_search_movie` | Trigger search to download a movie in your library |
 | `radarr_search_movies` | Bulk-trigger searches for multiple movie IDs at once |
 | `radarr_update_movie` | Update a movie's quality profile, monitored status, minimum availability, tags, or path |
 | `radarr_delete_queue_item` | Remove a queue item; `removeFromClient` (default true), `blocklist`, `skipRedownload`, `changeCategory` |
+| `radarr_get_manual_import_candidates` | List Radarr's native manual-import candidates for a `downloadId` (read-only, no paths accepted) |
+| `radarr_preview_manual_import` | Reprocess candidate mappings via Radarr's native endpoint **without importing**; shows recalculated movie mapping and rejections; unmapped candidates return `mappingRequired` (never sent with a 0 `movieId`) |
+| `radarr_execute_manual_import` | Queue Radarr's native `ManualImport` command; explicit `importMode` (default `auto`), per-item `allowRejected=true` to override that candidate's rejections |
 | `radarr_refresh_movie` | Trigger a metadata refresh for a specific movie in Radarr |
 
 ### Lidarr Tools (Music)
@@ -319,8 +325,11 @@ The existing service-specific tools remain available for richer local or power-u
 | `lidarr_get_root_folders` | Get available root folders for adding artists |
 | `lidarr_get_quality_profiles` | Get available quality profiles for adding artists |
 | `lidarr_get_metadata_profiles` | Get available metadata profiles for adding artists |
-| `lidarr_get_queue` | View current download queue with `limit`/`offset` pagination; includes import diagnostics (`statusMessages`, `errorMessage`, `downloadId`, `outputPath`, `indexer`, `artistId`/`albumId`) |
+| `lidarr_get_queue` | View current download queue with `limit` and `offset` pagination |
 | `lidarr_delete_queue_item` | Remove a queue item; `removeFromClient` (default true), `blocklist`, `skipRedownload`, `changeCategory` |
+| `lidarr_get_manual_import_candidates` | List Lidarr's native manual-import candidates for a `downloadId` (read-only, no paths accepted) |
+| `lidarr_preview_manual_import` | Reprocess candidate mappings via Lidarr's native update endpoint **without importing**; Lidarr recomputes track mappings server-side; explicit `trackIds` are validated against the album and preserved (`tracksSource` shows which mapping will import) |
+| `lidarr_execute_manual_import` | Queue Lidarr's native `ManualImport` command; explicit `importMode` (default `auto`) and `replaceExistingFiles` (default `false`), per-item `allowRejected=true` to override that candidate's rejections; explicit `trackIds` overrides survive into the command |
 | `lidarr_get_albums` | List albums for an artist (shows missing vs available) |
 | `lidarr_search_album` | Trigger search for a specific album |
 | `lidarr_search_missing` | Trigger search for all missing albums for an artist |
@@ -375,6 +384,74 @@ Access community-curated quality profiles, custom formats, and naming convention
 - "List HDR-related custom formats for Radarr"
 
 Data is cached for 1 hour to minimize GitHub API calls.
+
+## Manual Import Workflow (stuck downloads)
+
+When Sonarr/Radarr/Lidarr finish a download but cannot import it automatically — unparseable filenames, missing episode/movie/album mapping, `Unable to determine if file is a sample`, partial multi-file imports — the manual-import tools reproduce the native **Interactive Import** workflow through MCP:
+
+```text
+*_get_queue                      → find the stuck item's downloadId + statusMessages
+*_get_manual_import_candidates   → discover what the app sees for that downloadId
+*_preview_manual_import          → (if needed) fix series/movie/album/track mapping, inspect the result
+*_execute_manual_import          → queue the native ManualImport command
+*_get_queue                      → re-check: did the queue entry clear?
+```
+
+**Security model.** The workflow is deliberately narrower than raw API access:
+
+- Every tool is keyed by `downloadId`; the *arr app resolves the download location itself.
+- Candidates are only previewable/importable if the native `/manualimport` endpoint returned them for that `downloadId`. The `candidateId` is the native resource id (a hash of the path).
+- **A caller-supplied filesystem path is never accepted.** Execute re-fetches candidates, resolves each `candidateId`, merges only permitted mapping overrides, reprocesses through the native endpoint, validates the mapping, and only then submits the command. Nothing is cached between MCP calls, so a stale preview can never be imported.
+- No queue items are deleted automatically and no blocklisting happens — Sonarr/Radarr/Lidarr update their tracked-download state normally.
+
+**Behavioral rules.**
+
+- `preview` is **non-importing** — it never moves, copies, or imports files.
+- `execute` always sends `importMode` explicitly; the default is `auto`, matching the queue-driven Interactive Import behavior of the *arr UIs.
+- Candidates with remaining native rejections are **refused** unless **that item** sets `allowRejected=true`. Authorization is per candidate: in a multi-file release you can force-import file B despite its rejection while file A (rejected, not authorized) stays blocked — the whole command is refused while any blocked candidate remains. The server never decides that a specific rejection (e.g. the sample check) is safe — the agent/human reviews the rejections from the preview and opts in explicitly. Overridden rejections are reported in the response for auditability.
+- Candidates with **no valid entity mapping** (Sonarr series / Radarr movie) are reported as `mappingRequired` with `canPreview: false` and are **never sent to the native reprocess endpoint** — Sonarr/Radarr resolve the supplied id server-side and throw for unknown ids, so a fabricated `0` is never submitted. Supply a real `seriesId`/`movieId` override (found via `sonarr_get_series` / `radarr_get_movies`) first.
+- Candidate resolution requires **exactly one** current candidate with the requested `candidateId`. Native ids are 31-bit path hashes and can collide: 0 matches → stale/unknown error, 2+ matches → `ambiguous candidate` refusal. Disambiguation is by re-running discovery, never by supplying a path.
+- **Mappings and rejections are Sonarr's parse guesses — verify them, don't trust them.** Every discovery/preview response leads with a `verifyBeforeActing` directive: a complete-looking mapping (`mappingValid: true`) can still point at the wrong episodes, and a rejection is Sonarr's opinion, not ground truth. Before recommending `execute` — especially `allowRejected=true` — independently check the mapping against `sonarr_get_episodes`. **The release name's title is the verification key, not the numbers:** when episode/season numbers in the name differ from Sonarr's detected numbers, that is usually just a mapping-source difference (TheTVDB/TMDB/absolute numbering) — a number mismatch alone is *not* evidence of a wrong mapping. The mapping is suspect only when the name contains an **episode title** that does not match the detected episodes' titles. On a title match (by **meaning**, not exact string — fan-sub/region translations, especially anime, differ from official titles), trust the mapping. On a title mismatch, search seasons in this order:
+  1. the season of the episode **Sonarr guessed** (may differ from the release title's season due to Sonarr's mapping);
+  2. the season **specified in the release title**, if different;
+  3. **Specials** (`seasonNumber=0`);
+  4. **other seasons**, starting with the closest to the specified season and working outwards.
+
+  If the name contains only numbers, there is nothing to match — trust the mapping. The rejection **"Single episode file contains all episodes in seasons" is almost never a correctly mapped release**: it usually means the file is named incorrectly, or the release is intended as a **special** (the release name will usually include the special's name) — treat Sonarr's season-spanning episode list as suspect by default and expect the answer to be a special (`seasonNumber=0`) or a corrected single-episode mapping. Example: Letterkenny `S04 The Haunting of MoDean's II` — the signal was not the `S04` number, it was that the name's title matches none of the detected S04E01–06 titles; it is the season-0 special of that title (remap with `seasonNumber=0` + its `episodeIds`).
+- **An existing file is not a reason to skip — compare quality, via `upgradeAssessment`.** The Sonarr preview includes an `upgradeAssessment` for each mapped candidate. Sonarr's own reprocess evaluates the existing file and rejects with *"Not an upgrade for existing episode file(s)"* (quality profile), *"Not a Custom Format upgrade for existing episode file(s)"* (CF score), or *"Episode already imported"* when the new file is not better — so verdict `not-an-upgrade` → **do not import**. `no-existing-file` → fills a gap; `no-upgrade-rejection` → Sonarr raised no upgrade rejection, so the file is **equal to or better** than the existing one (equal quality + equal CF surfaces no warning — a neutral, allowed replacement); the existing file(s) are listed with quality name and CF score — compare against `newQualityWeight`/`newCustomFormatScore`. After remapping a mis-parsed release, the preview re-evaluates against the **new** target's existing file — check the assessment post-remap.
+- A successful execute returns a `commandId` with status `queued`: command acceptance is **asynchronous** and does not guarantee the import succeeded. Re-check the queue afterwards.
+- Lidarr specifics: its native update endpoint has **no `trackIds` field** — it recomputes the track mapping server-side from artist/album/release overrides. An explicit `trackIds` override is therefore validated **strictly against the selected album release's track list** (`GET /track?albumReleaseId=…`, mirroring the native Interactive Import track selector) and **preserved into the final command**, so a corrected track mapping (Lidarr guessed Track 6 → you determined Track 7) survives reprocessing. Tracks from other releases of the same album, from other albums, or from the candidate's current mapping are **not** authorization targets; if Lidarr's recomputed mapping contains tracks outside the selected release's query, the preview surfaces the inconsistency (`releaseTrackMismatch`) without widening the allowlist. `tracksSource` shows which mapping will import. `replaceExistingFiles` defaults to `false` — the safer non-destructive default used by the Interactive Import UI.
+
+Example (Sonarr, the sample-file case):
+
+```text
+sonarr_get_queue
+  → queueId 100, downloadId "ABC123", statusMessages: ["Unable to determine if file is a sample"]
+sonarr_get_manual_import_candidates(downloadId="ABC123")
+  → candidateId 123 already maps to The Good Fight S06E03, rejection present
+sonarr_execute_manual_import(downloadId="ABC123", items=[{candidateId: 123, allowRejected: true}])
+  → commandId queued; then sonarr_get_queue to confirm the entry cleared
+```
+
+Example (Lidarr, correcting a bad automatic track match):
+
+```text
+lidarr_get_manual_import_candidates(downloadId="ABC123")
+  → candidateId 333: file01.flac mapped to Track 6 (id 501)
+lidarr_preview_manual_import(downloadId="ABC123", items=[{candidateId: 333, trackIds: [502]}])
+  → tracksSource "caller-override", tracks [502] — validated against the album
+lidarr_execute_manual_import(downloadId="ABC123", items=[{candidateId: 333, trackIds: [502]}])
+  → the native ManualImport command imports Track 7 (id 502)
+```
+
+### Live/integration validation
+
+The automated suite runs against deterministic stub *arr apps. When real instances are available, these four scenarios are worth validating manually with the **preview** tools (non-destructive) before trusting execute:
+
+1. **Sonarr, unknown series** — a candidate with no matched series must return `mappingRequired`/`canPreview: false`, not an API error from `seriesId=0`.
+2. **Radarr, unknown movie** — same behavior with `movieId`.
+3. **Lidarr, corrected track mapping** — preview a candidate with a `trackIds` override pointing at a different track of the **selected album release** (`GET /track?albumReleaseId=…`); the preview must show `tracksSource: "caller-override"` with your ids, and the eventual command must import them. A track from a *different release of the same album* must be refused.
+4. **Sonarr, multi-file partial import** — a release where file 1 is rejected ("already imported / not a CF upgrade") and file 2 has the sample-indeterminate rejection: execute with `allowRejected: true` only on file 2's item must block file 1 (no command submitted while it remains blocked), never importing file 1.
 
 ## Development
 

@@ -426,6 +426,287 @@ export interface SearchResult {
   disambiguation?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Manual / Interactive Import types
+//
+// These mirror the native *arr manual-import resources (Sonarr/Radarr
+// src/{Sonarr,Radarr}.Api.V3/ManualImport/, Lidarr src/Lidarr.Api.V1/ManualImport/).
+// The native `id` of every manual-import resource is a deterministic hash of the
+// file path (HashConverter.GetHashInt31(path)); the MCP layer exposes it as the
+// `candidateId` so callers can reference a discovered file without ever
+// supplying a filesystem path of their own.
+// ---------------------------------------------------------------------------
+
+/** Sonarr/Radarr serialize import rejections as `{ reason, type }`. */
+export interface ManualImportRejection {
+  reason: string;
+  type?: string;
+}
+
+/**
+ * Lidarr's core `Rejection` (NzbDrone.Core/DecisionEngine/Rejection.cs)
+ * serializes like Sonarr/Radarr: `{ reason, type }`. `reason` can be null and
+ * `type` is the RejectionType enum (omitted when default), so both are
+ * optional here — live responses can legitimately contain `{}`.
+ */
+export interface LidarrManualImportRejection {
+  reason?: string | null;
+  type?: string | null;
+}
+
+/** Native QualityModel shape: `{ quality: { id, name, ... }, revision: { version, real } }`. */
+export interface ManualImportQuality {
+  quality?: {
+    id?: number;
+    name?: string;
+    source?: string;
+    resolution?: number;
+  };
+  revision?: {
+    version?: number;
+    real?: number;
+  };
+}
+
+/** Native Language serialization: `{ id, name }`. */
+export interface ManualImportLanguage {
+  id: number;
+  name: string;
+}
+
+export interface ManualImportCustomFormat {
+  id?: number;
+  name?: string;
+  score?: number;
+}
+
+export interface SonarrManualImportEpisode {
+  id: number;
+  seasonNumber?: number;
+  episodeNumber?: number;
+  absoluteEpisodeNumber?: number;
+  title?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * One native Sonarr `ManualImportResource` (GET /api/v3/manualimport) or one
+ * reprocessed `ManualImportReprocessResource` (POST /api/v3/manualimport).
+ * The reprocess response omits `series`/`folderName` (they are not part of the
+ * reprocess resource), so those fields are optional here.
+ */
+export interface SonarrManualImportCandidate {
+  id: number;
+  path: string;
+  relativePath?: string;
+  folderName?: string;
+  name?: string;
+  size?: number;
+  /** Present on reprocess responses (the reprocess resource echoes SeriesId). */
+  seriesId?: number;
+  series?: { id: number; title: string; [key: string]: unknown } | null;
+  seasonNumber?: number | null;
+  episodes?: SonarrManualImportEpisode[] | null;
+  episodeFileId?: number | null;
+  releaseGroup?: string | null;
+  quality?: ManualImportQuality | null;
+  languages?: ManualImportLanguage[] | null;
+  qualityWeight?: number;
+  downloadId?: string | null;
+  customFormats?: ManualImportCustomFormat[] | null;
+  customFormatScore?: number;
+  indexerFlags?: number;
+  releaseType?: string | null;
+  rejections?: ManualImportRejection[] | null;
+}
+
+/** Body item for Sonarr POST /api/v3/manualimport (ReprocessItems). */
+export interface SonarrManualImportReprocessItem {
+  id: number;
+  path: string;
+  seriesId: number;
+  seasonNumber?: number | null;
+  episodeIds?: number[];
+  quality?: ManualImportQuality | null;
+  languages?: ManualImportLanguage[] | null;
+  releaseGroup?: string | null;
+  indexerFlags?: number;
+  releaseType?: string | null;
+  downloadId?: string | null;
+}
+
+/**
+ * Existing episode file as embedded in the episode resource
+ * (GET /api/v3/episode?seriesId=&seasonNumber= → episodeFile).
+ * NOTE: the native episodefile endpoint does NOT expose episode linkage or
+ * qualityWeight — the episode resource is the only place files map to episodes.
+ */
+export interface SonarrEpisodeFile {
+  id: number;
+  quality?: ManualImportQuality;
+  customFormatScore?: number;
+  qualityCutoffNotMet?: boolean;
+  releaseGroup?: string | null;
+  size?: number;
+  [key: string]: unknown;
+}
+
+/**
+ * Episode resource (GET /api/v3/episode?seriesId=&seasonNumber=). The file is
+ * NOT embedded — the episode carries `episodeFileId`, which joins to the
+ * episodefile list's `id`.
+ */
+export interface SonarrEpisodeWithFile {
+  id: number;
+  hasFile?: boolean;
+  episodeFileId?: number | null;
+  [key: string]: unknown;
+}
+
+/** One `ManualImportFile` in Sonarr's ManualImport command. */
+export interface SonarrManualImportCommandFile {
+  path: string;
+  folderName?: string;
+  seriesId: number;
+  episodeIds: number[];
+  episodeFileId?: number | null;
+  quality: ManualImportQuality;
+  languages: ManualImportLanguage[];
+  releaseGroup?: string | null;
+  indexerFlags?: number;
+  releaseType?: string | null;
+  downloadId?: string | null;
+}
+
+export interface RadarrManualImportCandidate {
+  id: number;
+  path: string;
+  relativePath?: string;
+  folderName?: string;
+  name?: string;
+  size?: number;
+  movie?: { id: number; title: string; year?: number; [key: string]: unknown } | null;
+  movieFileId?: number | null;
+  releaseGroup?: string | null;
+  quality?: ManualImportQuality | null;
+  languages?: ManualImportLanguage[] | null;
+  qualityWeight?: number;
+  downloadId?: string | null;
+  customFormats?: ManualImportCustomFormat[] | null;
+  customFormatScore?: number;
+  indexerFlags?: number;
+  rejections?: ManualImportRejection[] | null;
+}
+
+/** Body item for Radarr POST /api/v3/manualimport (ReprocessItems). */
+export interface RadarrManualImportReprocessItem {
+  id: number;
+  path: string;
+  movieId: number;
+  quality?: ManualImportQuality | null;
+  languages?: ManualImportLanguage[] | null;
+  releaseGroup?: string | null;
+  indexerFlags?: number;
+  downloadId?: string | null;
+}
+
+/** One `ManualImportFile` in Radarr's ManualImport command. */
+export interface RadarrManualImportCommandFile {
+  path: string;
+  folderName?: string;
+  movieId: number;
+  quality: ManualImportQuality;
+  languages: ManualImportLanguage[];
+  releaseGroup?: string | null;
+  indexerFlags?: number;
+  downloadId?: string | null;
+}
+
+export interface LidarrManualImportTrack {
+  id: number;
+  title?: string;
+  trackNumber?: number;
+  position?: number;
+  mediumNumber?: number;
+  [key: string]: unknown;
+}
+
+/**
+ * One native Lidarr `ManualImportResource` (GET /api/v1/manualimport) or the
+ * resource returned by POST /api/v1/manualimport (UpdateItems).
+ */
+export interface LidarrManualImportCandidate {
+  id: number;
+  path: string;
+  name?: string;
+  size?: number;
+  artist?: { id: number; artistName: string; [key: string]: unknown } | null;
+  album?: { id: number; title: string; [key: string]: unknown } | null;
+  albumReleaseId?: number;
+  tracks?: LidarrManualImportTrack[] | null;
+  quality?: ManualImportQuality | null;
+  releaseGroup?: string | null;
+  qualityWeight?: number;
+  downloadId?: string | null;
+  indexerFlags?: number;
+  rejections?: LidarrManualImportRejection[] | null;
+  /** Native audio-tag metadata; not needed by the MCP workflow. */
+  audioTags?: unknown;
+  additionalFile?: boolean;
+  replaceExistingFiles?: boolean;
+  disableReleaseSwitching?: boolean;
+}
+
+/**
+ * Body item for Lidarr POST /api/v1/manualimport (UpdateItems).
+ * Mirrors the native `ManualImportUpdateResource`, which has NO trackIds field:
+ * the backend re-runs the import decision with the artist/album/release
+ * overrides and recomputes the tracks. A caller-corrected track selection is
+ * therefore applied by the MCP layer to the final command (validated against
+ * the album's tracks), not to this request.
+ */
+export interface LidarrManualImportUpdateItem {
+  id: number;
+  path: string;
+  name?: string;
+  artistId?: number | null;
+  albumId?: number | null;
+  albumReleaseId?: number | null;
+  quality?: ManualImportQuality | null;
+  releaseGroup?: string | null;
+  indexerFlags?: number;
+  downloadId?: string | null;
+  additionalFile?: boolean;
+  replaceExistingFiles?: boolean;
+  disableReleaseSwitching?: boolean;
+}
+
+/** One native Lidarr `TrackResource` (GET /api/v1/track?albumId=…). */
+export interface LidarrTrack {
+  id: number;
+  artistId?: number;
+  albumId?: number;
+  title?: string;
+  trackNumber?: number;
+  position?: number;
+  mediumNumber?: number;
+  [key: string]: unknown;
+}
+
+/** One `ManualImportFile` in Lidarr's ManualImport command. */
+export interface LidarrManualImportCommandFile {
+  path: string;
+  artistId: number;
+  albumId: number;
+  albumReleaseId: number;
+  trackIds: number[];
+  quality: ManualImportQuality;
+  releaseGroup?: string | null;
+  indexerFlags?: number;
+  downloadId?: string | null;
+  disableReleaseSwitching?: boolean;
+}
+
 export class ArrClient {
   private config: ArrConfig;
   private serviceName: ArrService;
@@ -709,6 +990,67 @@ export class SonarrClient extends ArrClient {
       }),
     });
   }
+
+  /**
+   * Discover native manual-import candidates for a tracked download.
+   * GET /api/v3/manualimport — the app resolves the download location from
+   * `downloadId`; callers never supply a path.
+   */
+  async getManualImportCandidates(params: {
+    downloadId: string;
+    seriesId?: number;
+    seasonNumber?: number;
+    filterExistingFiles?: boolean;
+  }): Promise<SonarrManualImportCandidate[]> {
+    const query = new URLSearchParams({ downloadId: params.downloadId });
+    if (params.seriesId !== undefined) query.append('seriesId', String(params.seriesId));
+    if (params.seasonNumber !== undefined) query.append('seasonNumber', String(params.seasonNumber));
+    if (params.filterExistingFiles !== undefined) query.append('filterExistingFiles', String(params.filterExistingFiles));
+    return this['request']<SonarrManualImportCandidate[]>(`/manualimport?${query.toString()}`);
+  }
+
+  /**
+   * Reprocess candidate items through Sonarr's native manual-import endpoint
+   * (POST /api/v3/manualimport). Returns the same items with Sonarr's
+   * recalculated season/episode mapping, quality, languages and rejections.
+   */
+  async reprocessManualImport(items: SonarrManualImportReprocessItem[]): Promise<SonarrManualImportCandidate[]> {
+    return this['request']<SonarrManualImportCandidate[]>('/manualimport', {
+      method: 'POST',
+      body: JSON.stringify(items),
+    });
+  }
+
+  /**
+   * Get episodes for a season (GET /api/v3/episode?seriesId=&seasonNumber=).
+   * Each episode carries `episodeFileId` — the join key to `getEpisodeFiles`.
+   */
+  async getEpisodesWithFiles(seriesId: number, seasonNumber: number): Promise<SonarrEpisodeWithFile[]> {
+    return this['request']<SonarrEpisodeWithFile[]>(`/episode?seriesId=${seriesId}&seasonNumber=${seasonNumber}`);
+  }
+
+  /**
+   * Get all episode files for a series (GET /api/v3/episodefile?seriesId=…).
+   * The file list has no episode linkage; join via episode.episodeFileId.
+   */
+  async getEpisodeFiles(seriesId: number): Promise<SonarrEpisodeFile[]> {
+    return this['request']<SonarrEpisodeFile[]>(`/episodefile?seriesId=${seriesId}`);
+  }
+
+  /**
+   * Queue Sonarr's native ManualImport command (POST /api/v3/command).
+   * `importMode` is always sent explicitly; never rely on the server default.
+   */
+  async executeManualImport(files: SonarrManualImportCommandFile[], importMode: string): Promise<{ id: number }> {
+    return this['request']<{ id: number }>('/command', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: 'ManualImport',
+        files,
+        importMode,
+      }),
+    });
+  }
 }
 
 export class RadarrClient extends ArrClient {
@@ -798,6 +1140,49 @@ export class RadarrClient extends ArrClient {
       body: JSON.stringify({
         name: 'RefreshMovie',
         movieIds: [movieId],
+      }),
+    });
+  }
+
+  /**
+   * Discover native manual-import candidates for a tracked download.
+   * GET /api/v3/manualimport — the app resolves the download location from
+   * `downloadId`; callers never supply a path.
+   */
+  async getManualImportCandidates(params: {
+    downloadId: string;
+    movieId?: number;
+    filterExistingFiles?: boolean;
+  }): Promise<RadarrManualImportCandidate[]> {
+    const query = new URLSearchParams({ downloadId: params.downloadId });
+    if (params.movieId !== undefined) query.append('movieId', String(params.movieId));
+    if (params.filterExistingFiles !== undefined) query.append('filterExistingFiles', String(params.filterExistingFiles));
+    return this['request']<RadarrManualImportCandidate[]>(`/manualimport?${query.toString()}`);
+  }
+
+  /**
+   * Reprocess candidate items through Radarr's native manual-import endpoint
+   * (POST /api/v3/manualimport). Returns the same items with Radarr's
+   * recalculated movie mapping, quality, languages and rejections.
+   */
+  async reprocessManualImport(items: RadarrManualImportReprocessItem[]): Promise<RadarrManualImportCandidate[]> {
+    return this['request']<RadarrManualImportCandidate[]>('/manualimport', {
+      method: 'POST',
+      body: JSON.stringify(items),
+    });
+  }
+
+  /**
+   * Queue Radarr's native ManualImport command (POST /api/v3/command).
+   * `importMode` is always sent explicitly; never rely on the server default.
+   */
+  async executeManualImport(files: RadarrManualImportCommandFile[], importMode: string): Promise<{ id: number }> {
+    return this['request']<{ id: number }>('/command', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: 'ManualImport',
+        files,
+        importMode,
       }),
     });
   }
@@ -903,6 +1288,76 @@ export class LidarrClient extends ArrClient {
    */
   async getMetadataProfiles(): Promise<MetadataProfile[]> {
     return this['request']<MetadataProfile[]>('/metadataprofile');
+  }
+
+  /**
+   * Discover native manual-import candidates for a tracked download.
+   * GET /api/v1/manualimport — the app resolves the download location from
+   * `downloadId`; callers never supply a path. An untracked downloadId yields
+   * an empty list (native behavior).
+   */
+  async getManualImportCandidates(params: {
+    downloadId: string;
+    artistId?: number;
+    filterExistingFiles?: boolean;
+    replaceExistingFiles?: boolean;
+  }): Promise<LidarrManualImportCandidate[]> {
+    const query = new URLSearchParams({ downloadId: params.downloadId });
+    if (params.artistId !== undefined) query.append('artistId', String(params.artistId));
+    if (params.filterExistingFiles !== undefined) query.append('filterExistingFiles', String(params.filterExistingFiles));
+    if (params.replaceExistingFiles !== undefined) query.append('replaceExistingFiles', String(params.replaceExistingFiles));
+    return this['request']<LidarrManualImportCandidate[]>(`/manualimport?${query.toString()}`);
+  }
+
+  /**
+   * Update/reprocess candidate items through Lidarr's native manual-import
+   * endpoint (POST /api/v1/manualimport, UpdateItems).
+   *
+   * Lidarr's backend re-runs the import decision with the supplied
+   * artist/album/release overrides and RECOMPUTES the tracks, quality and
+   * rejections server-side. The tracks in the response are Lidarr's default
+   * mapping; an explicit caller track override is applied separately (see
+   * `getTracks` for validation).
+   */
+  async updateManualImport(items: LidarrManualImportUpdateItem[]): Promise<LidarrManualImportCandidate[]> {
+    return this['request']<LidarrManualImportCandidate[]>('/manualimport', {
+      method: 'POST',
+      body: JSON.stringify(items),
+    });
+  }
+
+  /**
+   * Get tracks by album release (GET /api/v1/track?albumReleaseId=… →
+   * GetTracksByRelease) or by album. Used to validate caller-supplied track
+   * overrides against the selected album release before they are placed into
+   * the ManualImport command — mirroring the native Interactive Import track
+   * selector, which fetches the selectable tracks with the albumReleaseId.
+   */
+  async getTracks(params: { albumReleaseId?: number; albumId?: number }): Promise<LidarrTrack[]> {
+    const query = new URLSearchParams();
+    if (params.albumReleaseId !== undefined) query.append('albumReleaseId', String(params.albumReleaseId));
+    if (params.albumId !== undefined) query.append('albumId', String(params.albumId));
+    return this['request']<LidarrTrack[]>(`/track?${query.toString()}`);
+  }
+
+  /**
+   * Queue Lidarr's native ManualImport command (POST /api/v1/command).
+   * `importMode` and `replaceExistingFiles` are always sent explicitly.
+   */
+  async executeManualImport(
+    files: LidarrManualImportCommandFile[],
+    importMode: string,
+    replaceExistingFiles: boolean,
+  ): Promise<{ id: number }> {
+    return this['request']<{ id: number }>('/command', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: 'ManualImport',
+        files,
+        importMode,
+        replaceExistingFiles,
+      }),
+    });
   }
 }
 
