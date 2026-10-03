@@ -9,6 +9,31 @@ import { arrApiTimeoutMs, manualImportApiTimeoutMs } from "./config.js";
 
 export type ArrService = 'sonarr' | 'radarr' | 'lidarr' | 'prowlarr';
 
+/**
+ * Thrown when a single *arr API request exceeds its configured per-request
+ * timeout (`ARR_API_TIMEOUT_MS` / `MANUAL_IMPORT_API_TIMEOUT_MS`). It is a
+ * distinct, typed failure so callers can tell a real native API stall apart
+ * from an ordinary 404/500/connection error — best-effort preview metadata
+ * lookups must NOT disguise a request timeout as a null/unverifiable fallback.
+ *
+ * This is deliberately separate from an operation-level abort (preview
+ * deadline / explicit cancellation), which propagates the caller's own abort
+ * reason, never this error.
+ */
+export class ArrRequestTimeoutError extends Error {
+  readonly service: ArrService;
+  readonly endpoint: string;
+  readonly timeoutMs: number;
+
+  constructor(service: ArrService, endpoint: string, timeoutMs: number) {
+    super(`${service} request timed out after ${timeoutMs}ms: ${endpoint}`);
+    this.name = "ArrRequestTimeoutError";
+    this.service = service;
+    this.endpoint = endpoint;
+    this.timeoutMs = timeoutMs;
+  }
+}
+
 export interface ArrConfig {
   url: string;
   apiKey: string;
@@ -768,7 +793,7 @@ export class ArrClient {
     if (effectiveTimeout > 0) {
       timer = setTimeout(() => {
         timedOut = true;
-        controller.abort(new Error(`${this.serviceName} request timed out after ${effectiveTimeout}ms: ${endpoint}`));
+        controller.abort(new ArrRequestTimeoutError(this.serviceName, endpoint, effectiveTimeout));
       }, effectiveTimeout);
     }
 
@@ -803,10 +828,11 @@ export class ArrClient {
       return JSON.parse(body) as T;
     } catch (error) {
       // A per-request timeout aborts the fetch with a generic AbortError;
-      // surface the timeout explicitly so callers can distinguish it from a
-      // caller-initiated cancellation.
+      // surface the typed timeout so callers can distinguish it from a
+      // caller-initiated cancellation (operation deadline / cancel), which
+      // propagates the caller's own abort reason unchanged.
       if (timedOut) {
-        throw new Error(`${this.serviceName} request timed out after ${effectiveTimeout}ms: ${endpoint}`);
+        throw new ArrRequestTimeoutError(this.serviceName, endpoint, effectiveTimeout);
       }
       throw error;
     } finally {

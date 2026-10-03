@@ -28,6 +28,7 @@ import {
   LidarrClient,
   ProwlarrClient,
   ArrService,
+  ArrRequestTimeoutError,
 } from "./arr-client.js";
 import type {
   QueueStatusMessage,
@@ -2375,8 +2376,9 @@ async function sonarrEffectiveSeries(
   try {
     const series = await client.getSeriesById(seriesId, ctx.signal);
     resolved = { id: seriesId, title: series?.title ?? null };
-  } catch {
+  } catch (error) {
     rethrowIfOperationAborted(ctx.signal);
+    if (error instanceof ArrRequestTimeoutError) throw error;
     resolved = { id: seriesId, title: null };
   }
   cache.set(seriesId, resolved);
@@ -2407,8 +2409,9 @@ async function findSonarrReleaseContext(client: SonarrClient, downloadId: string
     let queue: { records: QueueItem[]; totalRecords: number };
     try {
       queue = await client.getQueue(page, pageSize, ctx.signal);
-    } catch {
+    } catch (error) {
       rethrowIfOperationAborted(ctx.signal);
+      if (error instanceof ArrRequestTimeoutError) throw error;
       return { available: false, title: null, customFormats: [], nativeScore: null, seriesId: null, reason: "queue-unavailable" };
     }
     const match = (queue.records ?? []).find((q) => q.downloadId === downloadId);
@@ -2459,8 +2462,9 @@ async function resolveSonarrProfileCFScores(
         map.set(f.format, { name: f.name, score: f.score });
       }
     }
-  } catch {
+  } catch (error) {
     rethrowIfOperationAborted(ctx.signal);
+    if (error instanceof ArrRequestTimeoutError) throw error;
     map = null;
   }
   profileCache.set(seriesId, map);
@@ -3170,8 +3174,9 @@ async function radarrEffectiveMovie(
   try {
     const movie = await client.getMovieById(movieId, ctx.signal);
     resolved = { id: movieId, title: movie?.title ?? null, year: movie?.year ?? null };
-  } catch {
+  } catch (error) {
     rethrowIfOperationAborted(ctx.signal);
+    if (error instanceof ArrRequestTimeoutError) throw error;
     resolved = { id: movieId, title: null, year: null };
   }
   cache.set(movieId, resolved);
@@ -3554,8 +3559,9 @@ async function getLidarrAlbumIdentity(
     resolved = album && album.id > 0
       ? { id: album.id, artistId: album.artistId, releases: album.releases ?? [] }
       : null;
-  } catch {
+  } catch (error) {
     rethrowIfOperationAborted(ctx.signal);
+    if (error instanceof ArrRequestTimeoutError) throw error;
     resolved = null;
   }
   cache.set(albumId, resolved);

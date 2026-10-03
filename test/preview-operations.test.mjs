@@ -182,6 +182,7 @@ function lidarrRoutes(opts = {}) {
       json: { id: 2, artistId: 1, releases: [{ id: 3, albumId: 2 }] },
       delayMs: opts.lidarrAlbumDelay,
       hang: opts.lidarrAlbumHang,
+      status: opts.lidarrAlbumStatus,
     }),
     "GET /api/v1/track": () => ({ json: [{ id: 10, albumReleaseId: 3, title: "Track", trackNumber: 1 }] }),
   };
@@ -676,6 +677,70 @@ test("an identical preview after a timeout starts a fresh operation, not a dedup
       assert.equal(b.payload.status, "running");
       assert.notEqual(b.payload.operationId, a.payload.operationId, "a new identical preview starts fresh after the prior one timed out");
       assert.notEqual(b.payload.deduplicated, true, "the timed-out operation is not treated as an active fingerprint");
+    },
+  );
+});
+
+// --- S. Per-request timeout inside a best-effort lookup is a real failure --
+
+// A configured native request timeout must NOT be swallowed as a null /
+// "unverifiable" metadata fallback: it is a real API stall and the operation
+// must fail with the timeout, not complete diagnostically.
+test("a per-request timeout during a best-effort Lidarr album lookup fails the preview (not a fallback)", async () => {
+  await withServers(
+    {
+      PREVIEW_SYNC_BUDGET_MS: "100",
+      PREVIEW_MAX_RUNTIME_MS: "20000",
+      ARR_API_TIMEOUT_MS: "250",
+      OPERATION_RESULT_TTL_MS: "600000",
+    },
+    { lidarrAlbumDelay: 1500 },
+    async (port) => {
+      const { payload } = await callTool(port, "lidarr_preview_manual_import", LIDARR_RELATIONSHIP_ARGS);
+      assert.equal(payload.status, "running");
+      await sleep(600);
+      const poll = await callTool(port, "arr_get_operation", { operationId: payload.operationId });
+      assert.equal(poll.payload.status, "failed", "request timeout surfaces as a failed operation, not a completed diagnostic preview");
+      assert.match(poll.payload.error, /request timed out/, "error names the request timeout");
+      assert.equal(poll.payload.result, undefined, "no unverifiable-relationship preview result is produced");
+    },
+  );
+});
+
+test("a per-request timeout during a best-effort Sonarr queue-context lookup fails the preview", async () => {
+  await withServers(
+    {
+      PREVIEW_SYNC_BUDGET_MS: "100",
+      PREVIEW_MAX_RUNTIME_MS: "20000",
+      ARR_API_TIMEOUT_MS: "250",
+      OPERATION_RESULT_TTL_MS: "600000",
+    },
+    { sonarrQueueDelay: 1500 },
+    async (port) => {
+      const { payload } = await callTool(port, "sonarr_preview_manual_import", { downloadId: SONARR_DOWNLOAD_ID, items: [{ candidateId: 123 }] });
+      assert.equal(payload.status, "running");
+      await sleep(600);
+      const poll = await callTool(port, "arr_get_operation", { operationId: payload.operationId });
+      assert.equal(poll.payload.status, "failed", "request timeout fails the preview rather than degrading to queue-unavailable");
+      assert.match(poll.payload.error, /request timed out/, "error names the request timeout");
+    },
+  );
+});
+
+// --- T. Ordinary (non-timeout) lookup failure still degrades safely --------
+
+test("an ordinary HTTP 500 on a best-effort album lookup still falls back to a diagnostic preview", async () => {
+  await withServers(
+    { PREVIEW_SYNC_BUDGET_MS: "8000", PREVIEW_MAX_RUNTIME_MS: "20000", ARR_API_TIMEOUT_MS: "20000", OPERATION_RESULT_TTL_MS: "600000" },
+    { lidarrAlbumStatus: 500 },
+    async (port) => {
+      const { payload, isError } = await callTool(port, "lidarr_preview_manual_import", LIDARR_RELATIONSHIP_ARGS);
+      assert.equal(isError, false, "a 500 on an optional lookup is not fatal — the preview completes diagnostically");
+      assert.equal(payload.operationId, undefined, "fast path returns the normal preview shape");
+      assert.equal(payload.count, 1);
+      assert.equal(payload.items[0].canPreview, false, "the candidate is reported as not previewable");
+      assert.equal(payload.items[0].relationshipValidation.ok, false, "relationship is unverifiable, not a hard failure");
+      assert.match(payload.items[0].relationshipValidation.problems.join(" "), /could not be fetched/, "the fallback reason is reported");
     },
   );
 });
