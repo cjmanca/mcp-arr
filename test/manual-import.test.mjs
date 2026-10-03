@@ -56,6 +56,45 @@ const SONARR_CANDIDATE_2 = {
   rejections: [],
 };
 
+// Native episode data the MCP layer validates caller-supplied episodeIds
+// against: GET /api/v3/episode?seriesId=&seasonNumber= — the exact query the
+// native episode picker issues. Keyed "seriesId:seasonNumber".
+//   series 47 "The Good Fight": season 6 → 9001/9002, season 0 (specials) → 62640
+//   series 88 "A Different Series": season 1 → 9100
+const SONARR_EPISODE_CATALOG = {
+  "47:6": [
+    { id: 9001, seriesId: 47, seasonNumber: 6, episodeNumber: 3, title: "The End of Football", hasFile: false, episodeFileId: null },
+    { id: 9002, seriesId: 47, seasonNumber: 6, episodeNumber: 4, title: "The End of Football II", hasFile: false, episodeFileId: null },
+  ],
+  "47:0": [
+    { id: 62640, seriesId: 47, seasonNumber: 0, episodeNumber: 1, title: "The Haunting of MoDean's II", hasFile: false, episodeFileId: null },
+  ],
+  "88:1": [
+    { id: 9100, seriesId: 88, seasonNumber: 1, episodeNumber: 1, title: "Pilot", hasFile: false, episodeFileId: null },
+  ],
+  // Series 90 is the Letterkenny worked example (see the regression test at the
+  // end of this file): season 4 has six real episodes with titles unrelated to
+  // the special's name, and the special itself lives in season 0.
+  "90:4": [
+    { id: 9201, seriesId: 90, seasonNumber: 4, episodeNumber: 1, title: "A K Smelly Christmas", hasFile: true, episodeFileId: 701 },
+    { id: 9202, seriesId: 90, seasonNumber: 4, episodeNumber: 2, title: "Best Before", hasFile: true, episodeFileId: 702 },
+    { id: 9203, seriesId: 90, seasonNumber: 4, episodeNumber: 3, title: "Tis the Season", hasFile: true, episodeFileId: 703 },
+    { id: 9204, seriesId: 90, seasonNumber: 4, episodeNumber: 4, title: "Garnet Rings", hasFile: true, episodeFileId: 704 },
+    { id: 9205, seriesId: 90, seasonNumber: 4, episodeNumber: 5, title: "The D's", hasFile: true, episodeFileId: 705 },
+    { id: 9206, seriesId: 90, seasonNumber: 4, episodeNumber: 6, title: "The Shit Paradox 2", hasFile: true, episodeFileId: 706 },
+  ],
+  "90:0": [
+    { id: 9300, seriesId: 90, seasonNumber: 0, episodeNumber: 1, title: "The Haunting of MoDean's II", hasFile: true, episodeFileId: 700 },
+  ],
+};
+
+// GET /api/v3/series/{id} — the source of an overridden series' REAL title.
+const SONARR_SERIES = {
+  47: { id: 47, title: "The Good Fight", seriesType: "standard" },
+  88: { id: 88, title: "A Different Series", seriesType: "standard" },
+  90: { id: 90, title: "Letterkenny", seriesType: "standard" },
+};
+
 const RADARR_CANDIDATE = {
   id: 222,
   path: "/downloads/complete/Some.Movie/Some.Movie.2026.1080p.mkv",
@@ -106,7 +145,7 @@ function safeJson(raw) {
   }
 }
 
-function startStub(routes) {
+function startStub(routes, dynamic = []) {
   const requests = [];
   const server = createServer(async (req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
@@ -119,7 +158,8 @@ function startStub(routes) {
       body: raw ? safeJson(raw) : null,
     };
     requests.push(entry);
-    const route = routes[`${req.method} ${url.pathname}`];
+    const route = routes[`${req.method} ${url.pathname}`]
+      ?? dynamic.find((d) => d.method === req.method && d.pattern.test(url.pathname))?.handler;
     if (!route) {
       res.writeHead(404, { "content-type": "application/json" });
       res.end(JSON.stringify({ error: `unrouted ${req.method} ${url.pathname}` }));
@@ -136,29 +176,72 @@ function startStub(routes) {
   });
 }
 
-// Sonarr/Radarr reprocess: the native controller returns the SAME items with
-// recalculated fields; the stub echoes request fields and applies scripted
-// rejections, exactly the shape the MCP layer consumes.
+// Sonarr reprocess: mirrors ManualImportService.ReprocessItem (v5-develop) —
+//   episodeIds present  → _episodeService.GetEpisodes(episodeIds), a GLOBAL
+//                         lookup by id paired with the supplied seriesId. Sonarr
+//                         does NOT check that the episodes belong to the series.
+//   no episodeIds, season → ImportRejection(NoEpisodes, "Episodes not selected")
+//   neither             → ProcessFile: re-parse the path against the series.
+// The response echoes the request items with recalculated fields and
+// episodeIds cleared, exactly the shape the MCP layer consumes.
+function catalogEpisode(catalog, id) {
+  for (const list of Object.values(catalog)) {
+    const found = list.find((e) => e.id === id);
+    if (found) return found;
+  }
+  return null;
+}
+
+function parseSeasonEpisode(text) {
+  const m = /[Ss](\d{1,2})[Ee](\d{1,3})/.exec(text ?? "");
+  return m ? { seasonNumber: Number(m[1]), episodeNumber: Number(m[2]) } : null;
+}
+
 function sonarrReprocess(items, opts) {
   // Sonarr computes qualityWeight/customFormatScore server-side from the
   // release during reprocess; the stub echoes the discovery candidate's
   // values (the reprocess payload does not carry them).
   const byId = Object.fromEntries((opts.sonarrCandidates ?? [SONARR_CANDIDATE]).map((c) => [c.id, c]));
-  return items.map((item) => ({
-    ...item,
-    episodes: (item.episodeIds ?? []).map((id) => ({
-      id,
-      seriesId: item.seriesId,
-      seasonNumber: item.seasonNumber,
-      episodeNumber: 3,
-      title: `Episode ${id}`,
-    })),
-    rejections: opts.reprocessRejections ?? [],
-    customFormats: byId[item.id]?.customFormats ?? [],
-    customFormatScore: byId[item.id]?.customFormatScore ?? 0,
-    qualityWeight: byId[item.id]?.qualityWeight ?? 0,
-    episodeIds: null,
-  }));
+  const catalog = opts.sonarrEpisodeCatalog ?? SONARR_EPISODE_CATALOG;
+
+  return items.map((item) => {
+    const episodeIds = item.episodeIds ?? [];
+    let episodes;
+    let nativeRejections = [];
+
+    if (episodeIds.length > 0) {
+      episodes = episodeIds.map((id) => catalogEpisode(catalog, id) ?? {
+        id,
+        seriesId: item.seriesId,
+        seasonNumber: item.seasonNumber ?? 0,
+        episodeNumber: 3,
+        title: `Episode ${id}`,
+        hasFile: false,
+        episodeFileId: null,
+      });
+    } else if (item.seasonNumber !== null && item.seasonNumber !== undefined) {
+      episodes = [];
+      nativeRejections = [{ reason: "Episodes not selected", type: "permanent" }];
+    } else {
+      const parsed = parseSeasonEpisode(item.name ?? item.path);
+      const season = parsed ? catalog[`${item.seriesId}:${parsed.seasonNumber}`] ?? [] : [];
+      episodes = parsed ? season.filter((e) => e.episodeNumber === parsed.episodeNumber) : [];
+      nativeRejections = episodes.length === 0
+        ? [{ reason: "Unable to parse episode info from path", type: "permanent" }]
+        : [];
+    }
+
+    return {
+      ...item,
+      episodes,
+      seasonNumber: episodes.length > 0 ? episodes[0].seasonNumber : (item.seasonNumber ?? null),
+      rejections: [...nativeRejections, ...(opts.reprocessRejections ?? [])],
+      customFormats: byId[item.id]?.customFormats ?? [],
+      customFormatScore: byId[item.id]?.customFormatScore ?? 0,
+      qualityWeight: byId[item.id]?.qualityWeight ?? 0,
+      episodeIds: null,
+    };
+  });
 }
 
 function radarrReprocess(items, opts) {
@@ -237,10 +320,28 @@ function buildRoutes(opts) {
     }),
     "POST /api/v3/manualimport": (e) => ({ json: sonarrReprocess(e.body, opts) }),
     "POST /api/v3/command": () => ({ json: { id: opts.commandId ?? 987, name: "ManualImport", status: "queued" } }),
-    "GET /api/v3/episode": () => ({ json: opts.sonarrEpisodesWithFiles ?? [] }),
+    // Query-aware: GET /api/v3/episode?seriesId=&seasonNumber= returns that
+    // season's episodes, like the native endpoint the episode picker uses.
+    "GET /api/v3/episode": (e) => ({
+      json: opts.sonarrEpisodesWithFiles
+        ?? (opts.sonarrEpisodeCatalog ?? SONARR_EPISODE_CATALOG)[`${e.params.seriesId}:${e.params.seasonNumber}`]
+        ?? [],
+    }),
     "GET /api/v3/episodefile": () => ({ json: opts.sonarrEpisodeFilesList ?? [] }),
     "GET /api/v3/queue": () => ({ json: { records: [], totalRecords: 0 } }),
   };
+  // GET /api/v3/series/{id} — the real title of an overridden series.
+  const sonarrDynamic = [
+    {
+      method: "GET",
+      pattern: /^\/api\/v3\/series\/\d+$/,
+      handler: (e) => {
+        const id = Number(e.path.split("/").pop());
+        const series = (opts.sonarrSeries ?? SONARR_SERIES)[id];
+        return series ? { json: series } : { status: 404, json: { message: `series ${id} not found` } };
+      },
+    },
+  ];
   const radarr = {
     "GET /api/v3/manualimport": (e) => ({
       json: e.params.downloadId === "dl-11" ? (opts.radarrCandidates ?? [RADARR_CANDIDATE]) : [],
@@ -258,7 +359,7 @@ function buildRoutes(opts) {
     "GET /api/v1/track": (e) => ({ json: lidarrTrackResourcesForRelease(Number(e.params.albumReleaseId), opts) }),
     "GET /api/v1/queue": () => ({ json: { records: [], totalRecords: 0 } }),
   };
-  return { sonarr, radarr, lidarr };
+  return { sonarr, radarr, lidarr, sonarrDynamic };
 }
 
 // --- MCP harness ----------------------------------------------------------
@@ -324,7 +425,7 @@ async function callTool(port, name, args) {
 async function withServers(opts, fn) {
   const port = String(34000 + Math.floor(Math.random() * 1000));
   const routes = buildRoutes(opts);
-  const sonarrStub = await startStub(routes.sonarr);
+  const sonarrStub = await startStub(routes.sonarr, routes.sonarrDynamic);
   const radarrStub = await startStub(routes.radarr);
   const lidarrStub = await startStub(routes.lidarr);
 
@@ -390,7 +491,16 @@ test("sonarr_get_manual_import_candidates: native GET /api/v3/manualimport scope
 
     assert.equal(result.payload.count, 1);
     assert.ok(Array.isArray(result.payload.verifyBeforeActing) && result.payload.verifyBeforeActing.length >= 2, "discovery leads with the verify-before-acting directive");
-    assert.match(JSON.stringify(result.payload.verifyBeforeActing), /PARSE GUESSES/i, "directive states mappings/rejections are not facts");
+    assert.match(
+      JSON.stringify(result.payload.verifyBeforeActing),
+      /parse PROPOSAL/i,
+      "directive states the mapping is a proposal, not verified fact",
+    );
+    assert.doesNotMatch(
+      JSON.stringify(result.payload.verifyBeforeActing),
+      /is the verification key|trust the mapping|almost NEVER a correctly mapped/i,
+      "directive must not encode single-incident heuristics as universal rules",
+    );
     const c = result.payload.candidates[0];
     assert.equal(c.candidateId, 123, "candidateId is the native resource id");
     assert.equal(c.path, SONARR_CANDIDATE.path, "path is returned for display only");
@@ -527,14 +637,18 @@ test("sonarr_execute_manual_import: fresh GET -> resolve -> reprocess -> command
     });
     assert.equal(result.isError, false, result.text);
 
-    // Order: discovery, reprocess, command — reprocess happens immediately
-    // before command submission, on every execute.
+    // Order: discovery, episode-id validation, reprocess, command — reprocess
+    // happens immediately before command submission, on every execute.
     const methods = logs.sonarr.map((r) => `${r.method} ${r.path}`);
     assert.deepEqual(methods, [
       "GET /api/v3/manualimport",
+      "GET /api/v3/episode",
       "POST /api/v3/manualimport",
       "POST /api/v3/command",
     ]);
+    const validation = requestsTo(logs.sonarr, "GET", "/api/v3/episode")[0];
+    assert.equal(validation.params.seriesId, "47", "explicit episodeIds are validated against the effective series");
+    assert.equal(validation.params.seasonNumber, "6", "…and the effective season");
 
     const command = requestsTo(logs.sonarr, "POST", "/api/v3/command")[0].body;
     assert.equal(command.name, "ManualImport");
@@ -1207,7 +1321,320 @@ test("ambiguous candidateId (hash collision: two current candidates share an id)
   });
 });
 
-// --- 17. queue functionality unaffected -----------------------------------
+// --- 17. Sonarr mapping hierarchy: series → season → episodes -------------
+//
+// Native Interactive Import clears dependents when a parent is reselected
+// (InteractiveImportRow.tsx: onSeriesSelect → { seasonNumber: undefined,
+// episodes: [] }; onSeasonSelect → { episodes: [] }). It must do so because
+// Sonarr's reprocess resolves episode ids GLOBALLY and pairs them with the
+// supplied seriesId with no ownership check (ManualImportService.ReprocessItem:
+// `_episodeService.GetEpisodes(episodeIds)`), so an inherited child mapping
+// across a parent change would be imported, not rejected.
+
+test("seriesId override clears the inherited seasonNumber and episodes", async () => {
+  await withServers({ reprocessRejections: [] }, async (port, logs) => {
+    const preview = await callTool(port, "sonarr_preview_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 123, seriesId: 88 }],
+    });
+    assert.equal(preview.isError, false, preview.text);
+    const item = preview.payload.items[0];
+
+    assert.equal(item.series.id, 88);
+    assert.deepEqual(item.episodes, [], "Series A's episode 9001 must not be carried into Series B");
+    assert.equal(item.mappingOverridesApplied.seriesChanged, true);
+    assert.equal(item.mappingOverridesApplied.clearedSeasonNumber, true);
+    assert.equal(item.mappingOverridesApplied.clearedEpisodeIds, true);
+    assert.equal(item.episodesRequired, true, "preview reports that episodes must be selected");
+    assert.equal(item.mappingValid, false);
+    assert.equal(item.canExecuteWithoutOverride, false);
+
+    const reprocess = requestsTo(logs.sonarr, "POST", "/api/v3/manualimport")[0];
+    assert.equal(reprocess.body[0].seriesId, 88);
+    assert.equal(reprocess.body[0].seasonNumber, null, "the inherited season is cleared, not reused");
+    assert.deepEqual(reprocess.body[0].episodeIds, [], "the inherited episodes are cleared, not reused");
+
+    const exec = await callTool(port, "sonarr_execute_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 123, seriesId: 88 }],
+    });
+    assert.equal(exec.isError, true, "an incomplete mapping must not be importable");
+    assert.match(exec.text, /no episode mapping after reprocessing/);
+    assert.equal(requestsTo(logs.sonarr, "POST", "/api/v3/command").length, 0, "no command for an incomplete mapping");
+  });
+});
+
+test("seasonNumber override clears the inherited episodes", async () => {
+  await withServers({ reprocessRejections: [] }, async (port, logs) => {
+    const preview = await callTool(port, "sonarr_preview_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 123, seasonNumber: 0 }],
+    });
+    assert.equal(preview.isError, false, preview.text);
+    const item = preview.payload.items[0];
+
+    assert.equal(item.mappingOverridesApplied.seasonChanged, true);
+    assert.equal(item.mappingOverridesApplied.clearedSeasonNumber, false, "the season was supplied explicitly, so it is kept");
+    assert.equal(item.mappingOverridesApplied.clearedEpisodeIds, true);
+    assert.deepEqual(item.episodes, [], "season 6's episode 9001 must not be inherited into season 0");
+    assert.equal(item.episodesRequired, true);
+
+    const reprocess = requestsTo(logs.sonarr, "POST", "/api/v3/manualimport")[0];
+    assert.equal(reprocess.body[0].seasonNumber, 0);
+    assert.deepEqual(reprocess.body[0].episodeIds, []);
+
+    const exec = await callTool(port, "sonarr_execute_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 123, seasonNumber: 0 }],
+    });
+    assert.equal(exec.isError, true);
+    assert.match(exec.text, /no episode mapping after reprocessing/);
+    assert.equal(requestsTo(logs.sonarr, "POST", "/api/v3/command").length, 0);
+  });
+});
+
+test("cross-series episodeIds are refused before any reprocess or command", async () => {
+  await withServers({ reprocessRejections: [] }, async (port, logs) => {
+    // 9001 belongs to series 47 season 6; the effective target is series 88 season 1.
+    const exec = await callTool(port, "sonarr_execute_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 123, seriesId: 88, seasonNumber: 1, episodeIds: [9001] }],
+    });
+    assert.equal(exec.isError, true, exec.text);
+    assert.match(exec.text, /not episodes of the effective series\/season/);
+    const refusal = JSON.parse(exec.text);
+    assert.deepEqual(refusal.invalidSelections[0].unknownEpisodeIds, [9001]);
+    assert.equal(refusal.invalidSelections[0].effectiveSeriesId, 88);
+    assert.equal(refusal.invalidSelections[0].effectiveSeasonNumber, 1);
+    assert.equal(requestsTo(logs.sonarr, "POST", "/api/v3/manualimport").length, 0, "refused before reprocess");
+    assert.equal(requestsTo(logs.sonarr, "POST", "/api/v3/command").length, 0, "refused before command");
+
+    // Preview surfaces the same finding without failing.
+    const preview = await callTool(port, "sonarr_preview_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 123, seriesId: 88, seasonNumber: 1, episodeIds: [9001] }],
+    });
+    assert.equal(preview.isError, false, "preview stays non-destructive and reports the problem");
+    const item = preview.payload.items[0];
+    assert.equal(item.episodeValidation.ok, false);
+    assert.deepEqual(item.episodeValidation.unknownEpisodeIds, [9001]);
+    assert.equal(item.canExecuteWithoutOverride, false);
+  });
+});
+
+test("cross-season episodeIds are refused before any reprocess or command", async () => {
+  await withServers({ reprocessRejections: [] }, async (port, logs) => {
+    // Series is right, season is wrong: 9001 is a season-6 episode, target is season 0.
+    const exec = await callTool(port, "sonarr_execute_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 123, seriesId: 47, seasonNumber: 0, episodeIds: [9001] }],
+    });
+    assert.equal(exec.isError, true, exec.text);
+    const refusal = JSON.parse(exec.text);
+    assert.deepEqual(refusal.invalidSelections[0].unknownEpisodeIds, [9001]);
+    assert.equal(refusal.invalidSelections[0].effectiveSeasonNumber, 0);
+    assert.match(refusal.invalidSelections[0].reason, /seasonNumber=0/);
+    assert.equal(requestsTo(logs.sonarr, "POST", "/api/v3/command").length, 0);
+  });
+});
+
+test("episodeIds without an explicit seasonNumber are refused (native requires a season)", async () => {
+  await withServers({ reprocessRejections: [] }, async (port, logs) => {
+    const exec = await callTool(port, "sonarr_execute_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 123, seriesId: 88, episodeIds: [9100] }],
+    });
+    assert.equal(exec.isError, true, exec.text);
+    assert.match(exec.text, /require an explicit seasonNumber/);
+    assert.equal(requestsTo(logs.sonarr, "POST", "/api/v3/command").length, 0);
+  });
+});
+
+test("valid remap: corrected series + season + episodes previews and executes", async () => {
+  await withServers({ reprocessRejections: [] }, async (port, logs) => {
+    const items = [{ candidateId: 123, seriesId: 88, seasonNumber: 1, episodeIds: [9100] }];
+
+    const preview = await callTool(port, "sonarr_preview_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items,
+    });
+    assert.equal(preview.isError, false, preview.text);
+    const item = preview.payload.items[0];
+    assert.equal(item.series.id, 88);
+    assert.equal(item.series.title, "A Different Series", "the EFFECTIVE series' real title");
+    assert.equal(item.seasonNumber, 1);
+    assert.deepEqual(item.episodes.map((e) => e.id), [9100]);
+    assert.equal(item.episodeValidation.ok, true);
+    assert.equal(item.mappingValid, true);
+    assert.equal(item.episodesRequired, false);
+
+    const exec = await callTool(port, "sonarr_execute_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items,
+    });
+    assert.equal(exec.isError, false, exec.text);
+    const command = requestsTo(logs.sonarr, "POST", "/api/v3/command")[0].body;
+    assert.equal(command.files[0].seriesId, 88);
+    assert.deepEqual(command.files[0].episodeIds, [9100], "the corrected selection is what imports");
+    assert.equal(command.files[0].path, SONARR_CANDIDATE.path, "path still comes from the native candidate");
+    assert.equal(exec.payload.status, "queued");
+  });
+});
+
+test("preview reports the EFFECTIVE series title, never the original candidate's title under an overridden id", async () => {
+  await withServers({ reprocessRejections: [] }, async (port, logs) => {
+    const preview = await callTool(port, "sonarr_preview_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 123, seriesId: 88, seasonNumber: 1, episodeIds: [9100] }],
+    });
+    assert.equal(preview.isError, false, preview.text);
+    const item = preview.payload.items[0];
+    assert.deepEqual(item.series, { id: 88, title: "A Different Series" });
+    assert.notEqual(item.series.title, "The Good Fight", "the stale Series A title must never pair with Series B's id");
+
+    const seriesGets = requestsTo(logs.sonarr, "GET", "/api/v3/series/88");
+    assert.equal(seriesGets.length, 1, "the effective series is fetched from the native endpoint");
+
+    // An unmodified candidate keeps its own embedded series — no extra lookup.
+    const plain = await callTool(port, "sonarr_preview_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 123 }],
+    });
+    assert.deepEqual(plain.payload.items[0].series, { id: 47, title: "The Good Fight" });
+    assert.equal(requestsTo(logs.sonarr, "GET", "/api/v3/series/47").length, 0, "no lookup when the id is unchanged");
+  });
+});
+
+test("preview returns title: null rather than stale metadata when the effective series lookup fails", async () => {
+  await withServers({ reprocessRejections: [], sonarrSeries: {} }, async (port, logs) => {
+    const preview = await callTool(port, "sonarr_preview_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 123, seriesId: 88, seasonNumber: 1, episodeIds: [9100] }],
+    });
+    assert.equal(preview.isError, false, "a failed title lookup must not abort the preview");
+    const item = preview.payload.items[0];
+    assert.equal(item.series.id, 88, "the effective id is still reported");
+    assert.equal(item.series.title, null, "no stale title is substituted for a failed lookup");
+  });
+});
+
+// --- 18. duplicate candidateId guard --------------------------------------
+
+test("duplicate candidateId in one request is refused before any native request", async () => {
+  await withServers({}, async (port, logs) => {
+    const items = [{ candidateId: 123 }, { candidateId: 123 }];
+
+    const preview = await callTool(port, "sonarr_preview_manual_import", { downloadId: SONARR_DOWNLOAD_ID, items });
+    assert.equal(preview.isError, true);
+    assert.match(preview.text, /duplicate candidateId 123/);
+    assert.equal(logs.sonarr.length, 0, "refused at parse time — no discovery, reprocess, or command");
+
+    const exec = await callTool(port, "sonarr_execute_manual_import", { downloadId: SONARR_DOWNLOAD_ID, items });
+    assert.equal(exec.isError, true);
+    assert.match(exec.text, /duplicate candidateId 123/);
+    assert.equal(requestsTo(logs.sonarr, "POST", "/api/v3/command").length, 0);
+
+    // Shared parsing: the guard applies to the other services too.
+    const radarr = await callTool(port, "radarr_execute_manual_import", { downloadId: "dl-11", items: [{ candidateId: 222 }, { candidateId: 222 }] });
+    assert.equal(radarr.isError, true);
+    assert.match(radarr.text, /duplicate candidateId 222/);
+    const lidarr = await callTool(port, "lidarr_execute_manual_import", { downloadId: LIDARR_DOWNLOAD_ID, items: [{ candidateId: 333 }, { candidateId: 333 }] });
+    assert.equal(lidarr.isError, true);
+    assert.match(lidarr.text, /duplicate candidateId 333/);
+  });
+});
+
+// --- 19. Worked example: a complete-looking proposal that is wrong ---------
+//
+// The Letterkenny case, kept here as a regression test rather than as runtime
+// guidance injected into every response. Sonarr proposed
+//   Letterkenny.S04.The.Haunting.of.MoDeans.II  →  S04E01–06
+// six real season-4 episodes whose titles have nothing to do with the name's
+// title, and reported a complete mapping. The correct target is the season-0
+// special of that title. The point the directive preserves: the proposal is
+// complete, not verified — titles and numbering are both evidence, and here
+// they conflict, so the mapping is ambiguous and must be investigated.
+
+test("worked example: a complete season-4 proposal, remapped to the season-0 special", async () => {
+  const letterkenny = {
+    ...SONARR_CANDIDATE,
+    id: 130,
+    path: "/downloads/complete/Letterkenny/Letterkenny.S04.The.Haunting.of.MoDeans.II.1080p.WEB-DL.mkv",
+    name: "Letterkenny.S04.The.Haunting.of.MoDeans.II.1080p",
+    folderName: "Letterkenny.S04",
+    series: { id: 90, title: "Letterkenny" },
+    seasonNumber: 4,
+    episodes: SONARR_EPISODE_CATALOG["90:4"].map((e) => ({
+      id: e.id, seriesId: 90, seasonNumber: 4, episodeNumber: e.episodeNumber, title: e.title,
+    })),
+    // Equal to the special's existing file (CF 600), matching the real case.
+    customFormats: [{ id: 1, name: "NTb", score: 600 }],
+    customFormatScore: 600,
+    rejections: [],
+  };
+  const opts = {
+    sonarrCandidates: [letterkenny],
+    sonarrEpisodeFilesList: [
+      { id: 700, quality: QUALITY, customFormatScore: 600 },
+      ...SONARR_EPISODE_CATALOG["90:4"].map((e) => ({ id: e.episodeFileId, quality: QUALITY, customFormatScore: 600 })),
+    ],
+  };
+
+  await withServers(opts, async (port, logs) => {
+    // 1. The proposal looks complete — mappingValid: true — and the episode
+    //    titles are the evidence an agent must weigh against the release name.
+    const proposed = await callTool(port, "sonarr_preview_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 130 }],
+    });
+    assert.equal(proposed.isError, false, proposed.text);
+    const proposal = proposed.payload.items[0];
+    assert.equal(proposal.mappingValid, true, "a complete-looking proposal is exactly the trap");
+    assert.deepEqual(proposal.episodes.map((e) => e.id), [9201, 9202, 9203, 9204, 9205, 9206]);
+    assert.ok(
+      proposal.episodes.every((e) => !/haunting/i.test(e.title ?? "")),
+      "no detected episode title matches the release name's title — the conflicting evidence",
+    );
+
+    // 2. A season-only override must NOT silently keep the season-4 list:
+    //    the season change clears the inherited episodes.
+    const seasonOnly = await callTool(port, "sonarr_preview_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 130, seasonNumber: 0 }],
+    });
+    assert.equal(seasonOnly.isError, false, seasonOnly.text);
+    const cleared = seasonOnly.payload.items[0];
+    assert.deepEqual(cleared.episodes, [], "the season-4 selection is cleared, not carried into season 0");
+    assert.equal(cleared.mappingOverridesApplied.clearedEpisodeIds, true);
+    assert.equal(cleared.episodesRequired, true);
+    assert.equal(cleared.mappingValid, false);
+
+    const seasonOnlyExec = await callTool(port, "sonarr_execute_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 130, seasonNumber: 0 }],
+    });
+    assert.equal(seasonOnlyExec.isError, true, "the cleared selection cannot be imported");
+    assert.equal(requestsTo(logs.sonarr, "POST", "/api/v3/command").length, 0);
+
+    // 3. The full corrected selection imports the special, and the upgrade
+    //    decision is evaluated against the special's existing file.
+    const remapped = await callTool(port, "sonarr_preview_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 130, seasonNumber: 0, episodeIds: [9300] }],
+    });
+    assert.equal(remapped.isError, false, remapped.text);
+    const target = remapped.payload.items[0];
+    assert.equal(target.series.title, "Letterkenny");
+    assert.equal(target.seasonNumber, 0);
+    assert.deepEqual(target.episodes.map((e) => e.id), [9300]);
+    assert.equal(target.episodeValidation.ok, true);
+    assert.equal(target.mappingValid, true);
+    assert.equal(target.upgradeAssessment.verdict, "no-upgrade-rejection", "the special already has a file; equal quality + equal CF is a neutral replacement");
+    assert.equal(target.upgradeAssessment.existingFiles[0].episodeId, 9300);
+  });
+});
+
+// --- 20. queue functionality unaffected -----------------------------------
 
 test("queue tools keep working alongside the manual-import tools", async () => {
   await withServers({}, async (port) => {

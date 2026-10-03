@@ -331,7 +331,7 @@ if (clients.sonarr) {
     },
     {
       name: "sonarr_get_manual_import_candidates",
-      description: "Discover Sonarr's native manual-import candidates for a tracked download (read-only). Sonarr resolves the download location from the downloadId — never supply a path. Returns each candidate's candidateId (the native manual-import resource id), display path, quality, languages, mapped series/season/episodes, custom formats, and structured rejections (e.g. 'Unable to determine if file is a sample'). IMPORTANT: the returned mapping and rejection reasons are Sonarr's PARSE GUESSES from the release name — NOT facts. Verify against sonarr_get_episodes before recommending execute/allowRejected. The release name's TITLE is the verification key: number mismatches alone are expected mapping-source differences (TheTVDB/TMDB/absolute numbering), not errors; the mapping is suspect only when the name contains an episode title that does not match the detected episodes' titles (match by meaning, not exact string — fan-sub/anime translations differ). On a title mismatch, search seasons in order: Sonarr's guessed season, the release title's season, Specials (seasonNumber=0), then other seasons nearest-outward. Use sonarr_get_queue first to find the downloadId. Workflow: get candidates -> preview corrected mapping if needed -> execute manual import -> re-check queue.",
+      description: "Discover Sonarr's native manual-import candidates for a tracked download (read-only). Sonarr resolves the download location from the downloadId — never supply a path. Returns each candidate's candidateId (the native manual-import resource id), display path, quality, languages, mapped series/season/episodes, custom formats, and structured rejections (e.g. 'Unable to determine if file is a sample'). IMPORTANT: the returned mapping and rejection reasons are Sonarr's parse PROPOSAL derived from the release name — not verified facts. Verify against sonarr_get_episodes before recommending execute/allowRejected. Titles and numbering are both evidence and neither is conclusive alone; when they conflict, treat the mapping as ambiguous and investigate (including seasonNumber=0 for specials) rather than trusting the proposal or overriding it. Use sonarr_get_queue first to find the downloadId. Workflow: get candidates -> preview corrected mapping if needed -> execute manual import -> re-check queue.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -357,7 +357,7 @@ if (clients.sonarr) {
     },
     {
       name: "sonarr_preview_manual_import",
-      description: "Preview (reprocess) a manual import in Sonarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (seriesId/seasonNumber/episodeIds/releaseGroup), sends Sonarr's native manual-import reprocess request, and returns Sonarr's recalculated mapping, quality, languages and rejections. Candidates with no valid series mapping (and no seriesId override) are returned as mappingRequired/canPreview=false and are never sent to Sonarr — a 0 seriesId is never submitted, because Sonarr's reprocess resolves the series and throws for unknown ids. Use this to fix unparseable filenames or wrong episode mappings and inspect the result; then run sonarr_execute_manual_import with the same overrides. Non-destructive: never moves, copies, or imports files.",
+      description: "Preview (reprocess) a manual import in Sonarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (seriesId/seasonNumber/episodeIds/releaseGroup), sends Sonarr's native manual-import reprocess request, and returns Sonarr's recalculated mapping, quality, languages and rejections. Candidates with no valid series mapping (and no seriesId override) are returned as mappingRequired/canPreview=false and are never sent to Sonarr — a 0 seriesId is never submitted, because Sonarr's reprocess resolves the series and throws for unknown ids. Overrides follow the native hierarchy series -> season -> episodes: a seriesId override clears the inherited seasonNumber and episodes, and a seasonNumber override clears the inherited episodes, so supply the full corrected selection rather than only the parent. Explicit episodeIds are validated against GET /api/v3/episode?seriesId=&seasonNumber= and reported in episodeValidation. The reported series is the EFFECTIVE series (its real id and title), never the original candidate's title under an overridden id. Use this to fix unparseable filenames or wrong episode mappings and inspect the result; then run sonarr_execute_manual_import with the same overrides. Non-destructive: never moves, copies, or imports files.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -402,7 +402,7 @@ if (clients.sonarr) {
     },
     {
       name: "sonarr_execute_manual_import",
-      description: "Execute a manual import in Sonarr (DESTRUCTIVE: moves/copies media files). Always re-validates from scratch: re-fetches native candidates for the downloadId, resolves each candidateId (fails if a candidate disappeared or is ambiguous), merges only permitted mapping overrides, reprocesses through Sonarr's native endpoint, verifies series/episode/quality mapping, then queues Sonarr's native ManualImport command with an explicit importMode. Caller-supplied paths are never accepted — paths come only from native candidates. Candidates with no valid series mapping are refused before any native request (never sent with a fabricated 0). Candidates with remaining rejections are refused unless that item sets allowRejected=true (mirrors the Interactive Import 'import anyway' override; authorization is per candidate, so a multi-file release can import one file despite its rejection while a rejected file you did not authorize stays blocked). VERIFY BEFORE EXECUTING: Sonarr's suggested mapping and rejections are parse guesses, not facts — confirm the mapping against sonarr_get_episodes (check Specials when the release name carries a title) before authorizing an import. Returns the command id — the import runs asynchronously, so re-check sonarr_get_queue afterwards. Does NOT delete queue items.",
+      description: "Execute a manual import in Sonarr (DESTRUCTIVE: moves/copies media files). Always re-validates from scratch: re-fetches native candidates for the downloadId, resolves each candidateId (fails if a candidate disappeared or is ambiguous; duplicate candidateIds in one request are refused), merges only permitted mapping overrides, reprocesses through Sonarr's native endpoint, verifies series/episode/quality mapping, then queues Sonarr's native ManualImport command with an explicit importMode. Caller-supplied paths are never accepted — paths come only from native candidates. Candidates with no valid series mapping are refused before any native request (never sent with a fabricated 0). Overrides follow the native hierarchy series -> season -> episodes: a seriesId override clears the inherited seasonNumber and episodes, and a seasonNumber override clears the inherited episodes. Caller-supplied episodeIds are validated against GET /api/v3/episode?seriesId=&seasonNumber= and the command is refused when any id is not an episode of the effective series and season — Sonarr's own reprocess resolves episode ids globally and pairs them with the supplied seriesId without checking ownership, so this is the only layer that can catch a cross-series/cross-season selection. Candidates with remaining rejections are refused unless that item sets allowRejected=true (mirrors the Interactive Import 'import anyway' override; authorization is per candidate, so a multi-file release can import one file despite its rejection while a rejected file you did not authorize stays blocked). VERIFY BEFORE EXECUTING: Sonarr's suggested mapping and rejections are a parse proposal, not facts — confirm the mapping against sonarr_get_episodes before authorizing an import. Returns the command id — the import runs asynchronously, so re-check sonarr_get_queue afterwards. Does NOT delete queue items.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -1818,10 +1818,22 @@ function parseManualImportArgs(args: unknown): {
       "items is required: at least one { candidateId, ... } entry taken from *_get_manual_import_candidates for this downloadId.",
     );
   }
+  const seenCandidateIds = new Set<number>();
   for (const item of a.items) {
     if (!item || typeof item.candidateId !== "number" || !Number.isInteger(item.candidateId)) {
       throw new Error("every item must include a numeric candidateId from *_get_manual_import_candidates.");
     }
+    // The same native file must never be submitted twice in one ManualImport
+    // command. Checked at parse time, before any native request: two entries
+    // with one candidateId resolve to the same candidate, so episode-collision
+    // detection (which compares mappings ACROSS distinct candidates) cannot see
+    // them, and the command would import the same path twice.
+    if (seenCandidateIds.has(item.candidateId)) {
+      throw new Error(
+        `duplicate candidateId ${item.candidateId} in items: each candidate may appear only once per request. Merge the entry's overrides into a single item.`,
+      );
+    }
+    seenCandidateIds.add(item.candidateId);
     // Entity ids, when supplied, must be real positive ids. 0/negative values
     // are never valid native entity ids and must not be forwarded to the
     // *arr APIs (Sonarr/Radarr/Lidarr all throw on id 0 lookups).
@@ -1982,17 +1994,19 @@ function compactLidarrCandidate(c: LidarrManualImportCandidate) {
 /**
  * Prominent directive returned FIRST in Sonarr discovery/preview responses.
  * Agents have repeatedly treated Sonarr's suggested mapping and rejection
- * reasons as fact, recommended allowRejected=true, and imported files into
- * the wrong episodes — a complete-looking mapping (mappingValid: true) is
- * still only a parse guess. This must be verified, not trusted.
+ * reasons as fact, recommended allowRejected=true, and imported files into the
+ * wrong episodes — a complete-looking mapping (mappingValid: true) is only a
+ * parse proposal. The principle that must survive is that the mapping is a
+ * proposal, not ground truth. The evidence rules stay deliberately balanced:
+ * titles and numbering are BOTH evidence and conflicts are ambiguous, so no
+ * single incident's heuristic is encoded as universal production behavior.
+ * Kept short — this text is returned on every discovery/preview call.
  */
 const SONARR_VERIFY_DIRECTIVE = [
-  "Sonarr's suggested mapping and rejection reasons are PARSE GUESSES derived from the release name — NOT verified facts. A complete-looking mapping (mappingValid: true) can still point at the wrong episodes, and a rejection is Sonarr's opinion, not ground truth.",
-  "Before recommending execute — especially before setting allowRejected=true — independently VERIFY the mapping against the series' episode list (sonarr_get_episodes). Do not treat the suggested mapping as fact.",
-  "The TITLE is the verification key, not the numbers. When episode/season numbers in the release name differ from Sonarr's detected numbers, that is usually just a mapping-source difference (TheTVDB/TMDB/absolute-numbering conventions) — a number mismatch alone is NOT evidence of a wrong mapping. The mapping is considered wrong when the release name contains an episode TITLE that does not match the detected episodes' titles. On a title match (by MEANING, not exact string — fan-sub/region translations, especially anime, differ from official titles), trust the mapping. On a title mismatch, search seasons in this order: 1) the season of the episode Sonarr guessed (may differ from the release title's season due to Sonarr's mapping); 2) the season specified in the release title, if different; 3) Specials (seasonNumber=0); 4) other seasons, closest to the specified season working outwards. If the name has only numbers, there is nothing to match — trust the mapping.",
-  "Rejection-specific rule: 'Single episode file contains all episodes in seasons' is almost NEVER a correctly mapped release. It usually means the file is named incorrectly, or the release is intended as a SPECIAL (and the release name will usually include the special's name). Treat Sonarr's multi-episode mapping in this case as suspect by default: run the title check above, and expect the answer to be a special (seasonNumber=0) or a corrected single-episode mapping — not the season-spanning episode list Sonarr proposes.",
-  "An existing file on the target episode is NOT by itself a reason to skip the import — COMPARE QUALITY. The preview's `upgradeAssessment` does this: Sonarr's own reprocess evaluates the existing file and raises 'Not an upgrade for existing episode file(s)' (quality profile), 'Not a Custom Format upgrade for existing episode file(s)' (CF score), or 'Episode already imported' when the new file is not better — including after a remap — so verdict 'not-an-upgrade' → DO NOT import. Verdict 'no-existing-file' → fills a gap. Verdict 'no-upgrade-rejection' means Sonarr evaluated the mapping and raised no upgrade rejection — the file is equal to or better than the existing one (equal quality + equal CF surfaces NO warning and is a neutral, allowed replacement); the existing file(s) are listed with quality name and CF score — compare them against the candidate's newQualityWeight/newCustomFormatScore to judge upgrade vs neutral. After remapping a mis-parsed release, the preview re-evaluates against the NEW target's existing file, so check the assessment POST-remap.",
-  "Worked example of a complete-looking mapping that was WRONG: 'Letterkenny S04 The Haunting of MoDean's II' — Sonarr mapped the file to S04E01–06 (six real season-4 episodes with unrelated titles) and the preview reported mappingValid: true. The signal was NOT the S04 number: it was that the name's title 'The Haunting of MoDean's II' matches none of the detected episode titles — it is the season-0 special of that title (episode 62640). Remap with seasonNumber=0 + episodeIds=[62640]; the special already has a file, so the import decision is the preview's `upgradeAssessment` verdict for that episode (equal quality + equal CF → no warning, neutral replacement; strictly worse → 'not an upgrade' rejection → skip).",
+  "Sonarr's mapping and rejection reasons are a parse PROPOSAL derived from the release name — not verified facts. mappingValid: true means the proposal is complete, not that it is correct; a rejection is Sonarr's opinion, not ground truth.",
+  "Before execute — especially before allowRejected=true — verify the proposal against the library: series identity, season/episode identity (sonarr_get_episodes), the release title and numbering where the name supplies them, and existing-file state.",
+  "Titles and numbering are both evidence, and neither is conclusive alone. A number mismatch does not by itself prove the mapping wrong (TheTVDB/TMDB/absolute-numbering conventions differ); a title that matches none of the detected episodes does not by itself prove it right (translations and fan-sub titles differ from official ones). When the evidence conflicts, treat the mapping as AMBIGUOUS and investigate — including seasonNumber=0 for specials — rather than automatically trusting Sonarr's proposal or overriding it.",
+  "An existing file on the target episode is not by itself a reason to skip: read the preview's upgradeAssessment. 'not-an-upgrade' → do not import; 'no-existing-file' → fills a gap; 'no-upgrade-rejection' → equal to or better than the existing file (compare quality name and customFormatScore against newQualityWeight/newCustomFormatScore). Re-check it after any remap — the preview evaluates against the NEW target's file.",
 ];
 
 const RADARR_VERIFY_DIRECTIVE = [
@@ -2024,6 +2038,57 @@ function jsonTextError(data: unknown) {
 
 // --- Sonarr -----------------------------------------------------------------
 
+/**
+ * The Sonarr mapping is a hierarchy: series → season → episodes.
+ *
+ * Native Interactive Import clears the dependents when a parent is reselected
+ * (frontend/src/InteractiveImport/Interactive/InteractiveImportRow.tsx):
+ *
+ *   onSeriesSelect → updateInteractiveImportItem(id, { series, seasonNumber: undefined, episodes: [] })
+ *   onSeasonSelect → updateInteractiveImportItem(id, { seasonNumber, episodes: [] })
+ *
+ * The MCP layer must do the same, because Sonarr's reprocess endpoint does NOT
+ * validate the pairing: `ManualImportService.ReprocessItem` resolves
+ * `episodeIds` globally (`_episodeService.GetEpisodes(episodeIds)`) and assigns
+ * them to whatever `seriesId` was supplied, so a stale child mapping inherited
+ * across a parent change is accepted and imported rather than rejected.
+ */
+interface SonarrEffectiveMapping {
+  seriesId: number;
+  seasonNumber: number | null;
+  episodeIds: number[];
+  seriesChanged: boolean;
+  seasonChanged: boolean;
+}
+
+function sonarrOriginalSeriesId(candidate: SonarrManualImportCandidate): number {
+  return candidate.series?.id ?? candidate.seriesId ?? 0;
+}
+
+function sonarrEffectiveMapping(
+  candidate: SonarrManualImportCandidate,
+  override: ManualImportOverrideItem,
+): SonarrEffectiveMapping {
+  const originalSeriesId = sonarrOriginalSeriesId(candidate);
+  const originalSeasonNumber = candidate.seasonNumber ?? null;
+  const originalEpisodeIds = (candidate.episodes ?? []).map((e) => e.id);
+
+  const seriesChanged = override.seriesId !== undefined && override.seriesId !== originalSeriesId;
+  const seasonChanged = override.seasonNumber !== undefined && override.seasonNumber !== originalSeasonNumber;
+
+  return {
+    seriesId: override.seriesId ?? originalSeriesId,
+    seasonNumber: override.seasonNumber !== undefined
+      ? override.seasonNumber
+      : seriesChanged ? null : originalSeasonNumber,
+    episodeIds: override.episodeIds !== undefined
+      ? override.episodeIds
+      : seriesChanged || seasonChanged ? [] : originalEpisodeIds,
+    seriesChanged,
+    seasonChanged,
+  };
+}
+
 function buildSonarrReprocessItem(
   candidate: SonarrManualImportCandidate,
   override: ManualImportOverrideItem,
@@ -2032,15 +2097,13 @@ function buildSonarrReprocessItem(
   // Only identity/mapping fields may be overridden; everything Sonarr already
   // determined (quality, languages, indexer flags, release type) is taken from
   // the freshly fetched candidate, mirroring the Interactive Import UI.
+  const mapping = sonarrEffectiveMapping(candidate, override);
   return {
     id: candidate.id,
     path: candidate.path,
-    seriesId: override.seriesId ?? candidate.series?.id ?? 0,
-    seasonNumber: override.seasonNumber ?? candidate.seasonNumber ?? null,
-    episodeIds:
-      override.episodeIds && override.episodeIds.length > 0
-        ? override.episodeIds
-        : (candidate.episodes ?? []).map((e) => e.id),
+    seriesId: mapping.seriesId,
+    seasonNumber: mapping.seasonNumber,
+    episodeIds: mapping.episodeIds,
     quality: candidate.quality ?? null,
     languages: candidate.languages ?? [],
     releaseGroup: override.releaseGroup ?? candidate.releaseGroup ?? null,
@@ -2057,7 +2120,140 @@ function buildSonarrReprocessItem(
  * seriesId (discovered via sonarr_get_series) first.
  */
 function sonarrEffectiveSeriesId(candidate: SonarrManualImportCandidate, override: ManualImportOverrideItem): number {
-  return override.seriesId ?? candidate.series?.id ?? candidate.seriesId ?? 0;
+  return sonarrEffectiveMapping(candidate, override).seriesId;
+}
+
+/**
+ * Episodes for one (series, season) — `GET /api/v3/episode?seriesId=&seasonNumber=`,
+ * the query the native episode picker uses. Cached per preview/execute call:
+ * the episode-id validation and the upgrade assessment ask for the same season.
+ */
+async function getSonarrSeasonEpisodes(
+  client: SonarrClient,
+  seriesId: number,
+  seasonNumber: number,
+  cache: Map<string, SonarrEpisodeWithFile[]>,
+): Promise<SonarrEpisodeWithFile[]> {
+  const key = `${seriesId}:${seasonNumber}`;
+  const cached = cache.get(key);
+  if (cached) return cached;
+  const episodes = await client.getEpisodesWithFiles(seriesId, seasonNumber);
+  cache.set(key, episodes);
+  return episodes;
+}
+
+/**
+ * Episode files for a series, joined onto the season's episodes by
+ * episodeFileId. The episode resource is the only native shape that links
+ * files to episodes — the file list itself has no episode linkage.
+ */
+async function joinSonarrSeasonEpisodeFiles(
+  client: SonarrClient,
+  seriesId: number,
+  seasonNumber: number,
+  episodeCache: Map<string, SonarrEpisodeWithFile[]>,
+  fileCache: Map<number, SonarrEpisodeFile[]>,
+): Promise<Array<SonarrEpisodeWithFile & { _file?: SonarrEpisodeFile }>> {
+  const episodes = await getSonarrSeasonEpisodes(client, seriesId, seasonNumber, episodeCache);
+
+  const cachedFiles = fileCache.get(seriesId);
+  const files = cachedFiles ?? await client.getEpisodeFiles(seriesId);
+  if (!cachedFiles) fileCache.set(seriesId, files);
+
+  const fileById = new Map(files.map((f) => [f.id, f]));
+  return episodes.map((ep) => ({ ...ep, _file: fileById.get(ep.episodeFileId ?? 0) }));
+}
+
+/**
+ * Validate caller-supplied episodeIds against native Sonarr data.
+ *
+ * Sonarr's own reprocess resolves episode ids globally and pairs them with the
+ * supplied seriesId without checking ownership, so an id from another series —
+ * or another season — survives reprocessing and reaches the import command.
+ * The MCP layer is the only place that can catch it, so an explicit selection
+ * is checked against `GET /api/v3/episode?seriesId=&seasonNumber=` (the exact
+ * query the native episode picker uses) before anything is submitted.
+ */
+async function validateSonarrEpisodeIds(
+  client: SonarrClient,
+  mapping: SonarrEffectiveMapping,
+  callerSupplied: boolean,
+  cache: Map<string, SonarrEpisodeWithFile[]>,
+): Promise<Record<string, unknown>> {
+  const { seriesId, seasonNumber, episodeIds } = mapping;
+  const base = {
+    checked: callerSupplied,
+    seasonNumber,
+    episodeIds,
+  };
+
+  if (!callerSupplied) {
+    return { ...base, ok: true, unknownEpisodeIds: [], note: "episodeIds came from Sonarr's own parse for this candidate; not caller-supplied, so not re-validated." };
+  }
+  if (episodeIds.length === 0) {
+    return { ...base, ok: true, unknownEpisodeIds: [], note: "no explicit episodeIds supplied." };
+  }
+  const season = seasonNumber;
+  if (typeof season !== "number" || !Number.isInteger(season)) {
+    return {
+      ...base,
+      ok: false,
+      unknownEpisodeIds: episodeIds,
+      reason: "episodeIds require an explicit seasonNumber: Sonarr selects episodes within a season, and without one the selection cannot be validated.",
+    };
+  }
+
+  const seasonEpisodes = await getSonarrSeasonEpisodes(client, seriesId, season, cache);
+  const knownIds = new Set(seasonEpisodes.map((e) => e.id));
+  const unknownEpisodeIds = episodeIds.filter((id) => !knownIds.has(id));
+
+  return {
+    ...base,
+    ok: unknownEpisodeIds.length === 0,
+    unknownEpisodeIds,
+    seasonEpisodeCount: seasonEpisodes.length,
+    ...(unknownEpisodeIds.length > 0
+      ? {
+          reason:
+            `episodeIds ${unknownEpisodeIds.join(", ")} are not episodes of series ${seriesId} season ${seasonNumber} (GET /api/v3/episode?seriesId=${seriesId}&seasonNumber=${seasonNumber} returned ${seasonEpisodes.length} episodes). They belong to a different series or season — Sonarr's reprocess would accept them and import into the wrong episode.`,
+        }
+      : {}),
+  };
+}
+
+/**
+ * The effective series identity for a response.
+ *
+ * Sonarr's reprocess response carries no `series` object, so an overridden
+ * seriesId paired with the ORIGINAL candidate's title would report a real id
+ * with a stale, unrelated title — and the verify-before-acting guidance tells
+ * agents to check mappings by title. Fetch the real series when the id changed,
+ * and report `title: null` rather than stale metadata if the fetch fails.
+ */
+async function sonarrEffectiveSeries(
+  client: SonarrClient,
+  seriesId: number,
+  candidate: SonarrManualImportCandidate,
+  cache: Map<number, { id: number; title: string | null }>,
+): Promise<{ id: number; title: string | null }> {
+  if (seriesId <= 0) return { id: seriesId, title: null };
+
+  if (seriesId === sonarrOriginalSeriesId(candidate) && candidate.series) {
+    return { id: seriesId, title: candidate.series.title };
+  }
+
+  const cached = cache.get(seriesId);
+  if (cached) return cached;
+
+  let resolved: { id: number; title: string | null };
+  try {
+    const series = await client.getSeriesById(seriesId);
+    resolved = { id: seriesId, title: series?.title ?? null };
+  } catch {
+    resolved = { id: seriesId, title: null };
+  }
+  cache.set(seriesId, resolved);
+  return resolved;
 }
 
 /**
@@ -2080,6 +2276,7 @@ async function assessSonarrUpgrade(
   episodes: SonarrManualImportEpisode[],
   rejections: ManualImportRejection[],
   episodeCache: Map<string, SonarrEpisodeWithFile[]>,
+  fileCache: Map<number, SonarrEpisodeFile[]>,
 ): Promise<Record<string, unknown>> {
   const newQualityWeight = reprocessed.qualityWeight ?? candidate.qualityWeight ?? 0;
   const newCustomFormatScore = reprocessed.customFormatScore ?? candidate.customFormatScore ?? 0;
@@ -2089,20 +2286,7 @@ async function assessSonarrUpgrade(
   const seasonNumber = reprocessed.seasonNumber ?? candidate.seasonNumber;
   const existingFiles: Array<Record<string, unknown>> = [];
   if (typeof seasonNumber === "number") {
-    const key = `${seriesId}:${seasonNumber}`;
-    let eps = episodeCache.get(key);
-    if (!eps) {
-      // Episode → episodeFileId → file list id: the episode resource is the
-      // only native shape that links files to episodes; the file list itself
-      // has no episode linkage.
-      const [episodesWithFiles, files] = await Promise.all([
-        client.getEpisodesWithFiles(seriesId, seasonNumber),
-        client.getEpisodeFiles(seriesId),
-      ]);
-      const fileById = new Map(files.map((f) => [f.id, f]));
-      eps = episodesWithFiles.map((ep) => ({ ...ep, _file: fileById.get(ep.episodeFileId ?? 0) })) as SonarrEpisodeWithFile[];
-      episodeCache.set(key, eps);
-    }
+    const eps = await joinSonarrSeasonEpisodeFiles(client, seriesId, seasonNumber, episodeCache, fileCache);
     for (const e of episodes) {
       const ep = eps.find((x) => x.id === e.id);
       const f = (ep as { _file?: SonarrEpisodeFile } | undefined)?._file;
@@ -2170,6 +2354,8 @@ async function previewSonarrManualImport(client: SonarrClient, args: unknown) {
 
   const previews: Array<Record<string, unknown>> = [];
   const episodeCache = new Map<string, SonarrEpisodeWithFile[]>();
+  const fileCache = new Map<number, SonarrEpisodeFile[]>();
+  const seriesCache = new Map<number, { id: number; title: string | null }>();
   for (const { candidate, override } of previewable) {
     const r = byId.get(candidate.id);
     if (!r) {
@@ -2177,12 +2363,19 @@ async function previewSonarrManualImport(client: SonarrClient, args: unknown) {
         `Sonarr did not return candidate ${candidate.id} after reprocessing; the candidate changed — re-run sonarr_get_manual_import_candidates.`,
       );
     }
-    const seriesId = r.seriesId ?? sonarrEffectiveSeriesId(candidate, override);
+    const mapping = sonarrEffectiveMapping(candidate, override);
+    const seriesId = r.seriesId ?? mapping.seriesId;
     const episodes = r.episodes ?? [];
     const rejections = r.rejections ?? [];
     const mappingValid = seriesId > 0 && episodes.length > 0 && hasManualImportQuality(r.quality);
-    const upgradeAssessment = mappingValid
-      ? await assessSonarrUpgrade(client, candidate, r, seriesId, episodes, rejections, episodeCache)
+    const episodeValidation = await validateSonarrEpisodeIds(
+      client,
+      { ...mapping, seriesId },
+      override.episodeIds !== undefined,
+      episodeCache,
+    );
+    const upgradeAssessment = mappingValid && episodeValidation.ok !== false
+      ? await assessSonarrUpgrade(client, candidate, r, seriesId, episodes, rejections, episodeCache, fileCache)
       : null;
     previews.push({
       candidateId: candidate.id,
@@ -2190,7 +2383,9 @@ async function previewSonarrManualImport(client: SonarrClient, args: unknown) {
       path: candidate.path,
       canPreview: true,
       mappingRequired: false,
-      series: seriesId > 0 ? { id: seriesId, title: candidate.series?.title ?? null } : null,
+      // Effective identity, resolved from the effective id — never the
+      // original candidate's title under an overridden id.
+      series: await sonarrEffectiveSeries(client, seriesId, candidate, seriesCache),
       seasonNumber: r.seasonNumber ?? null,
       episodes: episodes.map((e) => ({
         id: e.id,
@@ -2207,7 +2402,22 @@ async function previewSonarrManualImport(client: SonarrClient, args: unknown) {
       customFormatScore: r.customFormatScore ?? null,
       rejections: rejections.map((rej) => ({ reason: rej.reason, type: rej.type ?? null })),
       mappingValid,
-      canExecuteWithoutOverride: mappingValid && rejections.length === 0,
+      // Sonarr's reprocess returns no episodes when the caller cleared them
+      // (a parent override with no replacement selection): the mapping is
+      // incomplete and execute will refuse until episodes are supplied.
+      episodesRequired: episodes.length === 0,
+      episodeValidation,
+      // Transparency: which inherited children a parent override invalidated.
+      mappingOverridesApplied: {
+        seriesId: override.seriesId ?? null,
+        seasonNumber: override.seasonNumber ?? null,
+        episodeIds: override.episodeIds ?? null,
+        seriesChanged: mapping.seriesChanged,
+        seasonChanged: mapping.seasonChanged,
+        clearedSeasonNumber: mapping.seriesChanged && override.seasonNumber === undefined,
+        clearedEpisodeIds: (mapping.seriesChanged || mapping.seasonChanged) && override.episodeIds === undefined,
+      },
+      canExecuteWithoutOverride: mappingValid && rejections.length === 0 && episodeValidation.ok !== false,
       upgradeAssessment,
     });
   }
@@ -2222,7 +2432,8 @@ async function previewSonarrManualImport(client: SonarrClient, args: unknown) {
     count: previews.length,
     items: previews,
     notes: [
-      "See verifyBeforeActing above: the release name's TITLE is the verification key (number mismatches alone are expected mapping-source differences, not errors).",
+      "Sonarr's mapping is a proposal, not ground truth — see verifyBeforeActing.",
+      "A seriesId override clears the inherited seasonNumber and episodes, and a seasonNumber override clears the inherited episodes (native Interactive Import behavior). Supply the replacement selection explicitly; episodeIds are validated against GET /api/v3/episode?seriesId=&seasonNumber= and must belong to the effective series and season.",
     ],
     guidance: manualImportGuidance("sonarr", downloadId),
   };
@@ -2265,6 +2476,46 @@ async function executeSonarrManualImport(client: SonarrClient, args: unknown) {
     });
   }
 
+  // Validate every caller-supplied episode selection against native episode
+  // data BEFORE anything is submitted. Sonarr's reprocess resolves episode ids
+  // globally (`_episodeService.GetEpisodes(episodeIds)`) and pairs them with
+  // the supplied seriesId without checking ownership, so a cross-series or
+  // cross-season selection would survive reprocessing and reach the import
+  // command — the native app offers no protection against it.
+  const episodeCache = new Map<string, SonarrEpisodeWithFile[]>();
+  const invalidSelections: Array<Record<string, unknown>> = [];
+  for (const { candidate, override } of resolved) {
+    if (override.episodeIds === undefined) continue;
+    const mapping = sonarrEffectiveMapping(candidate, override);
+    const validation = await validateSonarrEpisodeIds(client, mapping, true, episodeCache);
+    if (validation.ok === false) {
+      invalidSelections.push({
+        candidateId: candidate.id,
+        name: candidate.name ?? null,
+        path: candidate.path,
+        effectiveSeriesId: mapping.seriesId,
+        effectiveSeasonNumber: mapping.seasonNumber,
+        episodeIds: mapping.episodeIds,
+        unknownEpisodeIds: validation.unknownEpisodeIds,
+        seriesChanged: mapping.seriesChanged,
+        seasonChanged: mapping.seasonChanged,
+        reason: validation.reason,
+      });
+    }
+  }
+  if (invalidSelections.length > 0) {
+    return jsonTextError({
+      error: "Caller-supplied episodeIds are not episodes of the effective series/season; refusing to submit the manual import.",
+      downloadId,
+      invalidSelections,
+      guidance: [
+        "1. List the target season's real episodes: sonarr_get_episodes(seriesId, seasonNumber) — the ids Sonarr can import into are exactly those.",
+        "2. Re-run sonarr_preview_manual_import with episodeIds drawn from that list. episodeIds must belong to the effective seriesId AND the effective seasonNumber.",
+        "3. A seriesId override clears the inherited season and episodes, and a seasonNumber override clears the inherited episodes: supply the full corrected selection (seriesId + seasonNumber + episodeIds), not just the parent.",
+      ],
+    });
+  }
+
   const payload = resolved.map(({ candidate, override }) => buildSonarrReprocessItem(candidate, override, downloadId));
   const reprocessed = await client.reprocessManualImport(payload);
   const byId = new Map(reprocessed.map((r) => [r.id, r]));
@@ -2282,7 +2533,8 @@ async function executeSonarrManualImport(client: SonarrClient, args: unknown) {
       );
     }
 
-    const seriesId = r.seriesId ?? sonarrEffectiveSeriesId(candidate, override);
+    const mapping = sonarrEffectiveMapping(candidate, override);
+    const seriesId = r.seriesId ?? mapping.seriesId;
     const episodes = r.episodes ?? [];
     const rejections = r.rejections ?? [];
 
@@ -2292,8 +2544,10 @@ async function executeSonarrManualImport(client: SonarrClient, args: unknown) {
       );
     }
     if (episodes.length === 0) {
+      // Expected when a parent override cleared the inherited selection and no
+      // replacement was supplied: Sonarr rejects with "Episodes not selected".
       throw new Error(
-        `Candidate ${candidate.id} has no episode mapping after reprocessing. Run sonarr_preview_manual_import with explicit episodeIds (find them via sonarr_get_episodes) before executing.`,
+        `Candidate ${candidate.id} has no episode mapping after reprocessing${mapping.seasonChanged || mapping.seriesChanged ? " (the series/season override cleared the inherited episodes, and Sonarr's reprocess returned no replacement selection)" : ""}. Run sonarr_get_episodes(seriesId, seasonNumber) to list the real episodes, then sonarr_preview_manual_import with explicit episodeIds for that series and season before executing.`,
       );
     }
     if (!hasManualImportQuality(r.quality)) {
@@ -3346,7 +3600,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           notes: [
             "candidateId is the native manual-import resource id; pass it to sonarr_preview_manual_import / sonarr_execute_manual_import.",
             "Paths are shown for diagnosis only — the import tools resolve paths from native candidates and never accept caller-supplied paths.",
-            "See verifyBeforeActing above: the release name's TITLE is the verification key (number mismatches alone are expected mapping-source differences, not errors).",
+            "See verifyBeforeActing above: the mapping is a proposal, not ground truth — verify it against sonarr_get_episodes.",
             "If a candidate has rejections, decide via preview whether overriding them (allowRejected=true on that item in execute) is appropriate.",
           ],
         });
