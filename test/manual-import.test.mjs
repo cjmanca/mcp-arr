@@ -95,6 +95,12 @@ const SONARR_SERIES = {
   90: { id: 90, title: "Letterkenny", seriesType: "standard" },
 };
 
+// GET /api/v3/movie/{id} — the source of an overridden movie's REAL title.
+const RADARR_MOVIES = {
+  11: { id: 11, title: "Some Movie", year: 2026 },
+  12: { id: 12, title: "Second Movie", year: 2027 },
+};
+
 const RADARR_CANDIDATE = {
   id: 222,
   path: "/downloads/complete/Some.Movie/Some.Movie.2026.1080p.mkv",
@@ -133,6 +139,21 @@ const LIDARR_CANDIDATE = {
   additionalFile: false,
   replaceExistingFiles: false,
   disableReleaseSwitching: false,
+};
+
+// Native library data the MCP layer validates explicit overrides against:
+//   GET /api/v1/album/{id}   → the album's REAL artistId (album→artist check)
+//   GET /api/v1/release?albumId= → the album's releases (release→album check)
+// Album 9 (artist 5): releases 77 (tracks 501,502) and 78 (track 503).
+// Album 10 (artist 5): release 79 (track 601). Album 11 (artist 6): release 80.
+const LIDARR_ARTISTS = {
+  5: { id: 5, artistName: "Some Artist" },
+  6: { id: 6, artistName: "Other Artist" },
+};
+const LIDARR_ALBUMS = {
+  9: { id: 9, title: "Some Album", artistId: 5, releases: [{ id: 77, albumId: 9 }, { id: 78, albumId: 9 }] },
+  10: { id: 10, title: "Other Album", artistId: 5, releases: [{ id: 79, albumId: 10 }] },
+  11: { id: 11, title: "Foreign Album", artistId: 6, releases: [{ id: 80, albumId: 11 }] },
 };
 
 // --- stub *arr apps -------------------------------------------------------
@@ -247,7 +268,14 @@ function sonarrReprocess(items, opts) {
 function radarrReprocess(items, opts) {
   return items.map((item) => ({
     ...item,
-    movie: item.movieId > 0 ? { id: item.movieId, title: `Movie ${item.movieId}`, year: 2026 } : null,
+    // Real Radarr resolves item.Movie from the supplied MovieId
+    // (ReprocessItems: processedItem.Movie.ToResource(0)). The
+    // radarrReprocessNoMovie option models a response WITHOUT the movie
+    // object — the defensive case where the MCP layer must resolve the
+    // effective movie itself, never reuse the candidate's title.
+    movie: item.movieId > 0 && !opts.radarrReprocessNoMovie
+      ? { id: item.movieId, title: `Movie ${item.movieId}`, year: 2026 }
+      : null,
     rejections: opts.reprocessRejections ?? [],
     customFormats: [],
     customFormatScore: 0,
@@ -261,7 +289,7 @@ function radarrReprocess(items, opts) {
 // → GetTracksByRelease), mirroring the native Interactive Import selector.
 // Album 9 has release 77 (tracks 501, 502) and release 78 (track 503).
 function lidarrReleaseTracks(opts) {
-  return opts.lidarrReleaseTracks ?? { 77: [501, 502], 78: [503] };
+  return opts.lidarrReleaseTracks ?? { 77: [501, 502], 78: [503], 79: [601], 80: [701] };
 }
 
 function lidarrTrackResourcesForRelease(releaseId, opts) {
@@ -282,35 +310,47 @@ function lidarrUpdate(items, opts) {
   // opts.lidarrRecomputedTracks can inject a recomputed set that differs from
   // the release's track query (the native mapping/release-list inconsistency
   // the MCP layer must surface, not authorize).
+  const artists = opts.lidarrArtists ?? LIDARR_ARTISTS;
+  const albums = opts.lidarrAlbums ?? LIDARR_ALBUMS;
   const recomputedFor = (releaseId) =>
     (opts.lidarrRecomputedTracks ?? lidarrReleaseTracks(opts))[releaseId] ?? lidarrReleaseTracks(opts)[releaseId] ?? [];
-  return items.map((item) => ({
-    id: item.id,
-    path: item.path,
-    name: item.name,
-    size: 700,
-    artist: item.artistId ? { id: item.artistId, artistName: `Artist ${item.artistId}` } : null,
-    album: item.albumId ? { id: item.albumId, title: `Album ${item.albumId}` } : null,
-    albumReleaseId: item.albumReleaseId ?? 0,
-    tracks: recomputedFor(item.albumReleaseId ?? 0).map((id) => ({
-      id,
-      artistId: 5,
-      albumId: item.albumId ?? 0,
-      title: `Track ${id}`,
-      trackNumber: 1,
-      position: 1,
-      mediumNumber: 1,
-    })),
-    quality: item.quality,
-    releaseGroup: item.releaseGroup,
-    qualityWeight: 60,
-    downloadId: item.downloadId,
-    indexerFlags: item.indexerFlags,
-    rejections: opts.reprocessRejections ?? [],
-    additionalFile: item.additionalFile ?? false,
-    replaceExistingFiles: item.replaceExistingFiles ?? false,
-    disableReleaseSwitching: item.disableReleaseSwitching ?? false,
-  }));
+  return items.map((item) => {
+    // Native precedence (CandidateService.GetDbCandidatesFromTags): a forced
+    // release wins; with only an album forced, the backend picks a release of
+    // that album; with neither, it re-identifies from the files (the stub
+    // models "no identification" as null).
+    const album = item.albumId ? albums[item.albumId] ?? null : null;
+    let releaseId = item.albumReleaseId ?? 0;
+    if (!releaseId && album) releaseId = album.releases?.[0]?.id ?? 0;
+    const artist = item.artistId ? artists[item.artistId] ?? { id: item.artistId, artistName: `Artist ${item.artistId}` } : null;
+    return {
+      id: item.id,
+      path: item.path,
+      name: item.name,
+      size: 700,
+      artist: artist ? { id: artist.id, artistName: artist.artistName } : null,
+      album: album ? { id: album.id, title: album.title } : null,
+      albumReleaseId: releaseId,
+      tracks: recomputedFor(releaseId).map((id) => ({
+        id,
+        artistId: album?.artistId ?? 5,
+        albumId: album?.id ?? 0,
+        title: `Track ${id}`,
+        trackNumber: 1,
+        position: 1,
+        mediumNumber: 1,
+      })),
+      quality: item.quality,
+      releaseGroup: item.releaseGroup,
+      qualityWeight: 60,
+      downloadId: item.downloadId,
+      indexerFlags: item.indexerFlags,
+      rejections: opts.reprocessRejections ?? [],
+      additionalFile: item.additionalFile ?? false,
+      replaceExistingFiles: item.replaceExistingFiles ?? false,
+      disableReleaseSwitching: item.disableReleaseSwitching ?? false,
+    };
+  });
 }
 
 function buildRoutes(opts) {
@@ -350,6 +390,18 @@ function buildRoutes(opts) {
     "POST /api/v3/command": () => ({ json: { id: opts.radarrCommandId ?? 777, name: "ManualImport", status: "queued" } }),
     "GET /api/v3/queue": () => ({ json: { records: [], totalRecords: 0 } }),
   };
+  // GET /api/v3/movie/{id} — the real title of an overridden movie.
+  const radarrDynamic = [
+    {
+      method: "GET",
+      pattern: /^\/api\/v3\/movie\/\d+$/,
+      handler: (e) => {
+        const id = Number(e.path.split("/").pop());
+        const movie = (opts.radarrMovies ?? RADARR_MOVIES)[id];
+        return movie ? { json: movie } : { status: 404, json: { message: `movie ${id} not found` } };
+      },
+    },
+  ];
   const lidarr = {
     "GET /api/v1/manualimport": (e) => ({
       json: e.params.downloadId === LIDARR_DOWNLOAD_ID ? (opts.lidarrCandidates ?? [LIDARR_CANDIDATE]) : [],
@@ -359,7 +411,23 @@ function buildRoutes(opts) {
     "GET /api/v1/track": (e) => ({ json: lidarrTrackResourcesForRelease(Number(e.params.albumReleaseId), opts) }),
     "GET /api/v1/queue": () => ({ json: { records: [], totalRecords: 0 } }),
   };
-  return { sonarr, radarr, lidarr, sonarrDynamic };
+  // GET /api/v1/album/{id} — the native source for BOTH relationship checks:
+  // the album's REAL artistId (album→artist) and its embedded releases
+  // (release→album). GET /api/v1/release?albumId= is the indexer release-SEARCH
+  // endpoint (guid/quality/age), NOT the album's own releases — the MCP must
+  // not use it for validation.
+  const lidarrDynamic = [
+    {
+      method: "GET",
+      pattern: /^\/api\/v1\/album\/\d+$/,
+      handler: (e) => {
+        const id = Number(e.path.split("/").pop());
+        const album = (opts.lidarrAlbums ?? LIDARR_ALBUMS)[id];
+        return album ? { json: album } : { status: 404, json: { message: `album ${id} not found` } };
+      },
+    },
+  ];
+  return { sonarr, radarr, radarrDynamic, lidarr, sonarrDynamic, lidarrDynamic };
 }
 
 // --- MCP harness ----------------------------------------------------------
@@ -426,8 +494,8 @@ async function withServers(opts, fn) {
   const port = String(34000 + Math.floor(Math.random() * 1000));
   const routes = buildRoutes(opts);
   const sonarrStub = await startStub(routes.sonarr, routes.sonarrDynamic);
-  const radarrStub = await startStub(routes.radarr);
-  const lidarrStub = await startStub(routes.lidarr);
+  const radarrStub = await startStub(routes.radarr, routes.radarrDynamic);
+  const lidarrStub = await startStub(routes.lidarr, routes.lidarrDynamic);
 
   const child = spawn(process.execPath, ["dist/index.js"], {
     cwd: new URL("..", import.meta.url),
@@ -871,6 +939,44 @@ test("radarr execute refuses an unmapped candidate before command submission", a
   });
 });
 
+test("radarr preview reports the EFFECTIVE movie, never the candidate's stale title under an overridden id", async () => {
+  // The reprocess response carries no movie object (the defensive shape);
+  // the MCP layer must resolve the effective movie from GET /api/v3/movie/{id}.
+  await withServers({ radarrReprocessNoMovie: true }, async (port, logs) => {
+    const preview = await callTool(port, "radarr_preview_manual_import", {
+      downloadId: "dl-11",
+      items: [{ candidateId: 222, movieId: 12 }],
+    });
+    assert.equal(preview.isError, false, preview.text);
+    const item = preview.payload.items[0];
+    assert.deepEqual(item.movie, { id: 12, title: "Second Movie", year: 2027 });
+    assert.notEqual(item.movie.title, "Some Movie", "the stale Movie 11 title must never pair with Movie 12's id");
+    assert.equal(requestsTo(logs.radarr, "GET", "/api/v3/movie/12").length, 1, "the effective movie is fetched from the native endpoint");
+
+    // An unmodified candidate keeps its embedded movie — no extra lookup.
+    const plain = await callTool(port, "radarr_preview_manual_import", {
+      downloadId: "dl-11",
+      items: [{ candidateId: 222 }],
+    });
+    assert.deepEqual(plain.payload.items[0].movie, { id: 11, title: "Some Movie", year: 2026 });
+    assert.equal(requestsTo(logs.radarr, "GET", "/api/v3/movie/11").length, 0, "no lookup when the id is unchanged");
+  });
+});
+
+test("radarr preview returns null metadata rather than a stale title when the effective movie lookup fails", async () => {
+  await withServers({ radarrReprocessNoMovie: true, radarrMovies: {} }, async (port) => {
+    const preview = await callTool(port, "radarr_preview_manual_import", {
+      downloadId: "dl-11",
+      items: [{ candidateId: 222, movieId: 12 }],
+    });
+    assert.equal(preview.isError, false, "a failed title lookup must not abort the preview");
+    const item = preview.payload.items[0];
+    assert.equal(item.movie.id, 12, "the effective id is still reported");
+    assert.equal(item.movie.title, null, "no stale title is substituted for a failed lookup");
+    assert.equal(item.movie.year, null);
+  });
+});
+
 // --- 7/14. Lidarr ----------------------------------------------------------
 
 test("lidarr_preview_manual_import: update payload follows native UpdateItems semantics; tracks come from the server", async () => {
@@ -891,7 +997,7 @@ test("lidarr_preview_manual_import: update payload follows native UpdateItems se
     assert.equal(sent.albumReleaseId, 77, "release override merged");
     assert.equal(sent.trackIds, undefined, "native ManualImportUpdateResource has no trackIds field — caller tracks are never sent to the update endpoint");
     assert.equal(sent.replaceExistingFiles, false, "defaults to the safer non-destructive mode");
-    assert.equal(sent.disableReleaseSwitching, false);
+    assert.equal(sent.disableReleaseSwitching, true, "an explicit albumReleaseId defaults disableReleaseSwitching to true (native UI: selecting a release sets it; persists as album.AnyReleaseOk=false)");
     assert.equal(sent.downloadId, LIDARR_DOWNLOAD_ID);
 
     assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0, "preview never imports");
@@ -917,10 +1023,11 @@ test("lidarr_execute_manual_import: command consumes reprocessed tracks with imp
     const methods = logs.lidarr.map((r) => `${r.method} ${r.path}`);
     assert.deepEqual(methods, [
       "GET /api/v1/manualimport",
+      "GET /api/v1/album/9",
       "POST /api/v1/manualimport",
       "GET /api/v1/track",
       "POST /api/v1/command",
-    ]);
+    ], "relationship validation (album→artist + release→album from the album's embedded releases) runs before the reprocess");
 
     const command = requestsTo(logs.lidarr, "POST", "/api/v1/command")[0].body;
     assert.equal(command.name, "ManualImport");
@@ -934,7 +1041,7 @@ test("lidarr_execute_manual_import: command consumes reprocessed tracks with imp
     assert.deepEqual(file.trackIds, [501], "trackIds taken from the reprocessed response");
     assert.deepEqual(file.quality, QUALITY);
     assert.equal(file.downloadId, LIDARR_DOWNLOAD_ID);
-    assert.equal(file.disableReleaseSwitching, false);
+    assert.equal(file.disableReleaseSwitching, true, "explicit release selection carries the native disableReleaseSwitching=true default into the command");
 
     assert.equal(result.payload.commandId, 654);
     assert.equal(result.payload.status, "queued");
@@ -1787,6 +1894,239 @@ test("worked example: a complete season-4 proposal, remapped to the season-0 spe
     assert.equal(target.mappingValid, true);
     assert.equal(target.upgradeAssessment.verdict, "no-upgrade-rejection", "the special already has a file; equal quality + equal CF is a neutral replacement");
     assert.equal(target.upgradeAssessment.existingFiles[0].episodeId, 9300);
+  });
+});
+
+// --- 22. Lidarr mapping hierarchy: artist → album → release → tracks -------
+//
+// Native Interactive Import clears dependents when a parent is reselected
+// (SelectArtistModalContentConnector → { album: undefined, albumReleaseId:
+// undefined, tracks: [] }; SelectAlbumModalContentConnector → { albumReleaseId:
+// undefined, tracks: [] }; SelectAlbumReleaseModalContentConnector → { tracks:
+// [], disableReleaseSwitching: true }). It must, because the native reprocess
+// maps supplied ids straight into IdentificationOverrides with precedence
+// AlbumRelease > Album > Artist and no ownership check
+// (ManualImportController.UpdateImportItems +
+// CandidateService.GetDbCandidatesFromTags), so a stale child inherited across
+// a parent change is imported, not rejected.
+
+test("artist override clears the inherited album, release and tracks", async () => {
+  await withServers({}, async (port, logs) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333, artistId: 6 }],
+    });
+    assert.equal(preview.isError, false, preview.text);
+    const item = preview.payload.items[0];
+
+    assert.equal(item.artist.id, 6, "the effective artist");
+    assert.equal(item.artist.artistName, "Other Artist", "the new artist's real name, not the candidate's");
+    assert.equal(item.album, null, "Artist A's Album 9 must not be carried into Artist B");
+    assert.equal(item.albumReleaseId, 0, "the inherited release is cleared");
+    assert.deepEqual(item.tracks, [], "the inherited track 501 is cleared");
+    assert.equal(item.mappingOverridesApplied.artistChanged, true);
+    assert.equal(item.mappingOverridesApplied.clearedAlbum, true);
+    assert.equal(item.mappingOverridesApplied.clearedAlbumRelease, true);
+    assert.equal(item.mappingValid, false);
+
+    const reprocess = requestsTo(logs.lidarr, "POST", "/api/v1/manualimport")[0];
+    assert.equal(reprocess.body[0].artistId, 6);
+    assert.equal(reprocess.body[0].albumId, null, "the inherited album is cleared, not reused");
+    assert.equal(reprocess.body[0].albumReleaseId, null, "the inherited release is cleared, not reused");
+
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333, artistId: 6 }],
+    });
+    assert.equal(exec.isError, true, "an incomplete mapping must not be importable");
+    assert.match(exec.text, /no valid album mapping after reprocessing/);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0, "no command for an incomplete mapping");
+  });
+});
+
+test("album override clears the inherited release and tracks; Lidarr recomputes them for the new album", async () => {
+  await withServers({}, async (port, logs) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333, albumId: 10 }],
+    });
+    assert.equal(preview.isError, false, preview.text);
+    const item = preview.payload.items[0];
+
+    assert.equal(item.album.id, 10);
+    assert.equal(item.album.title, "Other Album", "the effective album's real title");
+    assert.equal(item.albumReleaseId, 79, "release 77 is cleared; Lidarr picks a release of album 10");
+    assert.deepEqual(item.tracks.map((t) => t.id), [601], "release 77's track 501 is not inherited");
+    assert.equal(item.tracksSource, "lidarr-recomputed");
+    assert.equal(item.mappingOverridesApplied.albumChanged, true);
+    assert.equal(item.mappingOverridesApplied.clearedAlbumRelease, true);
+    assert.equal(item.mappingOverridesApplied.clearedAlbum, false, "the album was supplied explicitly, so it is kept");
+    assert.equal(item.mappingValid, true);
+
+    const reprocess = requestsTo(logs.lidarr, "POST", "/api/v1/manualimport")[0];
+    assert.equal(reprocess.body[0].albumId, 10);
+    assert.equal(reprocess.body[0].albumReleaseId, null, "the inherited release is cleared, not reused");
+
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333, albumId: 10 }],
+    });
+    assert.equal(exec.isError, false, exec.text);
+    const command = requestsTo(logs.lidarr, "POST", "/api/v1/command")[0].body;
+    assert.equal(command.files[0].albumId, 10);
+    assert.equal(command.files[0].albumReleaseId, 79, "the recomputed release imports, not the stale 77");
+    assert.deepEqual(command.files[0].trackIds, [601], "the recomputed tracks import, not the stale 501");
+  });
+});
+
+test("release override clears the inherited tracks; no explicit trackIds uses Lidarr's recomputed mapping", async () => {
+  await withServers({}, async (port, logs) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333, albumReleaseId: 78 }],
+    });
+    assert.equal(preview.isError, false, preview.text);
+    const item = preview.payload.items[0];
+
+    assert.equal(item.albumReleaseId, 78);
+    assert.deepEqual(item.tracks.map((t) => t.id), [503], "release 77's tracks are not inherited into release 78");
+    assert.equal(item.tracksSource, "lidarr-recomputed");
+    assert.equal(item.mappingOverridesApplied.releaseChanged, true);
+    assert.equal(item.mappingOverridesApplied.disableReleaseSwitching, true, "native UI: an explicit release selection sets disableReleaseSwitching=true");
+    assert.equal(item.mappingValid, true);
+
+    const reprocess = requestsTo(logs.lidarr, "POST", "/api/v1/manualimport")[0];
+    assert.equal(reprocess.body[0].albumReleaseId, 78);
+    assert.equal(reprocess.body[0].disableReleaseSwitching, true);
+
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333, albumReleaseId: 78 }],
+    });
+    assert.equal(exec.isError, false, exec.text);
+    const command = requestsTo(logs.lidarr, "POST", "/api/v1/command")[0].body;
+    assert.equal(command.files[0].albumReleaseId, 78);
+    assert.deepEqual(command.files[0].trackIds, [503], "the recomputed release-78 tracks import");
+    assert.equal(command.files[0].disableReleaseSwitching, true);
+  });
+});
+
+test("disableReleaseSwitching=false is caller-controlled and overrides the explicit-release default", async () => {
+  await withServers({}, async (port, logs) => {
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333, albumReleaseId: 78, trackIds: [503], disableReleaseSwitching: false }],
+    });
+    assert.equal(exec.isError, false, exec.text);
+    const command = requestsTo(logs.lidarr, "POST", "/api/v1/command")[0].body;
+    assert.equal(command.files[0].disableReleaseSwitching, false, "an explicit false keeps the album's automatic release selection");
+  });
+});
+
+test("relationship validation: artist B + album belonging to artist A is refused before any reprocess", async () => {
+  await withServers({}, async (port, logs) => {
+    // Album 9 belongs to artist 5; the effective artist is 6.
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333, artistId: 6, albumId: 9, albumReleaseId: 77, trackIds: [501] }],
+    });
+    assert.equal(exec.isError, true, exec.text);
+    const refusal = JSON.parse(exec.text);
+    assert.match(JSON.stringify(refusal.invalidMappings[0].relationshipProblems), /belongs to artist 5, not the effective artist 6/);
+    assert.equal(refusal.invalidMappings[0].effectiveArtistId, 6);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/manualimport").length, 0, "refused before reprocess");
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0, "refused before command");
+
+    // Preview surfaces the same finding without failing.
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333, artistId: 6, albumId: 9, albumReleaseId: 77, trackIds: [501] }],
+    });
+    assert.equal(preview.isError, false, "preview stays non-destructive and reports the problem");
+    const item = preview.payload.items[0];
+    assert.equal(item.relationshipValidation.ok, false);
+    assert.equal(item.mappingValid, false);
+    assert.equal(item.canExecuteWithoutOverride, false);
+  });
+});
+
+test("relationship validation: album B + release belonging to album A is refused before any reprocess", async () => {
+  await withServers({}, async (port, logs) => {
+    // Release 77 belongs to album 9; the effective album is 10.
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333, albumId: 10, albumReleaseId: 77, trackIds: [501] }],
+    });
+    assert.equal(exec.isError, true, exec.text);
+    const refusal = JSON.parse(exec.text);
+    assert.match(JSON.stringify(refusal.invalidMappings[0].relationshipProblems), /album release 77 is not a release of album 10/);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/manualimport").length, 0);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0);
+  });
+});
+
+test("child override under a cleared parent is a dependency violation, refused before any reprocess", async () => {
+  await withServers({}, async (port, logs) => {
+    // The artist change clears the album; a release supplied without the new
+    // album has no parent to validate against.
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333, artistId: 6, albumReleaseId: 80 }],
+    });
+    assert.equal(exec.isError, true, exec.text);
+    const refusal = JSON.parse(exec.text);
+    assert.match(JSON.stringify(refusal.invalidMappings[0].dependencyProblems), /albumReleaseId 80 supplied with no effective albumId/);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/manualimport").length, 0, "refused before reprocess");
+
+    // trackIds under a cleared release: same class.
+    const trackExec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333, artistId: 6, trackIds: [501] }],
+    });
+    assert.equal(trackExec.isError, true, trackExec.text);
+    assert.match(JSON.parse(trackExec.text).invalidMappings[0].dependencyProblems.join(" "), /trackIds supplied with no effective albumReleaseId/);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/manualimport").length, 0);
+  });
+});
+
+test("full corrected remap into the new artist's album previews and executes with effective metadata", async () => {
+  await withServers({}, async (port, logs) => {
+    // Artist 6's album 11, release 80, track 701 — the complete selection.
+    const items = [{ candidateId: 333, artistId: 6, albumId: 11, albumReleaseId: 80, trackIds: [701] }];
+
+    const preview = await callTool(port, "lidarr_preview_manual_import", { downloadId: LIDARR_DOWNLOAD_ID, items });
+    assert.equal(preview.isError, false, preview.text);
+    const item = preview.payload.items[0];
+    assert.deepEqual(item.artist, { id: 6, artistName: "Other Artist" }, "the effective artist, never the candidate's stale name");
+    assert.deepEqual(item.album, { id: 11, title: "Foreign Album" }, "the effective album, never Album 9's title");
+    assert.equal(item.albumReleaseId, 80);
+    assert.deepEqual(item.tracks.map((t) => t.id), [701]);
+    assert.equal(item.relationshipValidation.ok, true);
+    assert.equal(item.mappingValid, true);
+
+    const exec = await callTool(port, "lidarr_execute_manual_import", { downloadId: LIDARR_DOWNLOAD_ID, items });
+    assert.equal(exec.isError, false, exec.text);
+    const command = requestsTo(logs.lidarr, "POST", "/api/v1/command")[0].body;
+    assert.equal(command.files[0].artistId, 6);
+    assert.equal(command.files[0].albumId, 11);
+    assert.equal(command.files[0].albumReleaseId, 80);
+    assert.deepEqual(command.files[0].trackIds, [701], "the corrected selection is what imports");
+    assert.equal(command.files[0].path, LIDARR_CANDIDATE.path, "path still comes from the native candidate");
+  });
+});
+
+test("an unchanged candidate keeps its native mapping with no relationship lookups", async () => {
+  await withServers({}, async (port, logs) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333 }],
+    });
+    assert.equal(preview.isError, false, preview.text);
+    const item = preview.payload.items[0];
+    assert.equal(item.relationshipValidation.checked, false, "inherited ids are coherent by construction — nothing to validate");
+    assert.equal(item.mappingOverridesApplied.disableReleaseSwitching, false, "no explicit release selection, so no release-switching change");
+    assert.equal(requestsTo(logs.lidarr, "GET", "/api/v1/release").length, 0, "no validation lookups for an unmodified candidate");
+    assert.equal(logs.lidarr.filter((r) => r.method === "GET" && r.path.startsWith("/api/v1/album/")).length, 0);
   });
 });
 
