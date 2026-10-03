@@ -1166,7 +1166,7 @@ test("preview upgradeAssessment: existing file + no upgrade rejection -> no-upgr
       assert.equal(a.existingFiles.length, 1);
       assert.equal(a.existingFiles[0].customFormatScore, 10);
       assert.equal(a.existingFiles[0].quality, "WEBDL-1080p");
-      assert.match(a.note, /NO upgrade rejection/);
+      assert.match(a.note, /no native upgrade rejection/i);
     },
   );
 });
@@ -1818,7 +1818,7 @@ test("preview upgradeAssessment: no native rejection + mixed existing targets ->
 });
 
 // I. Attribution mismatch with no native rejection stays conservative.
-test("preview upgradeAssessment: attribution mismatch + no native rejection stays conservative", async () => {
+test("preview upgradeAssessment: attribution mismatch + no native rejection -> cf-assessment-ambiguous", async () => {
   await withServers(
     {
       sonarrCandidates: [packCandidate(154, 9115, 15)],
@@ -1838,8 +1838,142 @@ test("preview upgradeAssessment: attribution mismatch + no native rejection stay
       assert.equal(result.isError, false, result.text);
       const a = result.payload.items[0].upgradeAssessment;
       assert.equal(a.customFormatAssessment.scoreAttributionValid, false);
+      assert.equal(a.verdict, "cf-assessment-ambiguous", "unusable provenance is not converted into an acceptance");
+      assert.notEqual(a.verdict, "no-upgrade-rejection", "no native rejection does not prove equal-to-or-better here");
       assert.notEqual(a.verdict, "cf-downgrade-despite-native-acceptance", "an invalid attribution never infers a downgrade");
-      assert.equal(a.verdict, "no-upgrade-rejection", "conservative: Sonarr raised no rejection and attribution is unreliable");
+      assert.doesNotMatch(a.note, /the new file is equal to or better/i, "note must not make the categorical acceptance claim");
+    },
+  );
+});
+
+// --- provenance-relevant-but-unusable -> ambiguous (no false acceptance) ----
+
+// A. Invalid attribution + no native rejection -> ambiguous (not "equal to or better").
+test("preview upgradeAssessment: native/profile attribution mismatch, no rejection -> cf-assessment-ambiguous", async () => {
+  await withServers(
+    {
+      sonarrCandidates: [packCandidate(160, 9116, 16)],
+      sonarrSeries: PACK_SERIES,
+      // Queue native total -1000 does not reconcile with the profile score -500.
+      sonarrQualityProfiles: packProfile([{ format: 10, name: "Bad Group", score: -500 }]),
+      sonarrQueue: packQueue([{ id: 10, name: "Bad Group" }], -1000),
+      sonarrEpisodesWithFiles: packEpisodes([{ id: 9116, episodeNumber: 16, fileId: 16 }]),
+      sonarrEpisodeFilesList: [{ id: 16, quality: QUALITY, customFormatScore: 0 }],
+      reprocessRejections: [],
+    },
+    async (port) => {
+      const result = await callTool(port, "sonarr_preview_manual_import", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        items: [{ candidateId: 160 }],
+      });
+      assert.equal(result.isError, false, result.text);
+      const a = result.payload.items[0].upgradeAssessment;
+      assert.equal(a.customFormatAssessment.scoreAttributionValid, false);
+      assert.equal(a.verdict, "cf-assessment-ambiguous");
+      assert.notEqual(a.verdict, "no-upgrade-rejection", "unusable provenance must not be accepted as equal-to-or-better");
+      assert.doesNotMatch(a.note, /the new file is equal to or better/i, "note must not make the categorical acceptance claim");
+    },
+  );
+});
+
+// B. Quality profile cannot be resolved -> ambiguous.
+test("preview upgradeAssessment: release context present but quality profile unresolvable -> cf-assessment-ambiguous", async () => {
+  await withServers(
+    {
+      sonarrCandidates: [packCandidate(161, 9117, 17)],
+      sonarrSeries: { 47: { id: 47, title: "The Good Fight", qualityProfileId: 99 } },
+      sonarrQualityProfiles: [],
+      sonarrQueue: packQueue([{ id: 10, name: "BluRay" }], 1600),
+      sonarrEpisodesWithFiles: packEpisodes([{ id: 9117, episodeNumber: 17, fileId: 17 }]),
+      sonarrEpisodeFilesList: [{ id: 17, quality: QUALITY, customFormatScore: 0 }],
+      reprocessRejections: [],
+    },
+    async (port) => {
+      const result = await callTool(port, "sonarr_preview_manual_import", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        items: [{ candidateId: 161 }],
+      });
+      assert.equal(result.isError, false, result.text);
+      const a = result.payload.items[0].upgradeAssessment;
+      assert.equal(a.verdict, "cf-assessment-ambiguous", "the release CFs cannot be scored without the profile");
+      assert.notEqual(a.verdict, "no-upgrade-rejection");
+    },
+  );
+});
+
+// C. Effective-series mismatch -> ambiguous, reason reported.
+test("preview upgradeAssessment: remap to a different series with release context -> cf-assessment-ambiguous", async () => {
+  await withServers(
+    {
+      sonarrCandidates: [packCandidate(162, 9100, 1)],
+      sonarrSeries: {
+        47: { id: 47, title: "The Good Fight", qualityProfileId: 14 },
+        88: { id: 88, title: "A Different Series", qualityProfileId: 14 },
+      },
+      sonarrEpisodeCatalog: {
+        "88:1": [{ id: 9100, seriesId: 88, seasonNumber: 1, episodeNumber: 1, title: "Pilot", hasFile: true, episodeFileId: 18 }],
+      },
+      sonarrQualityProfiles: packProfile([{ format: 10, name: "BluRay", score: 1600 }]),
+      sonarrQueue: packQueue([{ id: 10, name: "BluRay" }], 1600),
+      sonarrEpisodesWithFiles: [{ id: 9100, seriesId: 88, seasonNumber: 1, episodeNumber: 1, title: "Pilot", hasFile: true, episodeFileId: 18 }],
+      sonarrEpisodeFilesList: [{ id: 18, quality: QUALITY, customFormatScore: 0 }],
+      reprocessRejections: [],
+    },
+    async (port) => {
+      const result = await callTool(port, "sonarr_preview_manual_import", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        items: [{ candidateId: 162, seriesId: 88, seasonNumber: 1, episodeIds: [9100] }],
+      });
+      assert.equal(result.isError, false, result.text);
+      const a = result.payload.items[0].upgradeAssessment;
+      assert.equal(a.verdict, "cf-assessment-ambiguous", "the tracked release's CFs belong to series 47, not the remapped series 88");
+      assert.equal(a.releaseContext.reason, "effective-series-mismatch");
+      assert.notEqual(a.verdict, "no-upgrade-rejection");
+    },
+  );
+});
+
+// D. Season pack + no queue context + no native rejection -> ambiguous.
+test("preview upgradeAssessment: season pack, no queue context, no rejection -> cf-assessment-ambiguous", async () => {
+  await withServers(
+    {
+      sonarrCandidates: [packCandidate(163, 9119, 19)],
+      sonarrSeries: PACK_SERIES,
+      sonarrQualityProfiles: packProfile([{ format: 10, name: "BluRay", score: 1600 }]),
+      sonarrQueue: { records: [], totalRecords: 0 },
+      sonarrEpisodesWithFiles: packEpisodes([{ id: 9119, episodeNumber: 19, fileId: 19 }]),
+      sonarrEpisodeFilesList: [{ id: 19, quality: QUALITY, customFormatScore: 0 }],
+      reprocessRejections: [],
+    },
+    async (port) => {
+      const result = await callTool(port, "sonarr_preview_manual_import", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        items: [{ candidateId: 163 }],
+      });
+      assert.equal(result.isError, false, result.text);
+      const a = result.payload.items[0].upgradeAssessment;
+      assert.equal(a.verdict, "cf-assessment-ambiguous", "season-pack release metadata is expected but unavailable");
+      assert.notEqual(a.verdict, "no-upgrade-rejection");
+    },
+  );
+});
+
+// E. Ordinary single-file + no queue context + no rejection -> native fallback preserved.
+test("preview upgradeAssessment: ordinary single-file, no queue context, no rejection -> no-upgrade-rejection", async () => {
+  await withServers(
+    {
+      sonarrEpisodesWithFiles: [{ id: 9001, seriesId: 47, seasonNumber: 6, episodeNumber: 3, title: "The End of Football", hasFile: true, episodeFileId: 1 }],
+      sonarrEpisodeFilesList: [{ id: 1, quality: QUALITY, customFormatScore: 10 }],
+    },
+    async (port) => {
+      const result = await callTool(port, "sonarr_preview_manual_import", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        items: [{ candidateId: 123 }],
+      });
+      assert.equal(result.isError, false, result.text);
+      const a = result.payload.items[0].upgradeAssessment;
+      assert.equal(a.releaseContext.available, false);
+      assert.equal(a.verdict, "no-upgrade-rejection", "no evidence of provenance divergence for an ordinary file — preserve native behavior");
     },
   );
 });
