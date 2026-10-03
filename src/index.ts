@@ -344,8 +344,9 @@ if (clients.sonarr) {
             description: "Optional series hint passed to the native endpoint",
           },
           seasonNumber: {
-            type: "number",
-            description: "Optional season hint passed to the native endpoint",
+            type: "integer",
+            minimum: 0,
+            description: "Optional season hint passed to the native endpoint (non-negative integer; 0 is the Specials season)",
           },
           filterExistingFiles: {
             type: "boolean",
@@ -380,8 +381,9 @@ if (clients.sonarr) {
                   description: "Override the series this file should import as",
                 },
                 seasonNumber: {
-                  type: "number",
-                  description: "Override the season number",
+                  type: "integer",
+                  minimum: 0,
+                  description: "Override the season number (non-negative integer; 0 is the Specials season)",
                 },
                 episodeIds: {
                   type: "array",
@@ -425,8 +427,9 @@ if (clients.sonarr) {
                   description: "Override the series this file should import as (positive id; 0 is never sent to Sonarr)",
                 },
                 seasonNumber: {
-                  type: "number",
-                  description: "Override the season number",
+                  type: "integer",
+                  minimum: 0,
+                  description: "Override the season number (non-negative integer; 0 is the Specials season)",
                 },
                 episodeIds: {
                   type: "array",
@@ -1801,7 +1804,27 @@ interface ManualImportToolArgs {
   filterExistingFiles?: boolean;
 }
 
-function parseManualImportArgs(args: unknown): {
+/**
+ * Sonarr season numbers are non-negative integers, and 0 is a real season
+ * (Specials). A negative or fractional value is never a valid season, so it
+ * must be refused at the MCP boundary rather than forwarded to the native
+ * endpoints. Sonarr-specific: only Sonarr carries seasonNumber, so this is
+ * never applied to Radarr or Lidarr arguments.
+ */
+function assertSonarrSeasonNumber(value: unknown, label: string): void {
+  if (value === undefined) return;
+  if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
+    throw new Error(`${label} must be a non-negative integer when supplied (season 0 is the Specials season).`);
+  }
+}
+
+/**
+ * Shared argument parsing for the six preview/execute tools.
+ *
+ * `service` scopes the Sonarr-specific checks: `seasonNumber` is a Sonarr
+ * mapping field, so Radarr/Lidarr requests are never judged by it.
+ */
+function parseManualImportArgs(args: unknown, service: "sonarr" | "radarr" | "lidarr"): {
   downloadId: string;
   items: ManualImportOverrideItem[];
   importMode: ManualImportMode;
@@ -1850,6 +1873,11 @@ function parseManualImportArgs(args: unknown): {
           throw new Error(`item ${key} must be a non-empty array of positive integer ids when supplied.`);
         }
       }
+    }
+    // Sonarr's seasonNumber override: validated here, at the parse boundary,
+    // so -1 / 1.5 / NaN never reach a native request.
+    if (service === "sonarr") {
+      assertSonarrSeasonNumber(item.seasonNumber, "item seasonNumber");
     }
   }
   const importMode = a.importMode ?? "auto";
@@ -2199,7 +2227,7 @@ async function validateSonarrEpisodeIds(
       ...base,
       ok: false,
       unknownEpisodeIds: episodeIds,
-      reason: "episodeIds require an explicit seasonNumber: Sonarr selects episodes within a season, and without one the selection cannot be validated.",
+      reason: "episodeIds require a valid effective seasonNumber; no effective season is available for this mapping — the inherited season was cleared by a series override (or the candidate had none). Supply the corrected seasonNumber together with the episodeIds. An inherited season that a parent change did NOT clear stays valid: episodeIds alone are validated against it, so seasonNumber does not need to be repeated.",
     };
   }
 
@@ -2329,7 +2357,7 @@ function mappingRequiredEntry(candidateId: number, name: string | null, path: st
 }
 
 async function previewSonarrManualImport(client: SonarrClient, args: unknown) {
-  const { downloadId, items } = parseManualImportArgs(args);
+  const { downloadId, items } = parseManualImportArgs(args, "sonarr");
   const a = (args ?? {}) as ManualImportToolArgs;
 
   const candidates = await client.getManualImportCandidates({
@@ -2433,14 +2461,14 @@ async function previewSonarrManualImport(client: SonarrClient, args: unknown) {
     items: previews,
     notes: [
       "Sonarr's mapping is a proposal, not ground truth — see verifyBeforeActing.",
-      "A seriesId override clears the inherited seasonNumber and episodes, and a seasonNumber override clears the inherited episodes (native Interactive Import behavior). Supply the replacement selection explicitly; episodeIds are validated against GET /api/v3/episode?seriesId=&seasonNumber= and must belong to the effective series and season.",
+      "A seriesId override clears the inherited seasonNumber and episodes, and a seasonNumber override clears the inherited episodes (native Interactive Import behavior). episodeIds are validated against GET /api/v3/episode?seriesId=&seasonNumber= and must belong to the EFFECTIVE series and season — an inherited season that no parent change cleared is the effective one, so episodeIds alone are enough; supply seasonNumber only when a parent override cleared it.",
     ],
     guidance: manualImportGuidance("sonarr", downloadId),
   };
 }
 
 async function executeSonarrManualImport(client: SonarrClient, args: unknown) {
-  const { downloadId, items, importMode } = parseManualImportArgs(args);
+  const { downloadId, items, importMode } = parseManualImportArgs(args, "sonarr");
 
   // Always re-discover from the native endpoint — never trust an earlier
   // preview's data, and never accept a caller-supplied path.
@@ -2511,7 +2539,7 @@ async function executeSonarrManualImport(client: SonarrClient, args: unknown) {
       guidance: [
         "1. List the target season's real episodes: sonarr_get_episodes(seriesId, seasonNumber) — the ids Sonarr can import into are exactly those.",
         "2. Re-run sonarr_preview_manual_import with episodeIds drawn from that list. episodeIds must belong to the effective seriesId AND the effective seasonNumber.",
-        "3. A seriesId override clears the inherited season and episodes, and a seasonNumber override clears the inherited episodes: supply the full corrected selection (seriesId + seasonNumber + episodeIds), not just the parent.",
+        "3. A seriesId override clears the inherited season and episodes, and a seasonNumber override clears the inherited episodes: when a parent change clears the season, supply the corrected seasonNumber together with the episodeIds. An inherited season that no parent change cleared stays valid — episodeIds alone are validated against it, so there is no need to repeat seasonNumber.",
       ],
     });
   }
@@ -2657,7 +2685,7 @@ function buildRadarrReprocessItem(
 }
 
 async function previewRadarrManualImport(client: RadarrClient, args: unknown) {
-  const { downloadId, items } = parseManualImportArgs(args);
+  const { downloadId, items } = parseManualImportArgs(args, "radarr");
   const a = (args ?? {}) as ManualImportToolArgs;
 
   const candidates = await client.getManualImportCandidates({
@@ -2723,7 +2751,7 @@ async function previewRadarrManualImport(client: RadarrClient, args: unknown) {
 }
 
 async function executeRadarrManualImport(client: RadarrClient, args: unknown) {
-  const { downloadId, items, importMode } = parseManualImportArgs(args);
+  const { downloadId, items, importMode } = parseManualImportArgs(args, "radarr");
 
   const candidates = await client.getManualImportCandidates({ downloadId });
   if (candidates.length === 0) {
@@ -2943,7 +2971,7 @@ async function resolveLidarrTrackIds(
 }
 
 async function previewLidarrManualImport(client: LidarrClient, args: unknown) {
-  const { downloadId, items, replaceExistingFiles } = parseManualImportArgs(args);
+  const { downloadId, items, replaceExistingFiles } = parseManualImportArgs(args, "lidarr");
   const a = (args ?? {}) as ManualImportToolArgs;
 
   const candidates = await client.getManualImportCandidates({
@@ -3033,7 +3061,7 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown) {
 }
 
 async function executeLidarrManualImport(client: LidarrClient, args: unknown) {
-  const { downloadId, items, importMode, replaceExistingFiles } = parseManualImportArgs(args);
+  const { downloadId, items, importMode, replaceExistingFiles } = parseManualImportArgs(args, "lidarr");
 
   const candidates = await client.getManualImportCandidates({ downloadId, replaceExistingFiles });
   if (candidates.length === 0) {
@@ -3586,6 +3614,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (typeof a.downloadId !== "string" || a.downloadId.trim() === "") {
           throw new Error("downloadId is required (from sonarr_get_queue). Candidates are discovered from the tracked download, never from a caller-supplied path.");
         }
+        assertSonarrSeasonNumber(a.seasonNumber, "seasonNumber");
         const candidates = await clients.sonarr.getManualImportCandidates({
           downloadId: a.downloadId.trim(),
           seriesId: a.seriesId,

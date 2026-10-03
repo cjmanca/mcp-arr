@@ -1438,14 +1438,24 @@ test("cross-season episodeIds are refused before any reprocess or command", asyn
   });
 });
 
-test("episodeIds without an explicit seasonNumber are refused (native requires a season)", async () => {
+test("a series override clears the inherited season, so episodeIds have no effective season to validate against", async () => {
   await withServers({ reprocessRejections: [] }, async (port, logs) => {
+    const preview = await callTool(port, "sonarr_preview_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 123, seriesId: 88, episodeIds: [9100] }],
+    });
+    assert.equal(preview.isError, false, preview.text);
+    const item = preview.payload.items[0];
+    assert.equal(item.mappingOverridesApplied.seriesChanged, true);
+    assert.equal(item.mappingOverridesApplied.clearedSeasonNumber, true, "the inherited season 6 was cleared by the series change");
+    assert.equal(item.episodeValidation.ok, false, "with no effective season the selection cannot be validated");
+
     const exec = await callTool(port, "sonarr_execute_manual_import", {
       downloadId: SONARR_DOWNLOAD_ID,
       items: [{ candidateId: 123, seriesId: 88, episodeIds: [9100] }],
     });
     assert.equal(exec.isError, true, exec.text);
-    assert.match(exec.text, /require an explicit seasonNumber/);
+    assert.match(exec.text, /valid effective seasonNumber/);
     assert.equal(requestsTo(logs.sonarr, "POST", "/api/v3/command").length, 0);
   });
 });
@@ -1544,7 +1554,153 @@ test("duplicate candidateId in one request is refused before any native request"
   });
 });
 
-// --- 19. Worked example: a complete-looking proposal that is wrong ---------
+// --- 19. Sonarr seasonNumber input validation -----------------------------
+
+test("seasonNumber overrides must be non-negative integers, refused before any native request", async () => {
+  await withServers({}, async (port, logs) => {
+    for (const bad of [-1, -0.5, 1.5, 2.7]) {
+      const preview = await callTool(port, "sonarr_preview_manual_import", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        items: [{ candidateId: 123, seasonNumber: bad }],
+      });
+      assert.equal(preview.isError, true, `seasonNumber ${bad} must be refused`);
+      assert.match(preview.text, /seasonNumber must be a non-negative integer/);
+
+      const exec = await callTool(port, "sonarr_execute_manual_import", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        items: [{ candidateId: 123, seasonNumber: bad }],
+      });
+      assert.equal(exec.isError, true, `seasonNumber ${bad} must be refused on execute`);
+      assert.match(exec.text, /seasonNumber must be a non-negative integer/);
+    }
+    assert.equal(logs.sonarr.length, 0, "a refused season number must not produce any native request");
+  });
+});
+
+test("seasonNumber discovery hint is validated before the native discovery request", async () => {
+  await withServers({}, async (port, logs) => {
+    for (const bad of [-1, 1.5]) {
+      const refused = await callTool(port, "sonarr_get_manual_import_candidates", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        seasonNumber: bad,
+      });
+      assert.equal(refused.isError, true, `seasonNumber ${bad} must be refused`);
+      assert.match(refused.text, /seasonNumber must be a non-negative integer/);
+    }
+    assert.equal(requestsTo(logs.sonarr, "GET", "/api/v3/manualimport").length, 0, "no native discovery for a refused hint");
+
+    const accepted = await callTool(port, "sonarr_get_manual_import_candidates", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      seasonNumber: 6,
+    });
+    assert.equal(accepted.isError, false, accepted.text);
+    assert.equal(requestsTo(logs.sonarr, "GET", "/api/v3/manualimport").length, 1);
+  });
+});
+
+test("seasonNumber 0 (Specials) and 6 are accepted", async () => {
+  await withServers({ reprocessRejections: [] }, async (port) => {
+    const specials = await callTool(port, "sonarr_preview_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 123, seasonNumber: 0, episodeIds: [62640] }],
+    });
+    assert.equal(specials.isError, false, "season 0 is the Specials season and must be accepted");
+    assert.equal(specials.payload.items[0].seasonNumber, 0);
+    assert.equal(specials.payload.items[0].episodeValidation.ok, true);
+
+    const season6 = await callTool(port, "sonarr_preview_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 123, seasonNumber: 6, episodeIds: [9002] }],
+    });
+    assert.equal(season6.isError, false, season6.text);
+    assert.equal(season6.payload.items[0].episodeValidation.ok, true);
+  });
+});
+
+test("the Sonarr seasonNumber rule is not applied to Radarr or Lidarr requests", async () => {
+  await withServers({}, async (port, logs) => {
+    // seasonNumber is a Sonarr mapping field; Radarr/Lidarr ignore it, so a
+    // value that Sonarr would refuse must not make their tools fail.
+    const radarr = await callTool(port, "radarr_preview_manual_import", {
+      downloadId: "dl-11",
+      items: [{ candidateId: 222, seasonNumber: -1 }],
+    });
+    assert.equal(radarr.isError, false, radarr.text);
+
+    const lidarr = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333, seasonNumber: 1.5 }],
+    });
+    assert.equal(lidarr.isError, false, lidarr.text);
+  });
+});
+
+// --- 20. episodeIds validate against the EFFECTIVE season -----------------
+//
+// The rule is "a valid EFFECTIVE seasonNumber", not "an explicitly supplied
+// seasonNumber". A season the candidate already carries, and that no parent
+// override cleared, is the effective season: episodeIds alone validate against
+// it and need no redundant seasonNumber.
+
+test("episodeIds alone validate against the inherited effective season", async () => {
+  await withServers({ reprocessRejections: [] }, async (port, logs) => {
+    // Candidate is series 47 season 6; the caller sends only season-6 episodeIds.
+    const items = [{ candidateId: 123, episodeIds: [9002] }];
+
+    const preview = await callTool(port, "sonarr_preview_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items,
+    });
+    assert.equal(preview.isError, false, preview.text);
+    const item = preview.payload.items[0];
+    assert.equal(item.mappingOverridesApplied.seasonNumber, null, "no seasonNumber was supplied");
+    assert.equal(item.mappingOverridesApplied.clearedSeasonNumber, false, "nothing cleared the inherited season");
+    assert.equal(item.seasonNumber, 6, "the inherited season is the effective season");
+    assert.equal(item.episodeValidation.checked, true, "the caller-supplied ids were validated");
+    assert.equal(item.episodeValidation.ok, true, "validated against the inherited season, no refusal");
+    assert.equal(item.mappingValid, true);
+
+    const validationGet = requestsTo(logs.sonarr, "GET", "/api/v3/episode")[0];
+    assert.equal(validationGet.params.seriesId, "47");
+    assert.equal(validationGet.params.seasonNumber, "6", "validated against the inherited season's episode list");
+
+    const exec = await callTool(port, "sonarr_execute_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items,
+    });
+    assert.equal(exec.isError, false, exec.text);
+    const command = requestsTo(logs.sonarr, "POST", "/api/v3/command")[0].body;
+    assert.deepEqual(command.files[0].episodeIds, [9002], "the selection imports without a redundant seasonNumber");
+  });
+});
+
+test("episodeIds are refused only when no valid effective season exists", async () => {
+  await withServers({ reprocessRejections: [] }, async (port, logs) => {
+    // A series override clears the inherited season, so there is no effective
+    // season to validate against — this is the case that requires seasonNumber.
+    const exec = await callTool(port, "sonarr_execute_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 123, seriesId: 88, episodeIds: [9100] }],
+    });
+    assert.equal(exec.isError, true, exec.text);
+    assert.match(exec.text, /valid effective seasonNumber/);
+    assert.match(exec.text, /no effective season is available/);
+    assert.equal(requestsTo(logs.sonarr, "POST", "/api/v3/command").length, 0);
+
+    // Supplying the season the parent change cleared makes the same selection valid.
+    const fixed = await callTool(port, "sonarr_execute_manual_import", {
+      downloadId: SONARR_DOWNLOAD_ID,
+      items: [{ candidateId: 123, seriesId: 88, seasonNumber: 1, episodeIds: [9100] }],
+    });
+    assert.equal(fixed.isError, false, fixed.text);
+    assert.deepEqual(
+      requestsTo(logs.sonarr, "POST", "/api/v3/command")[0].body.files[0].episodeIds,
+      [9100],
+    );
+  });
+});
+
+// --- 21. Worked example: a complete-looking proposal that is wrong ---------
 //
 // The Letterkenny case, kept here as a regression test rather than as runtime
 // guidance injected into every response. Sonarr proposed
