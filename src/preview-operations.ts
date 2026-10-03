@@ -107,6 +107,14 @@ class PreviewOperationManager {
     const deadlineTimer = setTimeout(() => {
       if (op.status !== "running") return;
       op.abortReason = "deadline";
+      // Terminalize immediately: the deadline is authoritative even if a
+      // preview helper swallows the abort as an ordinary lookup failure and
+      // the executor later resolves. completedAt is fixed at the deadline so
+      // polling reports a stable elapsed time, and the active fingerprint is
+      // released so an identical preview can start fresh.
+      this.markTerminal(op, "timed_out", {
+        error: `${KIND_LABEL[kind]} preview exceeded the configured operation timeout.`,
+      });
       op.controller.abort(new Error(`${KIND_LABEL[kind]} exceeded the configured operation timeout.`));
     }, maxRuntime);
 
@@ -125,19 +133,21 @@ class PreviewOperationManager {
         // A hard timeout or cancellation that fired mid-run already moved the
         // status; do not overwrite it with a late success.
         if (op.status === "running") {
-          op.status = "completed";
-          op.result = result;
-          op.completedAt = Date.now();
+          this.markTerminal(op, "completed", { result });
         }
       } catch (error) {
-        if (op.abortReason === "deadline") {
-          op.status = "timed_out";
-          op.error = `${KIND_LABEL[kind]} preview exceeded the configured operation timeout.`;
+        if (op.status !== "running") {
+          // Already terminalized by the deadline/cancel path.
+        } else if (op.abortReason === "deadline") {
+          this.markTerminal(op, "timed_out", {
+            error: `${KIND_LABEL[kind]} preview exceeded the configured operation timeout.`,
+          });
         } else if (op.abortReason === "cancelled") {
-          op.status = "cancelled";
+          this.markTerminal(op, "cancelled");
         } else {
-          op.status = "failed";
-          op.error = error instanceof Error ? error.message : String(error);
+          this.markTerminal(op, "failed", {
+            error: error instanceof Error ? error.message : String(error),
+          });
         }
       } finally {
         clearTimeout(deadlineTimer);
@@ -150,6 +160,28 @@ class PreviewOperationManager {
     })();
 
     return op;
+  }
+
+  /**
+   * Move an operation to a terminal state exactly once: stamp completedAt,
+   * release its active fingerprint (so a timed-out/cancelled preview is not
+   * deduplicated against by a new identical preview), and record the result or
+   * error. The operation itself stays in the map until TTL expiry.
+   */
+  private markTerminal(
+    op: PreviewOperation,
+    status: "completed" | "failed" | "timed_out" | "cancelled",
+    opts: { result?: unknown; error?: string } = {},
+  ): void {
+    const now = Date.now();
+    op.status = status;
+    op.completedAt = now;
+    op.updatedAt = now;
+    if (opts.result !== undefined) op.result = opts.result;
+    if (opts.error !== undefined) op.error = opts.error;
+    if (op.fingerprint && this.activeFingerprints.get(op.fingerprint) === op.id) {
+      this.activeFingerprints.delete(op.fingerprint);
+    }
   }
 
   get(id: string): PreviewOperation | undefined {
@@ -180,9 +212,7 @@ class PreviewOperationManager {
       // Mark cancelled immediately so the caller sees the terminal status; the
       // executor's abort path converges on the same value and a late native
       // success can no longer overwrite it.
-      op.status = "cancelled";
-      op.completedAt = Date.now();
-      op.updatedAt = op.completedAt;
+      this.markTerminal(op, "cancelled");
       op.controller.abort(new Error("cancelled"));
     }
     return op;

@@ -75,6 +75,22 @@ function standaloneContext(): PreviewExecutionContext {
   return { signal: new AbortController().signal, setStage: () => {} };
 }
 
+/**
+ * Best-effort preview helpers swallow native lookup failures (404/500/connection
+ * errors) and return a fallback so a preview can still report a candidate. A
+ * whole-preview deadline or an explicit arr_cancel_operation aborts the
+ * operation's own signal, and that abort must NOT be mistaken for an ordinary
+ * metadata failure — it unwinds the preview so the manager records the terminal
+ * operation state. Keyed strictly on the operation signal, so a request's
+ * private per-request timeout (a distinct controller) still surfaces its own
+ * error normally, and execute's never-aborted signal makes this a no-op.
+ */
+function rethrowIfOperationAborted(signal: AbortSignal): void {
+  if (!signal.aborted) return;
+  if (signal.reason instanceof Error) throw signal.reason;
+  throw new Error("Preview operation aborted.");
+}
+
 // Read from package.json rather than hardcoding, so the version reported to
 // clients can never drift from the released version. package.json sits at the
 // package root in every distribution: npm always ships it, and the Dockerfile
@@ -2360,6 +2376,7 @@ async function sonarrEffectiveSeries(
     const series = await client.getSeriesById(seriesId, ctx.signal);
     resolved = { id: seriesId, title: series?.title ?? null };
   } catch {
+    rethrowIfOperationAborted(ctx.signal);
     resolved = { id: seriesId, title: null };
   }
   cache.set(seriesId, resolved);
@@ -2391,6 +2408,7 @@ async function findSonarrReleaseContext(client: SonarrClient, downloadId: string
     try {
       queue = await client.getQueue(page, pageSize, ctx.signal);
     } catch {
+      rethrowIfOperationAborted(ctx.signal);
       return { available: false, title: null, customFormats: [], nativeScore: null, seriesId: null, reason: "queue-unavailable" };
     }
     const match = (queue.records ?? []).find((q) => q.downloadId === downloadId);
@@ -2442,6 +2460,7 @@ async function resolveSonarrProfileCFScores(
       }
     }
   } catch {
+    rethrowIfOperationAborted(ctx.signal);
     map = null;
   }
   profileCache.set(seriesId, map);
@@ -3152,6 +3171,7 @@ async function radarrEffectiveMovie(
     const movie = await client.getMovieById(movieId, ctx.signal);
     resolved = { id: movieId, title: movie?.title ?? null, year: movie?.year ?? null };
   } catch {
+    rethrowIfOperationAborted(ctx.signal);
     resolved = { id: movieId, title: null, year: null };
   }
   cache.set(movieId, resolved);
@@ -3535,6 +3555,7 @@ async function getLidarrAlbumIdentity(
       ? { id: album.id, artistId: album.artistId, releases: album.releases ?? [] }
       : null;
   } catch {
+    rethrowIfOperationAborted(ctx.signal);
     resolved = null;
   }
   cache.set(albumId, resolved);

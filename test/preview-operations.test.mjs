@@ -178,7 +178,11 @@ function lidarrRoutes(opts = {}) {
       hang: opts.lidarrUpdateHang,
       status: opts.lidarrUpdateStatus,
     }),
-    "GET /api/v1/album/2": () => ({ json: { id: 2, artistId: 1, releases: [{ id: 3, albumId: 2 }] } }),
+    "GET /api/v1/album/2": () => ({
+      json: { id: 2, artistId: 1, releases: [{ id: 3, albumId: 2 }] },
+      delayMs: opts.lidarrAlbumDelay,
+      hang: opts.lidarrAlbumHang,
+    }),
     "GET /api/v1/track": () => ({ json: [{ id: 10, albumReleaseId: 3, title: "Track", trackNumber: 1 }] }),
   };
 }
@@ -187,7 +191,7 @@ function sonarrRoutes(opts = {}) {
   return {
     "GET /api/v3/manualimport": () => ({ json: [SONARR_CANDIDATE] }),
     "POST /api/v3/manualimport": (e) => ({ json: sonarrReprocess(e.body), delayMs: opts.sonarrReprocessDelay }),
-    "GET /api/v3/queue": () => ({ json: { records: [], totalRecords: 0 } }),
+    "GET /api/v3/queue": () => ({ json: { records: [], totalRecords: 0 }, delayMs: opts.sonarrQueueDelay, hang: opts.sonarrQueueHang }),
     "GET /api/v3/episode": () => ({ json: [{ id: 9001, seriesId: 47, seasonNumber: 1, episodeNumber: 1, title: "Pilot", hasFile: false, episodeFileId: null }] }),
     "GET /api/v3/episodefile": () => ({ json: [] }),
     "GET /api/v3/series/47": () => ({ json: { id: 47, title: "Series", qualityProfileId: 1 } }),
@@ -423,11 +427,17 @@ test("a preview exceeding PREVIEW_MAX_RUNTIME_MS is marked timed_out with its st
     async (port) => {
       const { payload } = await callTool(port, "lidarr_preview_manual_import", LIDARR_PREVIEW_ARGS);
       assert.equal(payload.status, "running");
-      await sleep(700);
+      // Poll just after the 400ms deadline, well before the 2000ms native
+      // response: the deadline must terminalize on its own, not wait for the
+      // native request/executor to unwind.
+      await sleep(480);
       const poll = await callTool(port, "arr_get_operation", { operationId: payload.operationId });
-      assert.equal(poll.payload.status, "timed_out");
+      assert.equal(poll.payload.status, "timed_out", "deadline terminalizes without the native request finishing");
       assert.ok(poll.payload.stage, "stage retained on timeout");
       assert.match(poll.payload.error, /exceeded the configured operation timeout/, "error describes the preview timeout");
+      // completedAt is fixed at the deadline, so elapsedMs is stable (~400ms),
+      // not the wall-clock time since start.
+      assert.ok(poll.payload.elapsedMs >= 380 && poll.payload.elapsedMs <= 600, `elapsedMs reflects the deadline, got ${poll.payload.elapsedMs}`);
     },
   );
 });
@@ -437,24 +447,41 @@ test("a preview exceeding PREVIEW_MAX_RUNTIME_MS is marked timed_out with its st
 test("arr_cancel_operation aborts a running preview and the status stays cancelled", async () => {
   await withServers(
     { PREVIEW_SYNC_BUDGET_MS: "200", PREVIEW_MAX_RUNTIME_MS: "20000", OPERATION_RESULT_TTL_MS: "600000" },
-    { lidarrUpdateDelay: 1500 },
-    async (port) => {
+    { lidarrUpdateHang: true },
+    async (port, logs) => {
       const { payload } = await callTool(port, "lidarr_preview_manual_import", LIDARR_PREVIEW_ARGS);
       assert.equal(payload.status, "running");
       const cancelled = await callTool(port, "arr_cancel_operation", { operationId: payload.operationId });
       assert.equal(cancelled.payload.status, "cancelled");
-      await sleep(1600);
+      await sleep(300);
       const poll = await callTool(port, "arr_get_operation", { operationId: payload.operationId });
-      assert.equal(poll.payload.status, "cancelled", "a cancelled operation stays cancelled after the native delay resolves");
+      assert.equal(poll.payload.status, "cancelled", "a cancelled operation stays cancelled");
+      const posts = requestsTo(logs.lidarr, "POST", "/api/v1/manualimport");
+      assert.equal(posts.length, 1, "the in-flight native request was received and the operation settled (no hang)");
     },
   );
 });
 
-test("arr_cancel_operation on a terminal operation does not mutate its status", async () => {
+test("arr_cancel_operation on a completed operation leaves it completed", async () => {
+  await withServers(
+    { PREVIEW_SYNC_BUDGET_MS: "200", PREVIEW_MAX_RUNTIME_MS: "20000", OPERATION_RESULT_TTL_MS: "600000" },
+    { lidarrUpdateDelay: 800 },
+    async (port) => {
+      const { payload } = await callTool(port, "lidarr_preview_manual_import", LIDARR_PREVIEW_ARGS);
+      assert.equal(payload.status, "running");
+      await sleep(1000);
+      const done = await callTool(port, "arr_get_operation", { operationId: payload.operationId });
+      assert.equal(done.payload.status, "completed");
+      const cancelled = await callTool(port, "arr_cancel_operation", { operationId: payload.operationId });
+      assert.equal(cancelled.payload.status, "completed", "cancel does not mutate a terminal operation");
+      const poll = await callTool(port, "arr_get_operation", { operationId: payload.operationId });
+      assert.equal(poll.payload.status, "completed", "the operation is still completed after cancel");
+    },
+  );
+});
+
+test("arr_cancel_operation on an unknown id returns expired-or-unknown", async () => {
   await withServers({ PREVIEW_SYNC_BUDGET_MS: "8000" }, {}, async (port) => {
-    const { payload } = await callTool(port, "lidarr_preview_manual_import", LIDARR_PREVIEW_ARGS);
-    assert.equal(payload.operationId, undefined, "fast preview completed synchronously");
-    // No operationId to cancel; cancel an unknown id.
     const res = await callTool(port, "arr_cancel_operation", { operationId: "does-not-exist" });
     assert.equal(res.payload.status, "expired-or-unknown");
   });
@@ -551,6 +578,104 @@ test("Lidarr preview reports native-reprocess before the update and resolving-tr
       await sleep(1300);
       const done = await callTool(port, "arr_get_operation", { operationId: payload.operationId });
       assert.equal(done.payload.status, "completed");
+    },
+  );
+});
+
+// --- O/P. Hard deadline during a best-effort Lidarr lookup (the race) ------
+
+// The deadline fires while validating-mappings is inside GET /album/{id}, a
+// helper that normally swallows lookup failures into a null/unverifiable
+// result. The operation-level abort must NOT be converted into a completed
+// diagnostic preview — the deadline is authoritative.
+const LIDARR_RELATIONSHIP_ARGS = { downloadId: LIDARR_DOWNLOAD_ID, items: [{ candidateId: 5, albumId: 2 }] };
+
+test("hard deadline during a swallowed Lidarr album lookup is timed_out, never a completed preview", async () => {
+  await withServers(
+    {
+      PREVIEW_SYNC_BUDGET_MS: "100",
+      PREVIEW_MAX_RUNTIME_MS: "400",
+      MANUAL_IMPORT_API_TIMEOUT_MS: "20000",
+      OPERATION_RESULT_TTL_MS: "600000",
+    },
+    { lidarrAlbumDelay: 1500 },
+    async (port) => {
+      const { payload } = await callTool(port, "lidarr_preview_manual_import", LIDARR_RELATIONSHIP_ARGS);
+      assert.equal(payload.status, "running");
+      await sleep(480);
+      const poll = await callTool(port, "arr_get_operation", { operationId: payload.operationId });
+      assert.equal(poll.payload.status, "timed_out", "deadline during the fallback lookup terminalizes as timed_out");
+      assert.equal(poll.payload.result, undefined, "no completed diagnostic preview is produced");
+    },
+  );
+});
+
+test("a late native response after the deadline cannot overwrite timed_out", async () => {
+  await withServers(
+    {
+      PREVIEW_SYNC_BUDGET_MS: "100",
+      PREVIEW_MAX_RUNTIME_MS: "400",
+      MANUAL_IMPORT_API_TIMEOUT_MS: "20000",
+      OPERATION_RESULT_TTL_MS: "600000",
+    },
+    { lidarrAlbumDelay: 1200 },
+    async (port) => {
+      const { payload } = await callTool(port, "lidarr_preview_manual_import", LIDARR_RELATIONSHIP_ARGS);
+      assert.equal(payload.status, "running");
+      await sleep(480);
+      const first = await callTool(port, "arr_get_operation", { operationId: payload.operationId });
+      assert.equal(first.payload.status, "timed_out");
+      // Let the delayed native lookup finally respond, then poll again.
+      await sleep(1000);
+      const second = await callTool(port, "arr_get_operation", { operationId: payload.operationId });
+      assert.equal(second.payload.status, "timed_out", "timed_out stays terminal after the native work resolves");
+    },
+  );
+});
+
+// --- Q. Sonarr swallowed-abort path (findSonarrReleaseContext) -------------
+
+test("hard deadline during a Sonarr queue-context lookup is timed_out, not a completed preview", async () => {
+  await withServers(
+    {
+      PREVIEW_SYNC_BUDGET_MS: "100",
+      PREVIEW_MAX_RUNTIME_MS: "400",
+      MANUAL_IMPORT_API_TIMEOUT_MS: "20000",
+      OPERATION_RESULT_TTL_MS: "600000",
+    },
+    { sonarrQueueDelay: 1500 },
+    async (port) => {
+      const { payload } = await callTool(port, "sonarr_preview_manual_import", { downloadId: SONARR_DOWNLOAD_ID, items: [{ candidateId: 123 }] });
+      assert.equal(payload.status, "running");
+      await sleep(480);
+      const poll = await callTool(port, "arr_get_operation", { operationId: payload.operationId });
+      assert.equal(poll.payload.status, "timed_out", "deadline during the best-effort queue lookup terminalizes as timed_out");
+      assert.equal(poll.payload.result, undefined, "no completed preview with an unavailable release context is produced");
+    },
+  );
+});
+
+// --- R. Fingerprint is reusable after a timeout ----------------------------
+
+test("an identical preview after a timeout starts a fresh operation, not a dedup against the timed-out one", async () => {
+  await withServers(
+    {
+      PREVIEW_SYNC_BUDGET_MS: "100",
+      PREVIEW_MAX_RUNTIME_MS: "400",
+      MANUAL_IMPORT_API_TIMEOUT_MS: "20000",
+      OPERATION_RESULT_TTL_MS: "600000",
+    },
+    { lidarrAlbumHang: true },
+    async (port) => {
+      const a = await callTool(port, "lidarr_preview_manual_import", LIDARR_RELATIONSHIP_ARGS);
+      assert.equal(a.payload.status, "running");
+      await sleep(480);
+      const pollA = await callTool(port, "arr_get_operation", { operationId: a.payload.operationId });
+      assert.equal(pollA.payload.status, "timed_out");
+      const b = await callTool(port, "lidarr_preview_manual_import", LIDARR_RELATIONSHIP_ARGS);
+      assert.equal(b.payload.status, "running");
+      assert.notEqual(b.payload.operationId, a.payload.operationId, "a new identical preview starts fresh after the prior one timed out");
+      assert.notEqual(b.payload.deduplicated, true, "the timed-out operation is not treated as an active fingerprint");
     },
   );
 });
