@@ -3261,7 +3261,9 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown) {
   const byId = new Map(reprocessed.map((r) => [r.id, r]));
 
   const releaseTrackCache = new Map<number, LidarrTrack[]>();
-  const previews: Array<Record<string, unknown>> = [];
+  // Keyed by candidateId, then emitted in the caller's original item order
+  // below — a mixed valid/invalid request reads in the order it was sent.
+  const previewById = new Map<number, Record<string, unknown>>();
   const mismatches: Array<{ candidateId: number; tracksOutsideRelease: number[] }> = [];
   for (const { candidate, override, mapping, dependencyProblems, relationshipValidation } of previewable) {
     const r = byId.get(candidate.id);
@@ -3283,7 +3285,7 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown) {
       hasManualImportQuality(r.quality) &&
       dependencyProblems.length === 0 &&
       relationshipValidation.ok;
-    previews.push({
+    previewById.set(candidate.id, {
       candidateId: candidate.id,
       name: candidate.name ?? null,
       path: candidate.path,
@@ -3335,7 +3337,7 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown) {
   // native Lidarr would throw on GetAlbum/GetRelease before the MCP could
   // diagnose. No effective artist/album names are fabricated for these.
   for (const { candidate, override, mapping, dependencyProblems, relationshipValidation } of rejected) {
-    previews.push({
+    previewById.set(candidate.id, {
       candidateId: candidate.id,
       name: candidate.name ?? null,
       path: candidate.path,
@@ -3366,6 +3368,9 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown) {
       canExecuteWithoutOverride: false,
     });
   }
+
+  // Emit in the caller's original item order, not valid-then-invalid.
+  const previews = mappings.map((m) => previewById.get(m.candidate.id)).filter((p): p is Record<string, unknown> => !!p);
 
   return {
     verifyBeforeActing: LIDARR_VERIFY_DIRECTIVE,

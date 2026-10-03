@@ -2259,6 +2259,28 @@ test("mixed preview: valid candidate reprocessed, invalid one reported diagnosti
   });
 });
 
+test("mixed preview returns items in the caller's original order, not valid-then-invalid", async () => {
+  const second = { ...LIDARR_CANDIDATE, id: 336, path: "/downloads/complete/Some.Artist/Some.Artist - Some Album/03 - Track Three.flac" };
+  await withServers({ lidarrCandidates: [LIDARR_CANDIDATE, second] }, async (port) => {
+    // Invalid first, valid second: the response must follow that order.
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [
+        { candidateId: 336, albumId: 999999 },                              // invalid, listed first
+        { candidateId: 333, albumId: 9, albumReleaseId: 77, trackIds: [501] }, // valid, listed second
+      ],
+    });
+    assert.equal(preview.isError, false, preview.text);
+    assert.deepEqual(
+      preview.payload.items.map((i) => i.candidateId),
+      [336, 333],
+      "preview items follow the caller's item order",
+    );
+    assert.equal(preview.payload.items[0].canPreview, false);
+    assert.equal(preview.payload.items[1].canPreview, true);
+  });
+});
+
 test("preview reports an existing-but-incoherent mapping diagnostically without submitting it", async () => {
   await withServers({}, async (port, logs) => {
     // Artist 6 + album 9 (belongs to artist 5): both ids exist, the pairing
