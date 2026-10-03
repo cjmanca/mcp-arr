@@ -361,7 +361,7 @@ if (clients.sonarr) {
     },
     {
       name: "sonarr_preview_manual_import",
-      description: "Preview (reprocess) a manual import in Sonarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (seriesId/seasonNumber/episodeIds/releaseGroup), sends Sonarr's native manual-import reprocess request, and returns Sonarr's recalculated mapping, quality, languages and rejections. Candidates with no valid series mapping (and no seriesId override) are returned as mappingRequired/canPreview=false and are never sent to Sonarr — a 0 seriesId is never submitted, because Sonarr's reprocess resolves the series and throws for unknown ids. Overrides follow the native hierarchy series -> season -> episodes: a seriesId override clears the inherited seasonNumber and episodes, and a seasonNumber override clears the inherited episodes, so supply the full corrected selection rather than only the parent. Explicit episodeIds are validated against GET /api/v3/episode?seriesId=&seasonNumber= and reported in episodeValidation. The reported series is the EFFECTIVE series (its real id and title), never the original candidate's title under an overridden id. Use this to fix unparseable filenames or wrong episode mappings and inspect the result; then run sonarr_execute_manual_import with the same overrides. Non-destructive: never moves, copies, or imports files. The preview's upgradeAssessment merges the tracked release's queue custom-format context with the file's own CF context (deduplicated by custom-format id, scored against the effective series' quality profile) to assess the pending candidate against existing files — a per-file CF rejection that the release-level evidence contradicts is reported as cf-upgrade-with-native-rejection, not a hard do-not-import.",
+      description: "Preview (reprocess) a manual import in Sonarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (seriesId/seasonNumber/episodeIds/releaseGroup), sends Sonarr's native manual-import reprocess request, and returns Sonarr's recalculated mapping, quality, languages and rejections. Candidates with no valid series mapping (and no seriesId override) are returned as mappingRequired/canPreview=false and are never sent to Sonarr — a 0 seriesId is never submitted, because Sonarr's reprocess resolves the series and throws for unknown ids. Overrides follow the native hierarchy series -> season -> episodes: a seriesId override clears the inherited seasonNumber and episodes, and a seasonNumber override clears the inherited episodes, so supply the full corrected selection rather than only the parent. Explicit episodeIds are validated against GET /api/v3/episode?seriesId=&seasonNumber= and reported in episodeValidation. The reported series is the EFFECTIVE series (its real id and title), never the original candidate's title under an overridden id. Use this to fix unparseable filenames or wrong episode mappings and inspect the result; then run sonarr_execute_manual_import with the same overrides. Non-destructive: never moves, copies, or imports files. The preview's upgradeAssessment merges the tracked release's queue custom-format context with the file's own CF context (deduplicated by custom-format id, scored against the effective series' quality profile) to assess the pending candidate against existing files — a per-file CF rejection that the release-level evidence contradicts is reported as cf-upgrade-with-native-rejection, not a hard do-not-import, and a release-only negative CF that the per-file evaluation cannot see is reported as cf-downgrade-despite-native-acceptance even when Sonarr raised no rejection. Quality/revision/already-imported rejections are always hard not-an-upgrade refusals.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -2062,7 +2062,7 @@ const SONARR_VERIFY_DIRECTIVE = [
   "Sonarr's mapping and rejection reasons are a parse PROPOSAL derived from the release name — not verified facts. mappingValid: true means the proposal is complete, not that it is correct; a rejection is Sonarr's opinion, not ground truth.",
   "Before execute — especially before allowRejected=true — verify the proposal against the library: series identity, season/episode identity (sonarr_get_episodes), the release title and numbering where the name supplies them, and existing-file state.",
   "Titles and numbering are both evidence, and neither is conclusive alone. A number mismatch does not by itself prove the mapping wrong (TheTVDB/TMDB/absolute-numbering conventions differ); a title that matches none of the detected episodes does not by itself prove it right (translations and fan-sub titles differ from official ones). When the evidence conflicts, treat the mapping as AMBIGUOUS and investigate — including seasonNumber=0 for specials — rather than automatically trusting Sonarr's proposal or overriding it.",
-  "An existing file on the target episode is not by itself a reason to skip: read the preview's upgradeAssessment. 'no-existing-file' → fills a gap; 'no-upgrade-rejection' → equal to or better than the existing file (compare quality name and customFormatScore against newQualityWeight/newCustomFormatScore); 'not-an-upgrade' → Sonarr rejects it as not better (quality/revision, already-imported, or a CF downgrade confirmed by release+file evidence); 'cf-upgrade-with-native-rejection' → the tracked release + file CF evidence scores the candidate ABOVE the existing file(s) even though Sonarr's per-file CF check rejected it; 'cf-assessment-ambiguous' → the CF comparison cannot be computed safely. A per-file native CF rejection is NOT sufficient evidence to remove/blocklist a tracked release when release-level CF provenance conflicts with it — blocklisting acts on the whole release. Re-check after any remap — the preview evaluates against the NEW target's file.",
+  "An existing file on the target episode is not by itself a reason to skip: read the preview's upgradeAssessment. 'no-existing-file' → fills a gap; 'no-upgrade-rejection' → Sonarr raised no native upgrade rejection, but still inspect the provenance-aware CF comparison (it is neutral/upgrade only when that comparison agrees); 'cf-downgrade-despite-native-acceptance' → release/file CF provenance shows a downgrade even though Sonarr's stripped per-file metadata triggered no CF rejection; 'not-an-upgrade' → Sonarr rejects it as not better (quality/revision, already-imported, or a CF downgrade confirmed by release+file evidence); 'cf-upgrade-with-native-rejection' → the tracked release + file CF evidence scores the candidate ABOVE the existing file(s) even though Sonarr's per-file CF check rejected it; 'cf-assessment-ambiguous' → the CF comparison cannot be computed safely. A per-file native CF rejection is NOT sufficient evidence to remove/blocklist a tracked release when release-level CF provenance conflicts with it — blocklisting acts on the whole release. Re-check after any remap — the preview evaluates against the NEW target's file.",
 ];
 
 const RADARR_VERIFY_DIRECTIVE = [
@@ -2483,17 +2483,36 @@ function mergeSonarrCustomFormats(
 }
 
 /**
- * Classify Sonarr's manual-import upgrade rejection. A quality/revision
- * downgrade is a hard native rejection that a high CF score must NOT override;
- * a custom-format rejection is the case where release-level CF provenance can
- * legitimately conflict with the per-file evaluation.
+ * Classify Sonarr's manual-import upgrade rejections. Sonarr's import decision
+ * maker can return SEVERAL rejections from different specifications, so the
+ * assessment must scan all of them and never trust array order.
+ *
+ * Quality, revision and already-imported rejections are HARD: a favorable
+ * custom-format score must NOT override them. The custom-format rejection is
+ * the one case where release-level CF provenance can legitimately conflict
+ * with Sonarr's per-file evaluation.
+ *
+ * "Not a quality revision upgrade for existing episode file(s)" is a distinct
+ * native string that does NOT contain "not an upgrade", so it needs its own
+ * pattern — matching only /not an upgrade/ would miss it entirely.
  */
-function classifySonarrUpgradeRejection(reason: string | null | undefined): "custom-format" | "quality" | "already-imported" | null {
-  const text = reason ?? "";
-  if (/custom format upgrade/i.test(text)) return "custom-format";
-  if (/already imported/i.test(text)) return "already-imported";
-  if (/not an upgrade/i.test(text)) return "quality";
-  return null;
+interface SonarrUpgradeRejections {
+  quality?: ManualImportRejection;
+  revision?: ManualImportRejection;
+  alreadyImported?: ManualImportRejection;
+  customFormat?: ManualImportRejection;
+}
+
+function classifySonarrUpgradeRejections(rejections: ManualImportRejection[]): SonarrUpgradeRejections {
+  const out: SonarrUpgradeRejections = {};
+  for (const r of rejections) {
+    const text = r.reason ?? "";
+    if (!out.customFormat && /custom format upgrade/i.test(text)) out.customFormat = r;
+    if (!out.revision && /not a quality revision upgrade/i.test(text)) out.revision = r;
+    if (!out.quality && /not an upgrade/i.test(text)) out.quality = r;
+    if (!out.alreadyImported && /already imported/i.test(text)) out.alreadyImported = r;
+  }
+  return out;
 }
 
 function compareSonarrCFScore(effectiveScore: number, existingScores: number[]): "upgrade" | "neutral" | "downgrade" | "mixed" {
@@ -2518,9 +2537,13 @@ function compareSonarrCFScore(effectiveScore: number, existingScores: number[]):
  * when the tracked release clearly beats the existing file. The tracked
  * release's queue CF context is merged with the file CF context (deduplicated
  * by custom-format id, scored against the effective quality profile) to build
- * the effective pending-candidate CF score. A quality/revision rejection stays
- * a hard refusal; a per-file CF rejection alone is not treated as proof the
- * release should be removed.
+ * the effective pending-candidate CF score. The comparison is applied
+ * symmetrically: a per-file CF rejection the release evidence contradicts is
+ * reported as an upgrade, and a release-only negative CF that the per-file
+ * evaluation cannot see is reported as a downgrade even when Sonarr raised no
+ * rejection. Quality/revision/already-imported rejections are hard refusals
+ * that a favorable CF score never overrides, and the classification scans ALL
+ * rejections so array order never changes the verdict.
  */
 async function assessSonarrUpgrade(
   client: SonarrClient,
@@ -2540,9 +2563,10 @@ async function assessSonarrUpgrade(
   const releaseType = reprocessed.releaseType ?? candidate.releaseType ?? null;
   const seasonPack = releaseType === "seasonPack";
 
-  const upgradeRejection = rejections.find((r) =>
-    /not an upgrade|not a custom format upgrade|already imported/i.test(r.reason ?? ""));
-  const rejectionType = upgradeRejection ? classifySonarrUpgradeRejection(upgradeRejection.reason) : null;
+  const classified = classifySonarrUpgradeRejections(rejections);
+  const hardRejection = classified.quality ?? classified.revision ?? classified.alreadyImported;
+  const cfRejection = classified.customFormat;
+  const drivingRejection = hardRejection ?? cfRejection ?? null;
 
   const seasonNumber = reprocessed.seasonNumber ?? candidate.seasonNumber;
   const existingFiles: Array<Record<string, unknown>> = [];
@@ -2607,22 +2631,25 @@ async function assessSonarrUpgrade(
     };
   }
 
+  const acceptedNote = "Sonarr evaluated this mapping and raised NO upgrade rejection — the new file is equal to or better than the existing file(s) (equal quality + equal CF surfaces no warning: neutral, allowed replacement). Compare the listed existing quality names and custom format scores against the candidate (newQualityWeight/newCustomFormatScore) to judge upgrade vs neutral.";
+
   let verdict: string;
   let note: string;
-  if (upgradeRejection) {
-    if (rejectionType === "quality") {
-      verdict = "not-an-upgrade";
-      note = `Sonarr's own decision rejects this mapping on quality/revision grounds ("${upgradeRejection.reason}") — the new file is NOT better than the existing episode file(s). A higher custom-format score does not override a lower quality. Do not import.`;
-    } else if (rejectionType === "already-imported") {
-      verdict = "not-an-upgrade";
-      note = `Sonarr reports the episode is already imported ("${upgradeRejection.reason}"). Do not import.`;
-    } else if (!releaseContext.available) {
+  if (hardRejection) {
+    verdict = "not-an-upgrade";
+    if (classified.alreadyImported && !classified.quality && !classified.revision) {
+      note = `Sonarr reports the episode is already imported ("${hardRejection.reason}"). Do not import.`;
+    } else {
+      note = `Sonarr's own decision rejects this mapping on quality/revision grounds ("${hardRejection.reason}") — the new file is NOT better than the existing episode file(s). A higher custom-format score does not override a lower quality. Do not import.`;
+    }
+  } else if (cfRejection) {
+    if (!releaseContext.available) {
       if (seasonPack) {
         verdict = "cf-assessment-ambiguous";
         note = "Sonarr rejected the individual file on a per-file Custom Format basis, and this is a season pack whose release-level CF metadata is not present in the file names. The tracked release's custom-format context is unavailable, so the pending-candidate CF comparison cannot be computed. This is NOT sufficient evidence to remove/blocklist the release — resolve the queue context (sonarr_get_queue) and re-preview. Execution requires explicit allowRejected=true.";
       } else {
         verdict = "not-an-upgrade";
-        note = `Sonarr's own decision rejects this mapping ("${upgradeRejection.reason}") — the new file is NOT better than the existing episode file(s). Do not import.`;
+        note = `Sonarr's own decision rejects this mapping ("${cfRejection.reason}") — the new file is NOT better than the existing episode file(s). Do not import.`;
       }
     } else if (!effectiveSeriesMatchesQueue) {
       verdict = "cf-assessment-ambiguous";
@@ -2635,7 +2662,7 @@ async function assessSonarrUpgrade(
       note = "The tracked release + file CF evidence scores this pending candidate above the existing file(s), but Sonarr's native manual-import decision rejected the individual file using its file/import CF context. Do not remove or blocklist this release solely because of that per-file CF rejection. Execution still requires explicit allowRejected=true.";
     } else if (comparison === "downgrade" || comparison === "neutral") {
       verdict = "not-an-upgrade";
-      note = `Sonarr's own decision rejects this mapping ("${upgradeRejection.reason}") and the tracked-release + file CF evidence confirms the pending candidate does not improve on the existing file(s). Do not import.`;
+      note = `Sonarr's own decision rejects this mapping ("${cfRejection.reason}") and the tracked-release + file CF evidence confirms the pending candidate does not improve on the existing file(s). Do not import.`;
     } else {
       verdict = "cf-assessment-ambiguous";
       note = "The pending candidate's effective CF score is better than some existing files and worse than others (mixed). Decide per episode; a per-file CF rejection is not sufficient evidence to blocklist the whole release. Execution requires explicit allowRejected=true.";
@@ -2643,9 +2670,24 @@ async function assessSonarrUpgrade(
   } else if (existingFiles.length === 0) {
     verdict = "no-existing-file";
     note = "No existing file for the mapped episodes — importing fills a gap.";
+  } else if (customFormatAssessment && customFormatAssessment.scoreAttributionValid === true && customFormatAssessment.effectiveCandidate) {
+    // No native rejection, but the provenance-aware comparison applies
+    // symmetrically: release-only metadata the per-file evaluation cannot see
+    // can make the candidate a CF downgrade (or a mixed result) that Sonarr's
+    // stripped filename assessment never surfaces as a rejection.
+    if (comparison === "downgrade") {
+      verdict = "cf-downgrade-despite-native-acceptance";
+      note = "Sonarr raised no per-file Custom Format upgrade rejection, but the tracked release + file CF provenance scores this pending candidate below the existing file(s). Release-level negative Custom Formats were lost from the individual filename, so the native per-file assessment overstates the candidate. Do not treat the absence of a native rejection as evidence that this is an upgrade.";
+    } else if (comparison === "mixed") {
+      verdict = "cf-assessment-ambiguous";
+      note = "The pending candidate's effective CF score is better than some existing files and worse than others (mixed). Sonarr raised no rejection, so execution is not blocked, but the CF evidence is not uniform — decide per episode.";
+    } else {
+      verdict = "no-upgrade-rejection";
+      note = acceptedNote;
+    }
   } else {
     verdict = "no-upgrade-rejection";
-    note = "Sonarr evaluated this mapping and raised NO upgrade rejection — the new file is equal to or better than the existing file(s) (equal quality + equal CF surfaces no warning: neutral, allowed replacement). Compare the listed existing quality names and custom format scores against the candidate (newQualityWeight/newCustomFormatScore) to judge upgrade vs neutral.";
+    note = acceptedNote;
   }
 
   return {
@@ -2661,7 +2703,7 @@ async function assessSonarrUpgrade(
       reason: effectiveSeriesMatchesQueue ? releaseContext.reason : "effective-series-mismatch",
       metadataInheritanceLikely: seasonPack,
     },
-    nativeImportRejection: upgradeRejection?.reason ?? null,
+    nativeImportRejection: drivingRejection?.reason ?? null,
   };
 }
 

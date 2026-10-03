@@ -1569,6 +1569,281 @@ test("sonarr_get_queue passes through customFormats/customFormatScore without re
   );
 });
 
+// --- rejection classification + symmetric CF comparison (follow-up) --------
+
+const PACK_QUALITY_REJECTION = {
+  reason: "Not an upgrade for existing episode file(s). Existing quality: WEBDL-1080p. New Quality HDTV-720p.",
+  type: "permanent",
+};
+const PACK_REVISION_REJECTION = {
+  reason: "Not a quality revision upgrade for existing episode file(s)",
+  type: "permanent",
+};
+const PACK_ALREADY_IMPORTED_REJECTION = {
+  reason: "Episode already imported",
+  type: "permanent",
+};
+
+// A. Native revision rejection is recognized (it does NOT match /not an upgrade/).
+test("preview upgradeAssessment: 'Not a quality revision upgrade' -> not-an-upgrade (not missed)", async () => {
+  await withServers(
+    {
+      sonarrCandidates: [packCandidate(146, 9101, 1)],
+      sonarrSeries: PACK_SERIES,
+      sonarrQualityProfiles: packProfile([
+        { format: 10, name: "BluRay", score: 1600 },
+        { format: 11, name: "Dual Audio", score: 1600 },
+      ]),
+      sonarrQueue: packQueue([{ id: 10, name: "BluRay" }, { id: 11, name: "Dual Audio" }], 3200),
+      sonarrEpisodesWithFiles: packEpisodes([{ id: 9101, episodeNumber: 1, fileId: 1 }]),
+      sonarrEpisodeFilesList: [{ id: 1, quality: QUALITY, customFormatScore: 1600 }],
+      reprocessRejections: [PACK_REVISION_REJECTION],
+    },
+    async (port) => {
+      const result = await callTool(port, "sonarr_preview_manual_import", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        items: [{ candidateId: 146 }],
+      });
+      assert.equal(result.isError, false, result.text);
+      const a = result.payload.items[0].upgradeAssessment;
+      assert.equal(a.customFormatAssessment.comparison, "upgrade", "CF evidence alone would say upgrade");
+      assert.equal(a.verdict, "not-an-upgrade", "a revision rejection is a hard refusal CF cannot override");
+      assert.match(a.note, /quality\/revision/i, "note names quality/revision grounds");
+    },
+  );
+});
+
+// B. Hard quality/revision rejection wins regardless of array order.
+test("preview upgradeAssessment: hard rejection wins over a CF rejection in any order", async () => {
+  const base = {
+    sonarrCandidates: [packCandidate(147, 9101, 1)],
+    sonarrSeries: PACK_SERIES,
+    sonarrQualityProfiles: packProfile([
+      { format: 10, name: "BluRay", score: 1600 },
+      { format: 11, name: "Dual Audio", score: 1600 },
+    ]),
+    sonarrQueue: packQueue([{ id: 10, name: "BluRay" }, { id: 11, name: "Dual Audio" }], 3200),
+    sonarrEpisodesWithFiles: packEpisodes([{ id: 9101, episodeNumber: 1, fileId: 1 }]),
+    sonarrEpisodeFilesList: [{ id: 1, quality: QUALITY, customFormatScore: 1600 }],
+  };
+  const orders = [
+    [PACK_CF_REJECTION, PACK_QUALITY_REJECTION],
+    [PACK_QUALITY_REJECTION, PACK_CF_REJECTION],
+    [PACK_CF_REJECTION, PACK_REVISION_REJECTION],
+    [PACK_REVISION_REJECTION, PACK_CF_REJECTION],
+  ];
+  for (const reprocessRejections of orders) {
+    await withServers({ ...base, reprocessRejections }, async (port) => {
+      const result = await callTool(port, "sonarr_preview_manual_import", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        items: [{ candidateId: 147 }],
+      });
+      assert.equal(result.isError, false, result.text);
+      const a = result.payload.items[0].upgradeAssessment;
+      assert.equal(a.customFormatAssessment.comparison, "upgrade", "CF evidence is favorable in every order");
+      assert.equal(a.verdict, "not-an-upgrade", `hard rejection must win for order ${JSON.stringify(reprocessRejections.map((r) => r.reason.slice(0, 20)))}`);
+    });
+  }
+});
+
+// C. Already-imported is a hard rejection even alongside a CF rejection.
+test("preview upgradeAssessment: already-imported rejection wins over a CF rejection in any order", async () => {
+  const base = {
+    sonarrCandidates: [packCandidate(148, 9101, 1)],
+    sonarrSeries: PACK_SERIES,
+    sonarrQualityProfiles: packProfile([
+      { format: 10, name: "BluRay", score: 1600 },
+      { format: 11, name: "Dual Audio", score: 1600 },
+    ]),
+    sonarrQueue: packQueue([{ id: 10, name: "BluRay" }, { id: 11, name: "Dual Audio" }], 3200),
+    sonarrEpisodesWithFiles: packEpisodes([{ id: 9101, episodeNumber: 1, fileId: 1 }]),
+    sonarrEpisodeFilesList: [{ id: 1, quality: QUALITY, customFormatScore: 1600 }],
+  };
+  for (const reprocessRejections of [[PACK_CF_REJECTION, PACK_ALREADY_IMPORTED_REJECTION], [PACK_ALREADY_IMPORTED_REJECTION, PACK_CF_REJECTION]]) {
+    await withServers({ ...base, reprocessRejections }, async (port) => {
+      const result = await callTool(port, "sonarr_preview_manual_import", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        items: [{ candidateId: 148 }],
+      });
+      assert.equal(result.isError, false, result.text);
+      assert.equal(result.payload.items[0].upgradeAssessment.verdict, "not-an-upgrade");
+    });
+  }
+});
+
+// D. Release-only negative CF with no native rejection -> inverse downgrade.
+test("preview upgradeAssessment: release-only negative CF, no native rejection -> cf-downgrade-despite-native-acceptance", async () => {
+  await withServers(
+    {
+      sonarrCandidates: [packCandidate(149, 9110, 10)],
+      sonarrSeries: PACK_SERIES,
+      sonarrQualityProfiles: packProfile([{ format: 30, name: "Bad Group", score: -1000 }]),
+      sonarrQueue: packQueue([{ id: 30, name: "Bad Group" }], -1000),
+      sonarrEpisodesWithFiles: packEpisodes([{ id: 9110, episodeNumber: 10, fileId: 10 }]),
+      sonarrEpisodeFilesList: [{ id: 10, quality: QUALITY, customFormatScore: 0 }],
+      reprocessRejections: [],
+    },
+    async (port) => {
+      const result = await callTool(port, "sonarr_preview_manual_import", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        items: [{ candidateId: 149 }],
+      });
+      assert.equal(result.isError, false, result.text);
+      const a = result.payload.items[0].upgradeAssessment;
+      assert.equal(a.customFormatAssessment.effectiveCandidate.score, -1000);
+      assert.equal(a.customFormatAssessment.comparison, "downgrade");
+      assert.equal(a.verdict, "cf-downgrade-despite-native-acceptance");
+      assert.notEqual(a.verdict, "no-upgrade-rejection", "absence of a native rejection is not evidence of an upgrade");
+    },
+  );
+});
+
+// E. Negative CF present at release and file levels is deduplicated once.
+test("preview CF merge: release+file negative CF deduplicated once, inverse downgrade", async () => {
+  await withServers(
+    {
+      sonarrCandidates: [packCandidate(150, 9111, 11, [{ id: 30, name: "Bad Group", score: -1000 }], -1000)],
+      sonarrSeries: PACK_SERIES,
+      sonarrQualityProfiles: packProfile([{ format: 30, name: "Bad Group", score: -1000 }]),
+      sonarrQueue: packQueue([{ id: 30, name: "Bad Group" }], -1000),
+      sonarrEpisodesWithFiles: packEpisodes([{ id: 9111, episodeNumber: 11, fileId: 11 }]),
+      sonarrEpisodeFilesList: [{ id: 11, quality: QUALITY, customFormatScore: 0 }],
+      reprocessRejections: [],
+    },
+    async (port) => {
+      const result = await callTool(port, "sonarr_preview_manual_import", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        items: [{ candidateId: 150 }],
+      });
+      assert.equal(result.isError, false, result.text);
+      const cf = result.payload.items[0].upgradeAssessment.customFormatAssessment;
+      const neg = cf.effectiveCandidate.contributors.filter((c) => c.id === 30);
+      assert.equal(neg.length, 1, "negative CF deduplicated to one contributor");
+      assert.deepEqual(neg[0].matchedAt, ["release", "file"]);
+      assert.equal(cf.effectiveCandidate.score, -1000, "counted once, not -2000");
+      assert.equal(result.payload.items[0].upgradeAssessment.verdict, "cf-downgrade-despite-native-acceptance");
+    },
+  );
+});
+
+// F. No native rejection + effective upgrade stays on the normal accepted path.
+test("preview upgradeAssessment: no native rejection + effective upgrade -> no-upgrade-rejection", async () => {
+  await withServers(
+    {
+      sonarrCandidates: [packCandidate(151, 9112, 12)],
+      sonarrSeries: PACK_SERIES,
+      sonarrQualityProfiles: packProfile([
+        { format: 10, name: "BluRay", score: 1600 },
+        { format: 11, name: "Dual Audio", score: 1600 },
+      ]),
+      sonarrQueue: packQueue([{ id: 10, name: "BluRay" }, { id: 11, name: "Dual Audio" }], 3200),
+      sonarrEpisodesWithFiles: packEpisodes([{ id: 9112, episodeNumber: 12, fileId: 12 }]),
+      sonarrEpisodeFilesList: [{ id: 12, quality: QUALITY, customFormatScore: 1600 }],
+      reprocessRejections: [],
+    },
+    async (port) => {
+      const result = await callTool(port, "sonarr_preview_manual_import", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        items: [{ candidateId: 151 }],
+      });
+      assert.equal(result.isError, false, result.text);
+      const a = result.payload.items[0].upgradeAssessment;
+      assert.equal(a.customFormatAssessment.comparison, "upgrade");
+      assert.equal(a.verdict, "no-upgrade-rejection", "no conflict -> the normal accepted path, no special verdict");
+    },
+  );
+});
+
+// G. No native rejection + neutral stays accepted/neutral.
+test("preview upgradeAssessment: no native rejection + neutral CF -> no-upgrade-rejection", async () => {
+  await withServers(
+    {
+      sonarrCandidates: [packCandidate(152, 9113, 13)],
+      sonarrSeries: PACK_SERIES,
+      sonarrQualityProfiles: packProfile([{ format: 10, name: "BluRay", score: 1600 }]),
+      sonarrQueue: packQueue([{ id: 10, name: "BluRay" }], 1600),
+      sonarrEpisodesWithFiles: packEpisodes([{ id: 9113, episodeNumber: 13, fileId: 13 }]),
+      sonarrEpisodeFilesList: [{ id: 13, quality: QUALITY, customFormatScore: 1600 }],
+      reprocessRejections: [],
+    },
+    async (port) => {
+      const result = await callTool(port, "sonarr_preview_manual_import", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        items: [{ candidateId: 152 }],
+      });
+      assert.equal(result.isError, false, result.text);
+      const a = result.payload.items[0].upgradeAssessment;
+      assert.equal(a.customFormatAssessment.comparison, "neutral");
+      assert.equal(a.verdict, "no-upgrade-rejection");
+    },
+  );
+});
+
+// H. No native rejection + mixed existing targets -> ambiguous.
+test("preview upgradeAssessment: no native rejection + mixed existing targets -> cf-assessment-ambiguous", async () => {
+  const multi = {
+    ...packCandidate(153, 9101, 1),
+    episodes: [
+      { id: 9101, seriesId: 47, seasonNumber: 1, episodeNumber: 1, title: "E1" },
+      { id: 9102, seriesId: 47, seasonNumber: 1, episodeNumber: 2, title: "E2" },
+    ],
+  };
+  await withServers(
+    {
+      sonarrCandidates: [multi],
+      sonarrSeries: PACK_SERIES,
+      sonarrQualityProfiles: packProfile([{ format: 10, name: "BluRay", score: 1600 }]),
+      sonarrQueue: packQueue([{ id: 10, name: "BluRay" }], 1600),
+      sonarrEpisodesWithFiles: packEpisodes([
+        { id: 9101, episodeNumber: 1, fileId: 1 },
+        { id: 9102, episodeNumber: 2, fileId: 2 },
+      ]),
+      sonarrEpisodeFilesList: [
+        { id: 1, quality: QUALITY, customFormatScore: 1000 },
+        { id: 2, quality: QUALITY, customFormatScore: 2000 },
+      ],
+      reprocessRejections: [],
+    },
+    async (port) => {
+      const result = await callTool(port, "sonarr_preview_manual_import", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        items: [{ candidateId: 153 }],
+      });
+      assert.equal(result.isError, false, result.text);
+      const a = result.payload.items[0].upgradeAssessment;
+      assert.equal(a.customFormatAssessment.comparison, "mixed");
+      assert.equal(a.verdict, "cf-assessment-ambiguous", "some files upgrade, others downgrade — not a blanket accept");
+    },
+  );
+});
+
+// I. Attribution mismatch with no native rejection stays conservative.
+test("preview upgradeAssessment: attribution mismatch + no native rejection stays conservative", async () => {
+  await withServers(
+    {
+      sonarrCandidates: [packCandidate(154, 9115, 15)],
+      sonarrSeries: PACK_SERIES,
+      // Profile says BluRay is 1600, queue reports a native total of 3200.
+      sonarrQualityProfiles: packProfile([{ format: 10, name: "BluRay", score: 1600 }]),
+      sonarrQueue: packQueue([{ id: 10, name: "BluRay" }], 3200),
+      sonarrEpisodesWithFiles: packEpisodes([{ id: 9115, episodeNumber: 15, fileId: 15 }]),
+      sonarrEpisodeFilesList: [{ id: 15, quality: QUALITY, customFormatScore: 1600 }],
+      reprocessRejections: [],
+    },
+    async (port) => {
+      const result = await callTool(port, "sonarr_preview_manual_import", {
+        downloadId: SONARR_DOWNLOAD_ID,
+        items: [{ candidateId: 154 }],
+      });
+      assert.equal(result.isError, false, result.text);
+      const a = result.payload.items[0].upgradeAssessment;
+      assert.equal(a.customFormatAssessment.scoreAttributionValid, false);
+      assert.notEqual(a.verdict, "cf-downgrade-despite-native-acceptance", "an invalid attribution never infers a downgrade");
+      assert.equal(a.verdict, "no-upgrade-rejection", "conservative: Sonarr raised no rejection and attribution is unreliable");
+    },
+  );
+});
+
 // --- 1. Sonarr/Radarr missing mapping: mappingRequired, never seriesId=0 --
 test("sonarr preview of an unmapped candidate: mappingRequired, no native reprocess request", async () => {
   const unmapped = { ...SONARR_CANDIDATE, id: 127, series: null, seasonNumber: null, episodes: [] };
