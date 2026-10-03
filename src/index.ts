@@ -340,8 +340,9 @@ if (clients.sonarr) {
             description: "Tracked download ID from sonarr_get_queue (required)",
           },
           seriesId: {
-            type: "number",
-            description: "Optional series hint passed to the native endpoint",
+            type: "integer",
+            minimum: 1,
+            description: "Optional series hint passed to the native endpoint (positive integer; omit when unspecified — 0 is never a valid native id)",
           },
           seasonNumber: {
             type: "integer",
@@ -790,8 +791,9 @@ if (clients.radarr) {
             description: "Tracked download ID from radarr_get_queue (required)",
           },
           movieId: {
-            type: "number",
-            description: "Optional movie hint passed to the native endpoint",
+            type: "integer",
+            minimum: 1,
+            description: "Optional movie hint passed to the native endpoint (positive integer; omit when unspecified — 0 is never a valid native id)",
           },
           filterExistingFiles: {
             type: "boolean",
@@ -1098,7 +1100,7 @@ if (clients.lidarr) {
     },
     {
       name: "lidarr_get_manual_import_candidates",
-      description: "Discover Lidarr's native manual-import candidates for a tracked download (read-only). Lidarr resolves the download location from the downloadId — never supply a path. Returns each candidate's candidateId (the native manual-import resource id), display path, quality, mapped artist/album/albumReleaseId/tracks, additionalFile/replaceExistingFiles/disableReleaseSwitching flags, and rejections (Lidarr serializes them as {message} objects). An untracked downloadId yields an empty list. Use lidarr_get_queue first to find the downloadId. Workflow: get candidates -> preview corrected mapping if needed -> execute manual import -> re-check queue.",
+      description: "Discover Lidarr's native manual-import candidates for a tracked download (read-only). Lidarr resolves the download location from the downloadId — never supply a path. Returns each candidate's candidateId (the native manual-import resource id), display path, quality, mapped artist/album/albumReleaseId/tracks, additionalFile/replaceExistingFiles/disableReleaseSwitching flags, and structured native rejections normalized as {reason, type} — Lidarr may serialize an empty rejection object, which is represented as null reason/type rather than discarded. An untracked downloadId yields an empty list. Use lidarr_get_queue first to find the downloadId. Workflow: get candidates -> preview corrected mapping if needed -> execute manual import -> re-check queue.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -1107,8 +1109,9 @@ if (clients.lidarr) {
             description: "Tracked download ID from lidarr_get_queue (required)",
           },
           artistId: {
-            type: "number",
-            description: "Optional artist hint passed to the native endpoint",
+            type: "integer",
+            minimum: 1,
+            description: "Optional artist hint passed to the native endpoint (positive integer; omit when unspecified — 0 is never a valid native id)",
           },
           filterExistingFiles: {
             type: "boolean",
@@ -1124,7 +1127,7 @@ if (clients.lidarr) {
     },
     {
       name: "lidarr_preview_manual_import",
-      description: "Preview (update/reprocess) a manual import in Lidarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (artistId/albumId/albumReleaseId/trackIds/disableReleaseSwitching), sends Lidarr's native POST /manualimport update, and returns the resulting mapping and rejections. IMPORTANT Lidarr semantics: the backend re-runs its import decision with the artist/album/release overrides and RECOMPUTES the track mapping itself — the native update endpoint drops the resource's Tracks/TrackIds when building the item. Supplied trackIds are validated against the selected album release's track list (GET /track?albumReleaseId=…) and PRESERVED: the preview response shows exactly the tracks that lidarr_execute_manual_import will import (tracksSource marks caller-override vs lidarr-recomputed). The mapping is a hierarchy artist → album → album release → tracks: an artistId override clears the inherited album/release/tracks, an albumId override clears the inherited release/tracks, an albumReleaseId override clears the inherited tracks (native Interactive Import behavior — the native reprocess resolves supplied ids with precedence AlbumRelease > Album > Artist and NO ownership check, so the MCP clears dependents and validates explicit overrides: albumId→artist via GET /album/{id}, albumReleaseId→album via GET /release?albumId=, trackIds→release via GET /track?albumReleaseId=). mappingOverridesApplied reports which inherited children a parent change cleared; dependencyProblems/relationshipValidation report a broken hierarchy. An explicit albumReleaseId defaults disableReleaseSwitching to true (native UI; persists as album.AnyReleaseOk=false on import) — set it false explicitly to keep automatic release selection. Non-destructive: never moves, copies, or imports files.",
+      description: "Preview (update/reprocess) a manual import in Lidarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (artistId/albumId/albumReleaseId/trackIds/disableReleaseSwitching), sends Lidarr's native POST /manualimport update, and returns the resulting mapping and rejections. IMPORTANT Lidarr semantics: the backend re-runs its import decision with the artist/album/release overrides and RECOMPUTES the track mapping itself — the native update endpoint drops the resource's Tracks/TrackIds when building the item. Supplied trackIds are validated against the selected album release's track list (GET /track?albumReleaseId=…) and PRESERVED: the preview response shows exactly the tracks that lidarr_execute_manual_import will import (tracksSource marks caller-override vs lidarr-recomputed). The mapping is a hierarchy artist → album → album release → tracks: an artistId override clears the inherited album/release/tracks, an albumId override clears the inherited release/tracks, an albumReleaseId override clears the inherited tracks (native Interactive Import behavior — the native reprocess resolves supplied ids with precedence AlbumRelease > Album > Artist and NO ownership check, so the MCP clears dependents and validates explicit overrides: albumId→artist via GET /album/{id}.artistId, albumReleaseId→album via GET /album/{id} and that album's embedded releases[], trackIds→release via GET /track?albumReleaseId=). Items whose explicit ids break the hierarchy are reported with canPreview=false and are NOT sent to the native reprocess (Lidarr throws on the lookup first). mappingOverridesApplied reports which inherited children a parent change cleared; dependencyProblems/relationshipValidation report a broken hierarchy. An explicit albumReleaseId defaults disableReleaseSwitching to true (native UI; persists as album.AnyReleaseOk=false on import) — set it false explicitly to keep automatic release selection. Non-destructive: never moves, copies, or imports files.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -1134,7 +1137,7 @@ if (clients.lidarr) {
           },
           items: {
             type: "array",
-            description: "Candidates to preview, each identified by candidateId from lidarr_get_manual_import_candidates. Mapping overrides are optional; omitted fields keep Lidarr's current values.",
+            description: "Candidates to preview, each identified by candidateId from lidarr_get_manual_import_candidates. Mapping overrides are optional; omitted fields keep Lidarr's current values UNLESS a parent override clears them (artistId clears album/release/tracks; albumId clears release/tracks; albumReleaseId clears tracks).",
             items: {
               type: "object",
               properties: {
@@ -1177,7 +1180,7 @@ if (clients.lidarr) {
     },
     {
       name: "lidarr_execute_manual_import",
-      description: "Execute a manual import in Lidarr (DESTRUCTIVE: moves/copies media files). Always re-validates from scratch: re-fetches native candidates for the downloadId, resolves each candidateId (fails if a candidate disappeared or is ambiguous), merges only permitted mapping overrides, reprocesses through Lidarr's native POST /manualimport (which recomputes the track mapping server-side), verifies artist/album/release/track/quality mapping against the reprocessed result, then queues Lidarr's native ManualImport command with explicit importMode and replaceExistingFiles. Caller-supplied paths are never accepted — paths come only from native candidates. Overrides follow the native hierarchy artist → album → album release → tracks: a parent override clears the inherited children (the native reprocess resolves supplied ids with precedence AlbumRelease > Album > Artist and no ownership check, so a stale child inherited across a parent change would import), and explicit overrides are validated BEFORE any request — albumId must belong to the effective artist (GET /album/{id}), albumReleaseId must be a release of the effective album (GET /release?albumId=), trackIds must belong to the selected release (GET /track?albumReleaseId=); violations are refused as invalidMappings with no reprocess and no command. Explicit trackIds are PRESERVED into the final command (Lidarr's server-side recomputation is used only when trackIds is omitted) — this is how a corrected track mapping survives reprocessing. An explicit albumReleaseId defaults disableReleaseSwitching to true (native UI behavior; persists as album.AnyReleaseOk=false on import). Candidates with remaining rejections are refused unless that item sets allowRejected=true (the override decision is yours, per candidate). VERIFY BEFORE EXECUTING: Lidarr's suggested artist/album/release/track mapping and rejections are parse guesses, not facts — confirm the album and track list against lidarr_get_albums before authorizing an import. Returns the command id — the import runs asynchronously, so re-check lidarr_get_queue afterwards. Does NOT delete queue items.",
+      description: "Execute a manual import in Lidarr (DESTRUCTIVE: moves/copies media files). Always re-validates from scratch: re-fetches native candidates for the downloadId, resolves each candidateId (fails if a candidate disappeared or is ambiguous), merges only permitted mapping overrides, reprocesses through Lidarr's native POST /manualimport (which recomputes the track mapping server-side), verifies artist/album/release/track/quality mapping against the reprocessed result, then queues Lidarr's native ManualImport command with explicit importMode and replaceExistingFiles. Caller-supplied paths are never accepted — paths come only from native candidates. Overrides follow the native hierarchy artist → album → album release → tracks: a parent override clears the inherited children (the native reprocess resolves supplied ids with precedence AlbumRelease > Album > Artist and no ownership check, so a stale child inherited across a parent change would import), and explicit overrides are validated BEFORE any request — albumId must belong to the effective artist (GET /album/{id}.artistId), albumReleaseId must be a release of the effective album (GET /album/{id} and that album's embedded releases[]), trackIds must belong to the selected release (GET /track?albumReleaseId=); violations are refused as invalidMappings with no reprocess and no command. Explicit trackIds are PRESERVED into the final command (Lidarr's server-side recomputation is used only when trackIds is omitted) — this is how a corrected track mapping survives reprocessing. An explicit albumReleaseId defaults disableReleaseSwitching to true (native UI behavior; persists as album.AnyReleaseOk=false on import). Candidates with remaining rejections are refused unless that item sets allowRejected=true (the override decision is yours, per candidate). VERIFY BEFORE EXECUTING: Lidarr's suggested artist/album/release/track mapping and rejections are parse guesses, not facts — confirm the album and track list against lidarr_get_albums before authorizing an import. Returns the command id — the import runs asynchronously, so re-check lidarr_get_queue afterwards. Does NOT delete queue items.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -1815,6 +1818,21 @@ function assertSonarrSeasonNumber(value: unknown, label: string): void {
   if (value === undefined) return;
   if (typeof value !== "number" || !Number.isInteger(value) || value < 0) {
     throw new Error(`${label} must be a non-negative integer when supplied (season 0 is the Specials season).`);
+  }
+}
+
+/**
+ * Entity ids (seriesId / movieId / artistId) are native database ids: 0,
+ * negatives, and fractions are never valid, and the apps throw on id-0
+ * lookups. Discovery hints bypass the item-level parser, so they need the
+ * same boundary check the preview/execute items already get — refuse before
+ * any native request. `undefined` means "no hint": omit the field, never
+ * send 0 to mean unspecified.
+ */
+function assertPositiveEntityId(value: unknown, label: string): void {
+  if (value === undefined) return;
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`${label} must be a positive integer when supplied (0 is never a valid native id).`);
   }
 }
 
@@ -3203,31 +3221,55 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown) {
   }
 
   const resolved = resolveManualImportCandidates("Lidarr", candidates, items);
-  const mappings = resolved.map(({ candidate, override }) => {
-    const mapping = lidarrEffectiveMapping(candidate, override);
-    return { candidate, override, mapping, dependencyProblems: lidarrDependencyProblems(mapping, override) };
-  });
 
-  const payload = mappings.map(({ candidate, override }) =>
+  // Validate BEFORE reprocessing, mirroring the Sonarr preview's
+  // previewable/unmapped split. A nonexistent explicit albumId/albumReleaseId
+  // makes native Lidarr throw inside GetAlbum/GetRelease during the update,
+  // so an item whose caller-supplied ids are structurally broken is never
+  // POSTed — it is returned as a diagnostic entry instead. Only explicit
+  // override ids are checked; inherited ids came from Lidarr's own mapping.
+  const albumIdentityCache = new Map<number, LidarrAlbumIdentity | null>();
+  const mappings: Array<{
+    candidate: LidarrManualImportCandidate;
+    override: ManualImportOverrideItem;
+    mapping: LidarrEffectiveMapping;
+    dependencyProblems: string[];
+    relationshipValidation: { checked: boolean; ok: boolean; problems: string[] };
+  }> = [];
+  for (const { candidate, override } of resolved) {
+    const mapping = lidarrEffectiveMapping(candidate, override);
+    const dependencyProblems = lidarrDependencyProblems(mapping, override);
+    const relationshipValidation = await validateLidarrRelationships(
+      client, mapping, override, albumIdentityCache,
+    );
+    mappings.push({ candidate, override, mapping, dependencyProblems, relationshipValidation });
+  }
+
+  const previewable = mappings.filter(
+    (m) => m.dependencyProblems.length === 0 && m.relationshipValidation.ok,
+  );
+  const rejected = mappings.filter(
+    (m) => m.dependencyProblems.length > 0 || !m.relationshipValidation.ok,
+  );
+
+  const payload = previewable.map(({ candidate, override }) =>
     buildLidarrUpdateItem(candidate, override, downloadId, replaceExistingFiles),
   );
-  const reprocessed = await client.updateManualImport(payload);
+  const reprocessed = payload.length > 0
+    ? await client.updateManualImport(payload)
+    : [];
   const byId = new Map(reprocessed.map((r) => [r.id, r]));
 
   const releaseTrackCache = new Map<number, LidarrTrack[]>();
-  const albumIdentityCache = new Map<number, LidarrAlbumIdentity | null>();
   const previews: Array<Record<string, unknown>> = [];
   const mismatches: Array<{ candidateId: number; tracksOutsideRelease: number[] }> = [];
-  for (const { candidate, override, mapping, dependencyProblems } of mappings) {
+  for (const { candidate, override, mapping, dependencyProblems, relationshipValidation } of previewable) {
     const r = byId.get(candidate.id);
     if (!r) {
       throw new Error(
         `Lidarr did not return candidate ${candidate.id} after updating; the candidate changed — re-run lidarr_get_manual_import_candidates.`,
       );
     }
-    const relationshipValidation = await validateLidarrRelationships(
-      client, mapping, override, albumIdentityCache,
-    );
     const resolvedTracks = await resolveLidarrTrackIds(client, r, override, releaseTrackCache);
     if (resolvedTracks.releaseTrackMismatch.length > 0) {
       mismatches.push({ candidateId: candidate.id, tracksOutsideRelease: resolvedTracks.releaseTrackMismatch });
@@ -3289,6 +3331,42 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown) {
     });
   }
 
+  // Caller-supplied ids that break the hierarchy are reported, not submitted:
+  // native Lidarr would throw on GetAlbum/GetRelease before the MCP could
+  // diagnose. No effective artist/album names are fabricated for these.
+  for (const { candidate, override, mapping, dependencyProblems, relationshipValidation } of rejected) {
+    previews.push({
+      candidateId: candidate.id,
+      name: candidate.name ?? null,
+      path: candidate.path,
+      canPreview: false,
+      mappingRequired: false,
+      submittedToNativeReprocess: false,
+      artist: null,
+      album: null,
+      albumReleaseId: mapping.albumReleaseId,
+      tracks: [],
+      tracksSource: null,
+      quality: null,
+      mappingOverridesApplied: {
+        artistId: override.artistId ?? null,
+        albumId: override.albumId ?? null,
+        albumReleaseId: override.albumReleaseId ?? null,
+        trackIds: override.trackIds ?? null,
+        artistChanged: mapping.artistChanged,
+        albumChanged: mapping.albumChanged,
+        releaseChanged: mapping.releaseChanged,
+        clearedAlbum: mapping.artistChanged && override.albumId === undefined,
+        clearedAlbumRelease: (mapping.artistChanged || mapping.albumChanged) && override.albumReleaseId === undefined,
+        disableReleaseSwitching: lidarrEffectiveDisableReleaseSwitching(candidate, override),
+      },
+      dependencyProblems,
+      relationshipValidation,
+      mappingValid: false,
+      canExecuteWithoutOverride: false,
+    });
+  }
+
   return {
     verifyBeforeActing: LIDARR_VERIFY_DIRECTIVE,
     downloadId,
@@ -3299,6 +3377,7 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown) {
       "tracksSource=caller-override means your explicit trackIds were validated against the selected album release's track list (GET /track?albumReleaseId=…) and will be used as-is; tracksSource=lidarr-recomputed means Lidarr's server-side mapping is being used.",
       "The mapping is a hierarchy artist → album → album release → tracks: an artistId override clears the inherited album, release and tracks, an albumId override clears the inherited release and tracks, and an albumReleaseId override clears the inherited tracks (native Interactive Import behavior). Supply the full corrected selection below a changed parent — a cleared child is re-identified by Lidarr from the files, and execute refuses an incomplete mapping.",
       "Supplying an explicit albumReleaseId defaults disableReleaseSwitching to true (native UI behavior; it persists as album.AnyReleaseOk=false on import). Set it to false explicitly to keep the album's automatic release selection.",
+      "Items whose explicit ids break the hierarchy (nonexistent album/release, child under a cleared parent) are NOT sent to the native reprocess — Lidarr would throw on the lookup before it could diagnose them. They are returned with canPreview=false, dependencyProblems and relationshipValidation; fix the ids and preview again.",
       ...(mismatches.length > 0
         ? [`Inconsistency surfaced (not authorized): Lidarr's recomputed mapping for ${mismatches.map((m) => `candidate ${m.candidateId} [tracks ${m.tracksOutsideRelease.join(", ")}]`).join("; ")} includes tracks outside the selected release's track query. The caller-override allowlist stays the release list; review the release selection if this is unexpected.`]
         : []),
@@ -3355,7 +3434,7 @@ async function executeLidarrManualImport(client: LidarrClient, args: unknown) {
       invalidMappings,
       guidance: [
         "1. The mapping is a hierarchy: an artistId override clears the inherited album/release/tracks, an albumId override clears the inherited release/tracks, an albumReleaseId override clears the inherited tracks. Supply the full corrected selection below a changed parent.",
-        "2. An explicit albumId must belong to the effective artist (lidarr_get_albums(artistId)); an explicit albumReleaseId must be a release of the effective album (GET /release?albumId=…, shown in the album's releases); explicit trackIds must belong to the selected release.",
+        "2. An explicit albumId must belong to the effective artist (lidarr_get_albums(artistId)); an explicit albumReleaseId must be a release of the effective album (GET /api/v1/album/{albumId} and that album's embedded releases[]); explicit trackIds must belong to the selected release (GET /api/v1/track?albumReleaseId=…).",
         "3. Re-run lidarr_preview_manual_import with the corrected overrides — it reports dependencyProblems and relationshipValidation per item without importing.",
       ],
     });
@@ -3905,6 +3984,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           throw new Error("downloadId is required (from sonarr_get_queue). Candidates are discovered from the tracked download, never from a caller-supplied path.");
         }
         assertSonarrSeasonNumber(a.seasonNumber, "seasonNumber");
+        assertPositiveEntityId(a.seriesId, "seriesId");
         const candidates = await clients.sonarr.getManualImportCandidates({
           downloadId: a.downloadId.trim(),
           seriesId: a.seriesId,
@@ -4268,6 +4348,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (typeof a.downloadId !== "string" || a.downloadId.trim() === "") {
           throw new Error("downloadId is required (from radarr_get_queue). Candidates are discovered from the tracked download, never from a caller-supplied path.");
         }
+        assertPositiveEntityId(a.movieId, "movieId");
         const candidates = await clients.radarr.getManualImportCandidates({
           downloadId: a.downloadId.trim(),
           movieId: a.movieId,
@@ -4387,6 +4468,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         if (typeof a.downloadId !== "string" || a.downloadId.trim() === "") {
           throw new Error("downloadId is required (from lidarr_get_queue). Candidates are discovered from the tracked download, never from a caller-supplied path.");
         }
+        assertPositiveEntityId(a.artistId, "artistId");
         const candidates = await clients.lidarr.getManualImportCandidates({
           downloadId: a.downloadId.trim(),
           artistId: a.artistId,

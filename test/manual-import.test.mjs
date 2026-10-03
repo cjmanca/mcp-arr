@@ -1705,6 +1705,63 @@ test("seasonNumber discovery hint is validated before the native discovery reque
   });
 });
 
+// --- 23. discovery entity hints: positive integers only, refused before any
+//         native request (the item-level parser does not see these) ---------
+
+test("discovery entity hints (seriesId/movieId/artistId) must be positive integers, refused before any native request", async () => {
+  const cases = [
+    { tool: "sonarr_get_manual_import_candidates", key: "seriesId", downloadId: SONARR_DOWNLOAD_ID, log: "sonarr", path: "/api/v3/manualimport" },
+    { tool: "radarr_get_manual_import_candidates", key: "movieId", downloadId: "dl-11", log: "radarr", path: "/api/v3/manualimport" },
+    { tool: "lidarr_get_manual_import_candidates", key: "artistId", downloadId: LIDARR_DOWNLOAD_ID, log: "lidarr", path: "/api/v1/manualimport" },
+  ];
+  await withServers({}, async (port, logs) => {
+    for (const c of cases) {
+      for (const bad of [0, -1, 1.5, "5", null, NaN]) {
+        const refused = await callTool(port, c.tool, { downloadId: c.downloadId, [c.key]: bad });
+        assert.equal(refused.isError, true, `${c.key}=${JSON.stringify(bad)} must be refused`);
+        assert.match(refused.text, new RegExp(`${c.key} must be a positive integer`));
+      }
+      assert.equal(
+        requestsTo(logs[c.log], "GET", c.path).length, 0,
+        `a refused ${c.key} hint must produce zero native discovery requests`,
+      );
+
+      const accepted = await callTool(port, c.tool, { downloadId: c.downloadId, [c.key]: 5 });
+      assert.equal(accepted.isError, false, accepted.text);
+
+      // Omitted stays valid — 0 is never used to mean "unspecified".
+      const omitted = await callTool(port, c.tool, { downloadId: c.downloadId });
+      assert.equal(omitted.isError, false, omitted.text);
+    }
+    assert.equal(requestsTo(logs.sonarr, "GET", "/api/v3/manualimport").length, 2, "only the valid-hint and omitted calls reached Sonarr");
+    assert.equal(requestsTo(logs.radarr, "GET", "/api/v3/manualimport").length, 2);
+    assert.equal(requestsTo(logs.lidarr, "GET", "/api/v1/manualimport").length, 2);
+  });
+});
+
+test("discovery hint schemas expose integer + minimum 1", async () => {
+  await withServers({}, async (port) => {
+    const response = await postMcp(port, { jsonrpc: "2.0", id: 9, method: "tools/list", params: {} });
+    assert.equal(response.status, 200);
+    const body = await mcpEnvelope(response);
+    const tools = Object.fromEntries(body.result.tools.map((t) => [t.name, t]));
+    const checks = [
+      ["sonarr_get_manual_import_candidates", "seriesId"],
+      ["radarr_get_manual_import_candidates", "movieId"],
+      ["lidarr_get_manual_import_candidates", "artistId"],
+    ];
+    for (const [tool, field] of checks) {
+      const schema = tools[tool].inputSchema.properties[field];
+      assert.equal(schema.type, "integer", `${tool}.${field} must be typed integer`);
+      assert.equal(schema.minimum, 1, `${tool}.${field} must declare minimum 1`);
+    }
+    // Sonarr's seasonNumber keeps its own >= 0 rule (0 is the Specials season).
+    const season = tools["sonarr_get_manual_import_candidates"].inputSchema.properties.seasonNumber;
+    assert.equal(season.type, "integer");
+    assert.equal(season.minimum, 0, "seasonNumber is NOT constrained to >= 1 — 0 is a real season");
+  });
+});
+
 test("seasonNumber 0 (Specials) and 6 are accepted", async () => {
   await withServers({ reprocessRejections: [] }, async (port) => {
     const specials = await callTool(port, "sonarr_preview_manual_import", {
@@ -2127,6 +2184,96 @@ test("an unchanged candidate keeps its native mapping with no relationship looku
     assert.equal(item.mappingOverridesApplied.disableReleaseSwitching, false, "no explicit release selection, so no release-switching change");
     assert.equal(requestsTo(logs.lidarr, "GET", "/api/v1/release").length, 0, "no validation lookups for an unmodified candidate");
     assert.equal(logs.lidarr.filter((r) => r.method === "GET" && r.path.startsWith("/api/v1/album/")).length, 0);
+  });
+});
+
+// --- 24. Lidarr preview validates BEFORE the native reprocess --------------
+//
+// A nonexistent explicit albumId/albumReleaseId makes native Lidarr throw
+// inside GetAlbum/GetRelease during POST /manualimport, before the MCP can
+// diagnose. Preview is diagnostic: such items are reported, not submitted.
+
+test("preview of a nonexistent albumId: diagnostic entry, never POSTed to /manualimport", async () => {
+  await withServers({}, async (port, logs) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333, albumId: 999999 }],
+    });
+    assert.equal(preview.isError, false, "preview stays a diagnostic operation");
+    const item = preview.payload.items[0];
+    assert.equal(item.canPreview, false);
+    assert.equal(item.submittedToNativeReprocess, false);
+    assert.equal(item.mappingValid, false);
+    assert.equal(item.relationshipValidation.ok, false);
+    assert.match(JSON.stringify(item.relationshipValidation.problems), /album 999999 could not be fetched/);
+    assert.equal(item.album, null, "no fabricated album identity for a failed lookup");
+    assert.equal(item.artist, null);
+
+    const posts = requestsTo(logs.lidarr, "POST", "/api/v1/manualimport");
+    assert.equal(posts.length, 0, "the invalid item must not be sent to the native reprocess");
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0);
+  });
+});
+
+test("preview of a nonexistent albumReleaseId: diagnostic entry, never POSTed to /manualimport", async () => {
+  await withServers({}, async (port, logs) => {
+    // Album 9 exists; release 999999 is not one of its releases.
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333, albumReleaseId: 999999 }],
+    });
+    assert.equal(preview.isError, false, preview.text);
+    const item = preview.payload.items[0];
+    assert.equal(item.canPreview, false);
+    assert.equal(item.relationshipValidation.ok, false);
+    assert.match(JSON.stringify(item.relationshipValidation.problems), /album release 999999 is not a release of album 9/);
+
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/manualimport").length, 0, "the invalid item must not be reprocessed");
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0);
+  });
+});
+
+test("mixed preview: valid candidate reprocessed, invalid one reported diagnostically", async () => {
+  const second = { ...LIDARR_CANDIDATE, id: 335, path: "/downloads/complete/Some.Artist/Some.Artist - Some Album/02 - Track Two.flac" };
+  await withServers({ lidarrCandidates: [LIDARR_CANDIDATE, second] }, async (port, logs) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [
+        { candidateId: 333, albumId: 9, albumReleaseId: 77, trackIds: [501] }, // valid
+        { candidateId: 335, albumId: 999999 },                                  // invalid
+      ],
+    });
+    assert.equal(preview.isError, false, preview.text);
+    assert.equal(preview.payload.count, 2, "both candidates are reported");
+
+    const byId = Object.fromEntries(preview.payload.items.map((i) => [i.candidateId, i]));
+    assert.equal(byId[333].canPreview, true, "the valid item gets a normal native preview");
+    assert.equal(byId[333].mappingValid, true);
+    assert.equal(byId[335].canPreview, false, "the invalid item is diagnostic, not submitted");
+    assert.equal(byId[335].relationshipValidation.ok, false);
+
+    const posts = requestsTo(logs.lidarr, "POST", "/api/v1/manualimport");
+    assert.equal(posts.length, 1, "exactly one reprocess request");
+    assert.deepEqual(posts[0].body.map((i) => i.id), [333], "only the valid candidate reaches the native endpoint");
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0, "preview never imports");
+  });
+});
+
+test("preview reports an existing-but-incoherent mapping diagnostically without submitting it", async () => {
+  await withServers({}, async (port, logs) => {
+    // Artist 6 + album 9 (belongs to artist 5): both ids exist, the pairing
+    // does not. Reported before reprocess, so nothing is submitted.
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333, artistId: 6, albumId: 9, albumReleaseId: 77, trackIds: [501] }],
+    });
+    assert.equal(preview.isError, false, preview.text);
+    const item = preview.payload.items[0];
+    assert.equal(item.canPreview, false);
+    assert.equal(item.relationshipValidation.ok, false);
+    assert.match(JSON.stringify(item.relationshipValidation.problems), /belongs to artist 5, not the effective artist 6/);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/manualimport").length, 0, "not submitted");
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0);
   });
 });
 
