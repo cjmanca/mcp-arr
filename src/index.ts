@@ -1916,6 +1916,16 @@ function assertPositiveEntityId(value: unknown, label: string): void {
 }
 
 /**
+ * Lidarr's native default for filterExistingFiles is true ("Unmapped Files
+ * Only"); only an explicit false ("All Files") changes it. Shared by the
+ * preview/execute argument parser and the preview dedup fingerprint so an
+ * omitted flag and an explicit true resolve to the same candidate policy.
+ */
+function resolvedLidarrFilterExistingFiles(value: unknown): boolean {
+  return value !== false;
+}
+
+/**
  * Shared argument parsing for the six preview/execute tools.
  *
  * `service` scopes the Sonarr-specific checks: `seasonNumber` is a Sonarr
@@ -1999,7 +2009,7 @@ function parseManualImportArgs(args: unknown, service: "sonarr" | "radarr" | "li
     //   true (default) = Unmapped Files Only
     //   false          = All Files
     // Normalize so preview/execute re-fetch with an explicit, consistent value.
-    filterExistingFiles: a.filterExistingFiles !== false,
+    filterExistingFiles: resolvedLidarrFilterExistingFiles(a.filterExistingFiles),
   };
 }
 
@@ -4153,8 +4163,17 @@ function previewFingerprint(service: "sonarr" | "radarr" | "lidarr", args: unkno
     items,
     replaceExistingFiles: a.replaceExistingFiles === true,
   };
-  for (const k of ["seriesId", "seasonNumber", "movieId", "artistId", "filterExistingFiles"] as const) {
+  for (const k of ["seriesId", "seasonNumber", "movieId", "artistId"] as const) {
     if (a[k] !== undefined) norm[k] = a[k];
+  }
+  // Lidarr resolves filterExistingFiles itself (omitted == true), so the
+  // fingerprint must resolve it the same way: an omitted flag and an explicit
+  // true are the same candidate policy and deduplicate together. Sonarr/Radarr
+  // keep the prior behavior — the key is only present when explicitly supplied.
+  if (service === "lidarr") {
+    norm.filterExistingFiles = resolvedLidarrFilterExistingFiles(a.filterExistingFiles);
+  } else if (a.filterExistingFiles !== undefined) {
+    norm.filterExistingFiles = a.filterExistingFiles;
   }
   return JSON.stringify(norm);
 }

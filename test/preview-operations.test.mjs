@@ -507,6 +507,51 @@ test("an identical preview while one is running deduplicates to the same operati
   );
 });
 
+// Lidarr resolves filterExistingFiles itself (omitted == true = "Unmapped
+// Files Only"), so an omitted flag and an explicit true are the same candidate
+// policy and must deduplicate to the same active operation.
+test("lidarr preview deduplicates omitted filterExistingFiles against explicit true", async () => {
+  await withServers(
+    { PREVIEW_SYNC_BUDGET_MS: "200", PREVIEW_MAX_RUNTIME_MS: "20000", OPERATION_RESULT_TTL_MS: "600000" },
+    { lidarrUpdateDelay: 1500 },
+    async (port, logs) => {
+      const first = await callTool(port, "lidarr_preview_manual_import", LIDARR_PREVIEW_ARGS);
+      assert.equal(first.payload.status, "running");
+      const second = await callTool(port, "lidarr_preview_manual_import", {
+        ...LIDARR_PREVIEW_ARGS,
+        filterExistingFiles: true,
+      });
+      assert.equal(second.payload.status, "running");
+      assert.equal(second.payload.operationId, first.payload.operationId, "omitted and explicit true share one operationId");
+      assert.equal(second.payload.deduplicated, true, "the semantically identical preview deduplicates");
+      const posts = requestsTo(logs.lidarr, "POST", "/api/v1/manualimport");
+      assert.equal(posts.length, 1, "only one native preview workload started");
+      const gets = requestsTo(logs.lidarr, "GET", "/api/v1/manualimport");
+      assert.equal(gets.length, 1, "only one native candidate discovery ran");
+    },
+  );
+});
+
+// The inverse: filterExistingFiles=false ("All Files") is a different candidate
+// set, so it must NOT deduplicate against the omitted/true policy.
+test("lidarr preview does not deduplicate filterExistingFiles=false against omitted/true", async () => {
+  await withServers(
+    { PREVIEW_SYNC_BUDGET_MS: "200", PREVIEW_MAX_RUNTIME_MS: "20000", OPERATION_RESULT_TTL_MS: "600000" },
+    { lidarrUpdateDelay: 1500 },
+    async (port) => {
+      const first = await callTool(port, "lidarr_preview_manual_import", LIDARR_PREVIEW_ARGS);
+      assert.equal(first.payload.status, "running");
+      const second = await callTool(port, "lidarr_preview_manual_import", {
+        ...LIDARR_PREVIEW_ARGS,
+        filterExistingFiles: false,
+      });
+      assert.equal(second.payload.status, "running");
+      assert.notEqual(second.payload.operationId, first.payload.operationId, "false is a distinct candidate policy — a new operation");
+      assert.notEqual(second.payload.deduplicated, true, "false does not deduplicate against omitted/true");
+    },
+  );
+});
+
 // --- J. Completed preview is NOT reused as fresh authority -----------------
 
 test("a completed preview is not reused: re-running re-fetches native state and starts a new operation", async () => {
