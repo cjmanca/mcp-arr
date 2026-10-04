@@ -1163,7 +1163,7 @@ if (clients.lidarr) {
     },
     {
       name: "lidarr_get_manual_import_candidates",
-      description: "Discover Lidarr's native manual-import candidates for a tracked download (read-only). Lidarr resolves the download location from the downloadId — never supply a path. Returns each candidate's candidateId (the native manual-import resource id), display path, quality, mapped artist/album/albumReleaseId/tracks, additionalFile/replaceExistingFiles/disableReleaseSwitching flags, and structured native rejections normalized as {reason, type} — Lidarr may serialize an empty rejection object, which is represented as null reason/type rather than discarded. An untracked downloadId yields an empty list. Use lidarr_get_queue first to find the downloadId. Workflow: get candidates -> preview corrected mapping if needed -> execute manual import -> re-check queue.",
+      description: "Discover Lidarr's native manual-import candidates for a tracked download (read-only). Lidarr resolves the download location from the downloadId — never supply a path. Returns each candidate's candidateId (the native manual-import resource id), display path, quality, mapped artist/album/albumReleaseId/tracks, additionalFile/replaceExistingFiles/disableReleaseSwitching flags, and structured native rejections normalized as {reason, type} — Lidarr may serialize an empty rejection object, which is represented as null reason/type rather than discarded. An untracked downloadId yields an empty list. Use lidarr_get_queue first to find the downloadId. Workflow: get candidates -> preview corrected mapping if needed -> execute manual import -> re-check queue. Two independent options govern existing files: filterExistingFiles is a CANDIDATE VISIBILITY / DISCOVERY FILTER only, while replaceExistingFiles is the EXISTING LIBRARY FILE POLICY (destructive on execute). Choose both before discovery and use the same values for discovery, preview and execute; re-run this tool after changing either.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -1178,11 +1178,11 @@ if (clients.lidarr) {
           },
           filterExistingFiles: {
             type: "boolean",
-            description: "Filter to files matching the tracked release (native filterExistingFiles, default: true)",
+            description: "CANDIDATE VISIBILITY / DISCOVERY FILTER (NOT the existing-library-file policy — that is replaceExistingFiles). Native Lidarr file-list filter. true (default) = UI 'Unmapped Files Only': omit unchanged files Lidarr already knows and has mapped to tracks. false = UI 'All Files': include those files in manual-import discovery too. This only controls which files are discovered — it does NOT delete, replace, or authorize replacement of files. Use the same value for discovery, preview and execute.",
           },
           replaceExistingFiles: {
             type: "boolean",
-            description: "Native replaceExistingFiles discovery option (default: false, matching the Interactive Import UI)",
+            description: "EXISTING LIBRARY FILE POLICY / DESTRUCTIVE EXECUTION BEHAVIOR (NOT the discovery filter — that is filterExistingFiles). Native Lidarr existing-file policy used while discovering/analyzing candidates. false (default) = UI 'Combine with existing files': no album-wide pre-delete. true = UI 'Replace Existing Files' / 'Existing files will be deleted': analyze the import as a replacement operation. On actual execute, Lidarr removes ALL existing track files for each affected album before importing the selected new files. DESTRUCTIVE ON EXECUTE — a partial selection or failed import can leave the album missing files. This discovery tool itself stays read-only. Use the same value for discovery, preview and execute.",
           },
         },
         required: ["downloadId"],
@@ -1190,7 +1190,7 @@ if (clients.lidarr) {
     },
     {
       name: "lidarr_preview_manual_import",
-      description: "Preview (update/reprocess) a manual import in Lidarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (artistId/albumId/albumReleaseId/trackIds/disableReleaseSwitching), sends Lidarr's native POST /manualimport update, and returns the resulting mapping and rejections. IMPORTANT Lidarr semantics: the backend re-runs its import decision with the artist/album/release overrides and RECOMPUTES the track mapping itself — the native update endpoint drops the resource's Tracks/TrackIds when building the item. Supplied trackIds are validated against the selected album release's track list (GET /track?albumReleaseId=…) and PRESERVED: the preview response shows exactly the tracks that lidarr_execute_manual_import will import (tracksSource marks caller-override vs lidarr-recomputed). The mapping is a hierarchy artist → album → album release → tracks: an artistId override clears the inherited album/release/tracks, an albumId override clears the inherited release/tracks, an albumReleaseId override clears the inherited tracks (native Interactive Import behavior — the native reprocess resolves supplied ids with precedence AlbumRelease > Album > Artist and NO ownership check, so the MCP clears dependents and validates explicit overrides: albumId→artist via GET /album/{id}.artistId, albumReleaseId→album via GET /album/{id} and that album's embedded releases[], trackIds→release via GET /track?albumReleaseId=). Items whose explicit ids break the hierarchy are reported with canPreview=false and are NOT sent to the native reprocess (Lidarr throws on the lookup first). mappingOverridesApplied reports which inherited children a parent change cleared; dependencyProblems/relationshipValidation report a broken hierarchy. An explicit albumReleaseId defaults disableReleaseSwitching to true (native UI; persists as album.AnyReleaseOk=false on import) — set it false explicitly to keep automatic release selection. Non-destructive: never moves, copies, or imports files. Normally returns the result directly; if native analysis takes longer than the synchronous response budget, it returns a running operationId handle instead — poll arr_get_operation at the indicated interval rather than starting a duplicate preview.",
+      description: "Preview (update/reprocess) a manual import in Lidarr WITHOUT importing anything. Re-fetches the native candidates for the downloadId, resolves each candidateId, merges only the supplied mapping overrides (artistId/albumId/albumReleaseId/trackIds/disableReleaseSwitching), sends Lidarr's native POST /manualimport update, and returns the resulting mapping and rejections. IMPORTANT Lidarr semantics: the backend re-runs its import decision with the artist/album/release overrides and RECOMPUTES the track mapping itself — the native update endpoint drops the resource's Tracks/TrackIds when building the item. Supplied trackIds are validated against the selected album release's track list (GET /track?albumReleaseId=…) and PRESERVED: the preview response shows exactly the tracks that lidarr_execute_manual_import will import (tracksSource marks caller-override vs lidarr-recomputed). The mapping is a hierarchy artist → album → album release → tracks: an artistId override clears the inherited album/release/tracks, an albumId override clears the inherited release/tracks, an albumReleaseId override clears the inherited tracks (native Interactive Import behavior — the native reprocess resolves supplied ids with precedence AlbumRelease > Album > Artist and NO ownership check, so the MCP clears dependents and validates explicit overrides: albumId→artist via GET /album/{id}.artistId, albumReleaseId→album via GET /album/{id} and that album's embedded releases[], trackIds→release via GET /track?albumReleaseId=). Items whose explicit ids break the hierarchy are reported with canPreview=false and are NOT sent to the native reprocess (Lidarr throws on the lookup first). mappingOverridesApplied reports which inherited children a parent change cleared; dependencyProblems/relationshipValidation report a broken hierarchy. An explicit albumReleaseId defaults disableReleaseSwitching to true (native UI; persists as album.AnyReleaseOk=false on import) — set it false explicitly to keep automatic release selection. Non-destructive: never moves, copies, or imports files. Normally returns the result directly; if native analysis takes longer than the synchronous response budget, it returns a running operationId handle instead — poll arr_get_operation at the indicated interval rather than starting a duplicate preview. IMPORTANT existing-file policy: replaceExistingFiles=false (default) = UI 'Combine with existing files' (no album-wide pre-delete); replaceExistingFiles=true = UI 'Replace Existing Files' / 'Existing files will be deleted'. Preview does NOT delete anything, but when true it asks Lidarr to reprocess the candidate under the same replacement semantics execute will use; actual execute with true deletes ALL existing track files for each affected album before importing the selected replacement files. filterExistingFiles is a separate discovery-visibility filter (Unmapped Files Only / All Files) and does not control replacement.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -1223,11 +1223,11 @@ if (clients.lidarr) {
                 trackIds: {
                   type: "array",
                   items: { type: "number" },
-                  description: "Explicit track mapping override: validated against the selected album release's track list and preserved into the preview result (and the eventual command). Omit to use Lidarr's server-side recomputed tracks.",
+                  description: "Explicit track mapping override: validated against the selected album release's track list (GET /track?albumReleaseId=…). If supplied, these exact track IDs become the final command mapping after validation; if omitted, Lidarr's server-side recomputed track mapping is used. Do not supply trackIds merely to silence a rejection — they determine which library tracks the file attaches to. Tracks from other releases of the same album are refused.",
                 },
                 disableReleaseSwitching: {
                   type: "boolean",
-                  description: "Turn off the album's automatic release selection (native disableReleaseSwitching; persists as album.AnyReleaseOk=false on import). Defaults to true when an albumReleaseId is supplied explicitly — set false to keep automatic selection.",
+                  description: "Album-release policy. true = disable Lidarr's automatic release switching for this album; on import this persists by setting album.AnyReleaseOk=false, so it changes future album behavior — NOT only a one-import preference. false = keep automatic release switching allowed. When albumReleaseId is explicitly overridden, MCP/native Interactive Import semantics default this to true; set false explicitly to choose the release for this import without persistently disabling automatic switching.",
                 },
               },
               required: ["candidateId"],
@@ -1235,7 +1235,11 @@ if (clients.lidarr) {
           },
           replaceExistingFiles: {
             type: "boolean",
-            description: "Consider replacing existing track files during reprocessing (default: false, matching the Interactive Import UI)",
+            description: "EXISTING LIBRARY FILE POLICY (NOT the discovery filter — that is filterExistingFiles). Preview is non-destructive: it MODELS this policy, it does not perform it. false (default) = UI 'Combine with existing files': no album-wide pre-delete. true = UI 'Replace Existing Files' / 'Existing files will be deleted': reprocess the candidate under the same replacement semantics execute will use. On execute, true deletes ALL existing track files for each affected album before importing the selected files. Use the same value for discovery, preview and execute.",
+          },
+          filterExistingFiles: {
+            type: "boolean",
+            description: "CANDIDATE VISIBILITY / DISCOVERY FILTER (NOT the existing-library-file policy — that is replaceExistingFiles). true (default) = UI 'Unmapped Files Only': omit unchanged files Lidarr already knows and has mapped to tracks. false = UI 'All Files': include those files as candidates too. Discovery only — it does NOT delete, replace, or authorize replacement. Pass the same value used for discovery so preview re-fetches the identical candidate set.",
           },
         },
         required: ["downloadId", "items"],
@@ -1243,7 +1247,7 @@ if (clients.lidarr) {
     },
     {
       name: "lidarr_execute_manual_import",
-      description: "Execute a manual import in Lidarr (DESTRUCTIVE: moves/copies media files). Always re-validates from scratch: re-fetches native candidates for the downloadId, resolves each candidateId (fails if a candidate disappeared or is ambiguous), merges only permitted mapping overrides, reprocesses through Lidarr's native POST /manualimport (which recomputes the track mapping server-side), verifies artist/album/release/track/quality mapping against the reprocessed result, then queues Lidarr's native ManualImport command with explicit importMode and replaceExistingFiles. Caller-supplied paths are never accepted — paths come only from native candidates. Overrides follow the native hierarchy artist → album → album release → tracks: a parent override clears the inherited children (the native reprocess resolves supplied ids with precedence AlbumRelease > Album > Artist and no ownership check, so a stale child inherited across a parent change would import), and explicit overrides are validated BEFORE any request — albumId must belong to the effective artist (GET /album/{id}.artistId), albumReleaseId must be a release of the effective album (GET /album/{id} and that album's embedded releases[]), trackIds must belong to the selected release (GET /track?albumReleaseId=); violations are refused as invalidMappings with no reprocess and no command. Explicit trackIds are PRESERVED into the final command (Lidarr's server-side recomputation is used only when trackIds is omitted) — this is how a corrected track mapping survives reprocessing. An explicit albumReleaseId defaults disableReleaseSwitching to true (native UI behavior; persists as album.AnyReleaseOk=false on import). Candidates with remaining rejections are refused unless that item sets allowRejected=true (the override decision is yours, per candidate). VERIFY BEFORE EXECUTING: Lidarr's suggested artist/album/release/track mapping and rejections are parse guesses, not facts — confirm the album and track list against lidarr_get_albums before authorizing an import. Returns the command id — the import runs asynchronously, so re-check lidarr_get_queue afterwards. Does NOT delete queue items.",
+      description: "Execute a manual import in Lidarr (DESTRUCTIVE: moves/copies media files). Always re-validates from scratch: re-fetches native candidates for the downloadId, resolves each candidateId (fails if a candidate disappeared or is ambiguous), merges only permitted mapping overrides, reprocesses through Lidarr's native POST /manualimport (which recomputes the track mapping server-side), verifies artist/album/release/track/quality mapping against the reprocessed result, then queues Lidarr's native ManualImport command with explicit importMode and replaceExistingFiles. Caller-supplied paths are never accepted — paths come only from native candidates. Overrides follow the native hierarchy artist → album → album release → tracks: a parent override clears the inherited children (the native reprocess resolves supplied ids with precedence AlbumRelease > Album > Artist and no ownership check, so a stale child inherited across a parent change would import), and explicit overrides are validated BEFORE any request — albumId must belong to the effective artist (GET /album/{id}.artistId), albumReleaseId must be a release of the effective album (GET /album/{id} and that album's embedded releases[]), trackIds must belong to the selected release (GET /track?albumReleaseId=); violations are refused as invalidMappings with no reprocess and no command. Explicit trackIds are PRESERVED into the final command (Lidarr's server-side recomputation is used only when trackIds is omitted) — this is how a corrected track mapping survives reprocessing. An explicit albumReleaseId defaults disableReleaseSwitching to true (native UI behavior; persists as album.AnyReleaseOk=false on import). Candidates with remaining rejections are refused unless that item sets allowRejected=true (the override decision is yours, per candidate). VERIFY BEFORE EXECUTING: Lidarr's suggested artist/album/release/track mapping and rejections are parse guesses, not facts — confirm the album and track list against lidarr_get_albums before authorizing an import. Returns the command id — the import runs asynchronously, so re-check lidarr_get_queue afterwards. Does NOT delete queue items. EXISTING-FILE POLICY: replaceExistingFiles=false (default) = UI 'Combine with existing files' (no album-wide pre-delete); replaceExistingFiles=true = UI 'Replace Existing Files' / 'Existing files will be deleted' — DESTRUCTIVE: before importing, Lidarr removes ALL currently imported track files for EACH affected album (not only the selected tracks), so a partial selection or import failure can leave the album missing files. importMode=copy does NOT neutralize this. filterExistingFiles is a separate discovery-visibility filter (Unmapped Files Only / All Files), not a replacement control.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -1276,15 +1280,15 @@ if (clients.lidarr) {
                 trackIds: {
                   type: "array",
                   items: { type: "number" },
-                  description: "Explicit track mapping override: validated strictly against the selected album release's track list (GET /track?albumReleaseId=…) and used as-is in the final ManualImport command. Tracks from other releases of the same album are refused. Omit to use Lidarr's server-side recomputed tracks.",
+                  description: "Explicit track mapping override: validated strictly against the selected album release's track list (GET /track?albumReleaseId=…) and used as-is in the final ManualImport command. If supplied, these exact track IDs become the final command mapping after validation; if omitted, Lidarr's server-side recomputed track mapping is used. Do not supply trackIds merely to silence a rejection — they determine which library tracks the file attaches to. Tracks from other releases of the same album are refused.",
                 },
                 disableReleaseSwitching: {
                   type: "boolean",
-                  description: "Turn off the album's automatic release selection (native disableReleaseSwitching; persists as album.AnyReleaseOk=false on import). Defaults to true when an albumReleaseId is supplied explicitly — set false to keep automatic selection.",
+                  description: "Album-release policy. true = disable Lidarr's automatic release switching for this album; on import this persists by setting album.AnyReleaseOk=false, so it changes future album behavior — NOT only a one-import preference. false = keep automatic release switching allowed. When albumReleaseId is explicitly overridden, MCP/native Interactive Import semantics default this to true; set false explicitly to choose the release for this import without persistently disabling automatic switching.",
                 },
                 allowRejected: {
                   type: "boolean",
-                  description: "Import THIS candidate even when Lidarr reports remaining rejections for it (default: false). Only set true after reasoning about each rejection from the preview result.",
+                  description: "Bypass Lidarr's remaining NATIVE IMPORT REJECTIONS for THIS candidate only (default false). This does NOT bypass MCP mapping safety: artist/album/release ownership checks, track-release validation, duplicate track ownership, candidate-id ambiguity, and other MCP hard validations still apply. Set true only after previewing and understanding each rejection.",
                 },
               },
               required: ["candidateId"],
@@ -1293,11 +1297,15 @@ if (clients.lidarr) {
           importMode: {
             type: "string",
             enum: ["auto", "copy", "move"],
-            description: "Import mode sent explicitly to Lidarr's ManualImport command (default: auto, matching queue-driven Interactive Import)",
+            description: "Import mode sent explicitly to Lidarr's ManualImport command (default: auto). auto = native Lidarr automatic behavior: for a tracked download it moves when the download client allows moving, otherwise copies. copy = import via Lidarr's copy/hardlink behavior, keeping the incoming download source. move = force move: the source file is moved into the library rather than retained at the download location (choose carefully for downloads that must keep seeding). importMode=copy does NOT make replaceExistingFiles=true non-destructive — the album's old library files are still removed first.",
           },
           replaceExistingFiles: {
             type: "boolean",
-            description: "Allow the import to replace existing track files (default: false — the safer non-destructive behavior used by the Interactive Import UI)",
+            description: "EXISTING LIBRARY FILE POLICY / DESTRUCTIVE EXECUTION BEHAVIOR (NOT the discovery filter — that is filterExistingFiles). false (default) = Lidarr UI 'Combine with existing files': no album-wide pre-delete; incoming files are combined with the album's existing files, subject to normal per-track import/upgrade behavior. true = Lidarr UI 'Replace Existing Files' / 'Existing files will be deleted': DESTRUCTIVE. Before importing the selected candidates, Lidarr removes ALL existing track files for EACH affected album, not only files for the selected tracks. A partial selection or later import failure can therefore leave the album missing files. importMode=copy does NOT neutralize this. Do not set true merely because some target tracks already have files.",
+          },
+          filterExistingFiles: {
+            type: "boolean",
+            description: "CANDIDATE VISIBILITY / DISCOVERY FILTER (NOT the existing-library-file policy — that is replaceExistingFiles). true (default) = UI 'Unmapped Files Only': omit unchanged files Lidarr already knows and has mapped to tracks. false = UI 'All Files': include those files as candidates too. Discovery only — it does NOT delete, replace, or authorize replacement. Pass the same value used for discovery/preview so execute re-fetches the identical candidate set.",
           },
         },
         required: ["downloadId", "items"],
@@ -1918,6 +1926,7 @@ function parseManualImportArgs(args: unknown, service: "sonarr" | "radarr" | "li
   items: ManualImportOverrideItem[];
   importMode: ManualImportMode;
   replaceExistingFiles: boolean;
+  filterExistingFiles: boolean;
 } {
   const a = (args ?? {}) as ManualImportToolArgs;
   if (typeof a.downloadId !== "string" || a.downloadId.trim() === "") {
@@ -1981,7 +1990,16 @@ function parseManualImportArgs(args: unknown, service: "sonarr" | "radarr" | "li
     importMode,
     // Lidarr's Interactive Import UI defaults replaceExistingFiles to false
     // (the safer, non-destructive behavior); match it.
+    // Native UI mapping:
+    //   false = Combine with existing files
+    //   true  = Replace Existing Files / existing files will be deleted
     replaceExistingFiles: a.replaceExistingFiles === true,
+    // filterExistingFiles is the candidate-visibility filter, independent of
+    // the replacement policy above. Native UI mapping:
+    //   true (default) = Unmapped Files Only
+    //   false          = All Files
+    // Normalize so preview/execute re-fetch with an explicit, consistent value.
+    filterExistingFiles: a.filterExistingFiles !== false,
   };
 }
 
@@ -2136,6 +2154,48 @@ const LIDARR_VERIFY_DIRECTIVE = [
   "Before recommending execute — especially before setting allowRejected=true — independently VERIFY the mapping (lidarr_get_artists / lidarr_get_albums): artist, album title, year/edition, and the track list must plausibly correspond to the files. Do not treat the suggested mapping as fact.",
 ];
 
+/**
+ * Machine-readable summary of the EXISTING LIBRARY FILE policy for a Lidarr
+ * manual-import call. Agents have inverted the native boolean semantics, so the
+ * UI label and destructive scope are spelled out alongside the raw flag.
+ * Native Interactive Import mapping:
+ *   false = "Combine with existing files" (no album-wide pre-delete)
+ *   true  = "Replace Existing Files" / "Existing files will be deleted"
+ *           (Lidarr removes ALL existing track files for each affected album
+ *            before importing the selected files)
+ */
+function lidarrExistingFilesPolicy(replaceExistingFiles: boolean) {
+  return replaceExistingFiles
+    ? {
+        replaceExistingFiles: true,
+        lidarrUiMode: "Replace Existing Files",
+        uiWarning: "Existing files will be deleted",
+        albumWidePreDelete: true,
+        scope: "all existing track files for each affected album",
+        warning: "Existing album files are removed before new files are imported; partial selection or import failure can leave missing files.",
+      }
+    : {
+        replaceExistingFiles: false,
+        lidarrUiMode: "Combine with existing files",
+        albumWidePreDelete: false,
+      };
+}
+
+/**
+ * Machine-readable summary of the CANDIDATE VISIBILITY / DISCOVERY filter.
+ * This is a separate axis from replaceExistingFiles: it only decides which
+ * files appear as candidates, never whether library files are deleted.
+ * Native Interactive Import mapping:
+ *   true (default) = "Unmapped Files Only"
+ *   false          = "All Files"
+ */
+function lidarrCandidateFilterPolicy(filterExistingFiles: boolean) {
+  return {
+    filterExistingFiles,
+    lidarrUiMode: filterExistingFiles ? "Unmapped Files Only" : "All Files",
+  };
+}
+
 function manualImportGuidance(service: string, downloadId: string) {
   const lines = [
     `Preview is non-importing: nothing has been moved, copied, or imported.`,
@@ -2147,6 +2207,11 @@ function manualImportGuidance(service: string, downloadId: string) {
   if (service === "sonarr") {
     lines.push(
       "A per-file native Custom Format rejection is NOT sufficient evidence to remove/blocklist the tracked release: blocklisting acts on the whole release, so weigh the release-level CF provenance in upgradeAssessment.customFormatAssessment first. This tool never removes or blocklists queue items.",
+    );
+  }
+  if (service === "lidarr") {
+    lines.push(
+      "Before execute, choose the existing-file policy deliberately: Combine (replaceExistingFiles=false, default) does no album-wide deletion; Replace (replaceExistingFiles=true) is DESTRUCTIVE — Lidarr removes ALL existing files for each affected album before importing the selected new files, so a partial selection or import failure can leave the album missing files. Do not infer replacement from filterExistingFiles (that flag only controls candidate visibility). Use the same filterExistingFiles/replaceExistingFiles for discovery, preview and execute; re-discover candidates after changing either.",
     );
   }
   return lines;
@@ -3673,14 +3738,14 @@ async function resolveLidarrTrackIds(
 }
 
 async function previewLidarrManualImport(client: LidarrClient, args: unknown, ctx: PreviewExecutionContext) {
-  const { downloadId, items, replaceExistingFiles } = parseManualImportArgs(args, "lidarr");
+  const { downloadId, items, replaceExistingFiles, filterExistingFiles } = parseManualImportArgs(args, "lidarr");
   const a = (args ?? {}) as ManualImportToolArgs;
 
   ctx.setStage("discovering-candidates");
   const candidates = await client.getManualImportCandidates({
     downloadId,
     artistId: a.artistId,
-    filterExistingFiles: a.filterExistingFiles,
+    filterExistingFiles,
     replaceExistingFiles,
   }, ctx.signal);
   if (candidates.length === 0) {
@@ -3847,6 +3912,8 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown, ct
   return {
     verifyBeforeActing: LIDARR_VERIFY_DIRECTIVE,
     downloadId,
+    existingFilesPolicy: lidarrExistingFilesPolicy(replaceExistingFiles),
+    candidateFilterPolicy: lidarrCandidateFilterPolicy(filterExistingFiles),
     count: previews.length,
     items: previews,
     notes: [
@@ -3864,9 +3931,9 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown, ct
 }
 
 async function executeLidarrManualImport(client: LidarrClient, args: unknown) {
-  const { downloadId, items, importMode, replaceExistingFiles } = parseManualImportArgs(args, "lidarr");
+  const { downloadId, items, importMode, replaceExistingFiles, filterExistingFiles } = parseManualImportArgs(args, "lidarr");
 
-  const candidates = await client.getManualImportCandidates({ downloadId, replaceExistingFiles });
+  const candidates = await client.getManualImportCandidates({ downloadId, filterExistingFiles, replaceExistingFiles });
   if (candidates.length === 0) {
     throw new Error(
       `Lidarr returned no manual-import candidates for downloadId '${downloadId}'. The download is likely no longer tracked — check lidarr_get_queue.`,
@@ -4030,6 +4097,8 @@ async function executeLidarrManualImport(client: LidarrClient, args: unknown) {
     status: "queued",
     importMode,
     replaceExistingFiles,
+    existingFilesPolicy: lidarrExistingFilesPolicy(replaceExistingFiles),
+    candidateFilterPolicy: lidarrCandidateFilterPolicy(filterExistingFiles),
     downloadId,
     files: files.map((f) => ({
       path: f.path,
@@ -5105,15 +5174,19 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
           throw new Error("downloadId is required (from lidarr_get_queue). Candidates are discovered from the tracked download, never from a caller-supplied path.");
         }
         assertPositiveEntityId(a.artistId, "artistId");
+        const filterExistingFiles = a.filterExistingFiles !== false;
+        const replaceExistingFiles = a.replaceExistingFiles === true;
         const candidates = await clients.lidarr.getManualImportCandidates({
           downloadId: a.downloadId.trim(),
           artistId: a.artistId,
-          filterExistingFiles: a.filterExistingFiles,
-          replaceExistingFiles: a.replaceExistingFiles ?? false,
+          filterExistingFiles,
+          replaceExistingFiles,
         });
         return jsonText({
           verifyBeforeActing: LIDARR_VERIFY_DIRECTIVE,
           downloadId: a.downloadId.trim(),
+          existingFilesPolicy: lidarrExistingFilesPolicy(replaceExistingFiles),
+          candidateFilterPolicy: lidarrCandidateFilterPolicy(filterExistingFiles),
           count: candidates.length,
           candidates: candidates.map(compactLidarrCandidate),
           notes: [
@@ -5121,6 +5194,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             "Paths are shown for diagnosis only — the import tools resolve paths from native candidates and never accept caller-supplied paths.",
             "Lidarr recomputes the track mapping server-side during preview; the preview result is authoritative for what execute will import.",
             "If a candidate has rejections, decide via preview whether overriding them (allowRejected=true on that item in execute) is appropriate.",
+            "filterExistingFiles (candidate visibility: Unmapped Files Only / All Files) and replaceExistingFiles (existing-library-file policy: Combine with existing files / Replace Existing Files) are independent axes. Use the same values for discovery, preview and execute; re-run this tool after changing either.",
           ],
         });
       }

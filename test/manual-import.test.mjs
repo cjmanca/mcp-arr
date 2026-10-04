@@ -3073,3 +3073,162 @@ test("queue tools keep working alongside the manual-import tools", async () => {
     assert.equal(status.isError, false, status.text);
   });
 });
+
+// --- Lidarr existing-file policy: schema semantics + filter propagation -----
+//
+// Native Lidarr Interactive Import mapping (verified against Lidarr source):
+//   replaceExistingFiles=false → "Combine with existing files" (no album-wide delete)
+//   replaceExistingFiles=true  → "Replace Existing Files" / "Existing files will be deleted"
+//                                (Lidarr removes ALL existing track files for each
+//                                 affected album before importing the selected files)
+//   filterExistingFiles=true   → "Unmapped Files Only" (discovery visibility only)
+//   filterExistingFiles=false  → "All Files"
+// These tests guard against semantic inversion and against the discovery filter
+// being conflated with the destructive replacement policy.
+
+async function lidarrToolSchemas(port) {
+  const response = await postMcp(port, { jsonrpc: "2.0", id: 42, method: "tools/list", params: {} });
+  assert.equal(response.status, 200);
+  const body = await mcpEnvelope(response);
+  return Object.fromEntries(body.result.tools.map((t) => [t.name, t]));
+}
+
+test("lidarr execute schema documents replaceExistingFiles native semantics", async () => {
+  await withServers({}, async (port) => {
+    const tools = await lidarrToolSchemas(port);
+    const desc = tools["lidarr_execute_manual_import"].inputSchema.properties.replaceExistingFiles.description;
+    for (const phrase of [
+      "false", "Combine with existing files",
+      "true", "Replace Existing Files", "Existing files will be deleted",
+      "all existing track files", "affected album",
+      "partial selection", "import failure",
+    ]) {
+      assert.ok(desc.toLowerCase().includes(phrase.toLowerCase()), `replaceExistingFiles description must convey "${phrase}"`);
+    }
+    assert.ok(desc.toLowerCase().includes("copy"), "replaceExistingFiles description must warn that importMode=copy does not neutralize it");
+  });
+});
+
+test("lidarr schemas document filterExistingFiles as a discovery-only filter, distinct from replacement", async () => {
+  await withServers({}, async (port) => {
+    const tools = await lidarrToolSchemas(port);
+    for (const tool of [
+      "lidarr_get_manual_import_candidates",
+      "lidarr_preview_manual_import",
+      "lidarr_execute_manual_import",
+    ]) {
+      const desc = tools[tool].inputSchema.properties.filterExistingFiles.description;
+      for (const phrase of ["true", "Unmapped Files Only", "false", "All Files"]) {
+        assert.ok(desc.toLowerCase().includes(phrase.toLowerCase()), `${tool}.filterExistingFiles must convey "${phrase}"`);
+      }
+      assert.match(desc, /does NOT delete/i, `${tool}.filterExistingFiles must state it does not delete/replace`);
+      assert.match(desc, /replaceExistingFiles/, `${tool}.filterExistingFiles must point to replaceExistingFiles as the separate policy`);
+    }
+  });
+});
+
+test("lidarr preview schema exposes filterExistingFiles", async () => {
+  await withServers({}, async (port) => {
+    const tools = await lidarrToolSchemas(port);
+    const prop = tools["lidarr_preview_manual_import"].inputSchema.properties.filterExistingFiles;
+    assert.ok(prop, "preview must expose filterExistingFiles so discovery/preview share one visibility policy");
+    assert.equal(prop.type, "boolean");
+  });
+});
+
+test("lidarr filterExistingFiles=false propagates from discovery to preview discovery", async () => {
+  await withServers({}, async (port, logs) => {
+    const discovery = await callTool(port, "lidarr_get_manual_import_candidates", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      filterExistingFiles: false,
+    });
+    assert.equal(discovery.isError, false, discovery.text);
+    assert.equal(discovery.payload.candidateFilterPolicy.filterExistingFiles, false);
+    assert.equal(discovery.payload.candidateFilterPolicy.lidarrUiMode, "All Files");
+
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333 }],
+      filterExistingFiles: false,
+    });
+    assert.equal(preview.isError, false, preview.text);
+    const previewGet = requestsTo(logs.lidarr, "GET", "/api/v1/manualimport").at(-1);
+    assert.equal(previewGet.params.filterExistingFiles, "false", "preview re-fetches with the caller's discovery visibility policy");
+  });
+});
+
+test("lidarr filterExistingFiles=false propagates to execute's fresh candidate discovery", async () => {
+  await withServers({}, async (port, logs) => {
+    const result = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333 }],
+      filterExistingFiles: false,
+    });
+    assert.equal(result.isError, false, result.text);
+    const get = requestsTo(logs.lidarr, "GET", "/api/v1/manualimport")[0];
+    assert.equal(get.params.filterExistingFiles, "false", "execute's fresh discovery uses the caller-selected visibility policy");
+    assert.equal(result.payload.candidateFilterPolicy.filterExistingFiles, false);
+    assert.equal(result.payload.candidateFilterPolicy.lidarrUiMode, "All Files");
+  });
+});
+
+test("lidarr safe defaults: omitted flags resolve to Unmapped Files Only + Combine with existing files", async () => {
+  await withServers({}, async (port, logs) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333 }],
+    });
+    assert.equal(preview.isError, false, preview.text);
+    assert.equal(preview.payload.candidateFilterPolicy.filterExistingFiles, true);
+    assert.equal(preview.payload.candidateFilterPolicy.lidarrUiMode, "Unmapped Files Only");
+    assert.equal(preview.payload.existingFilesPolicy.replaceExistingFiles, false);
+    assert.equal(preview.payload.existingFilesPolicy.lidarrUiMode, "Combine with existing files");
+    assert.equal(preview.payload.existingFilesPolicy.albumWidePreDelete, false);
+    const get = requestsTo(logs.lidarr, "GET", "/api/v1/manualimport")[0];
+    assert.equal(get.params.filterExistingFiles, "true", "default filter is sent explicitly");
+    assert.equal(get.params.replaceExistingFiles, "false", "default replacement policy is non-destructive");
+  });
+});
+
+test("lidarr preview reports the replacement policy without importing (album-wide delete scope)", async () => {
+  await withServers({}, async (port, logs) => {
+    const combine = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333 }],
+      replaceExistingFiles: false,
+    });
+    assert.equal(combine.isError, false, combine.text);
+    assert.equal(combine.payload.existingFilesPolicy.lidarrUiMode, "Combine with existing files");
+    assert.equal(combine.payload.existingFilesPolicy.albumWidePreDelete, false);
+
+    const replace = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333 }],
+      replaceExistingFiles: true,
+    });
+    assert.equal(replace.isError, false, replace.text);
+    assert.equal(replace.payload.existingFilesPolicy.replaceExistingFiles, true);
+    assert.equal(replace.payload.existingFilesPolicy.lidarrUiMode, "Replace Existing Files");
+    assert.equal(replace.payload.existingFilesPolicy.uiWarning, "Existing files will be deleted");
+    assert.equal(replace.payload.existingFilesPolicy.albumWidePreDelete, true);
+    assert.match(replace.payload.existingFilesPolicy.scope, /each affected album/i, "delete scope is album-wide, not per selected track");
+    assert.match(replace.payload.existingFilesPolicy.warning, /partial selection|import failure/i, "warning names the partial-selection/import-failure risk");
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0, "preview never imports, even under the destructive policy");
+  });
+});
+
+test("lidarr execute echoes the destructive policy and sends replaceExistingFiles exactly as selected", async () => {
+  await withServers({}, async (port, logs) => {
+    const result = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: [{ candidateId: 333 }],
+      replaceExistingFiles: true,
+    });
+    assert.equal(result.isError, false, result.text);
+    assert.equal(result.payload.existingFilesPolicy.replaceExistingFiles, true);
+    assert.equal(result.payload.existingFilesPolicy.lidarrUiMode, "Replace Existing Files");
+    assert.equal(result.payload.existingFilesPolicy.albumWidePreDelete, true);
+    const command = requestsTo(logs.lidarr, "POST", "/api/v1/command")[0].body;
+    assert.equal(command.replaceExistingFiles, true, "the native command receives the caller's explicit choice, never a safety rewrite");
+  });
+});
