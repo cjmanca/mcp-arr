@@ -517,6 +517,9 @@ function buildRoutes(opts) {
       pattern: /^\/api\/v1\/album\/\d+$/,
       handler: (e) => {
         const id = Number(e.path.split("/").pop());
+        if (opts.lidarrAlbumLookupError) {
+          return { status: opts.lidarrAlbumLookupError, json: { message: `album ${id} lookup failed` } };
+        }
         const album = (opts.lidarrAlbums ?? LIDARR_ALBUMS)[id];
         return album ? { json: album } : { status: 404, json: { message: `album ${id} not found` } };
       },
@@ -3629,5 +3632,131 @@ test("lidarr_get_albums surfaces the monitored release and per-release track cou
     assert.equal(standard.monitored, false);
     assert.equal(standard.trackCount, 11);
     assert.equal(standard.foreignReleaseId, "REL-200");
+  });
+});
+
+// --- release-switch safety fails closed when album state is unavailable -----
+//
+// The guard must never infer "safe first import" from a failed album lookup.
+// An ordinary GET /album/{id} failure (500 / connection / malformed) is NOT
+// "zero existing files" — it is an unknown safety state, so preview reports
+// assessmentAvailable=false and execute refuses with no command. Request
+// timeouts and operation aborts keep their existing typed behavior.
+
+test("lidarr preview reports assessment unavailable when the album lookup fails (500)", async () => {
+  await withServers(incidentOpts({ lidarrAlbumLookupError: 500 }), async (port, logs) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id })),
+    });
+    assert.equal(preview.isError, false, "preview stays diagnostic (non-destructive)");
+    const impact = preview.payload.releaseSwitchImpact.find((i) => i.albumId === 9);
+    assert.equal(impact.assessmentAvailable, false, "unavailable album state is never treated as assessable");
+    assert.equal(impact.requiresAuthorization, true);
+    assert.equal(impact.currentRelease, null);
+    assert.match(impact.warning, /could not be fetched|cannot be assessed/i);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0);
+  });
+});
+
+test("lidarr execute hard-refuses when the album state cannot be fetched (500)", async () => {
+  await withServers(incidentOpts({ lidarrAlbumLookupError: 500 }), async (port, logs) => {
+    const result = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+    });
+    assert.equal(result.isError, true, "unverifiable album state must fail closed");
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0, "no command on unverifiable album state");
+    assert.match(result.text, /cannot be assessed|could not be fetched|release switch/i);
+  });
+});
+
+test("releaseSwitchAuthorizations cannot authorize execution when album state is unavailable", async () => {
+  await withServers(incidentOpts({ lidarrAlbumLookupError: 500 }), async (port, logs) => {
+    const result = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+      releaseSwitchAuthorizations: [{ albumId: 9, fromAlbumReleaseId: 100, toAlbumReleaseId: 200 }],
+    });
+    assert.equal(result.isError, true, "authorization cannot prove current==100 when the album lookup failed");
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0);
+  });
+});
+
+test("lidarr treats missing album statistics as unknown existing-file state, not zero", async () => {
+  const noStats = { ...INCIDENT_ALBUM, statistics: undefined };
+  await withServers(incidentOpts({ lidarrAlbums: { 9: noStats } }), async (port, logs) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id })),
+    });
+    const impact = preview.payload.releaseSwitchImpact.find((i) => i.albumId === 9);
+    assert.equal(impact.assessmentAvailable, false, "missing statistics is unknown, not a safe first import");
+
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+    });
+    assert.equal(exec.isError, true, exec.text);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0);
+  });
+});
+
+test("lidarr known zero trackFileCount still allows a first-import release selection", async () => {
+  const zero = { ...INCIDENT_ALBUM, statistics: { trackFileCount: 0, trackCount: 17, totalTrackCount: 17, sizeOnDisk: 0, percentOfTracks: 0 } };
+  await withServers(incidentOpts({ lidarrAlbums: { 9: zero } }), async (port, logs) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id })),
+    });
+    const impact = preview.payload.releaseSwitchImpact.find((i) => i.albumId === 9);
+    assert.equal(impact.albumHasExistingFiles, false);
+    assert.equal(impact.assessmentAvailable, true, "known zero is assessable, unlike missing statistics");
+    assert.equal(impact.requiresAuthorization, false);
+
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+    });
+    assert.equal(exec.isError, false, exec.text);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 1);
+  });
+});
+
+test("lidarr preserve-current-release is invalid when two candidates map to the same current track", async () => {
+  // Release 200's tracks 2001 and 2002 both carry recording rec-1, so the two
+  // incoming files resolve to the SAME current-release track (1001). The
+  // preserve suggestion must refuse, not present a one-to-many remap as safe.
+  const dupCatalog = {
+    100: INCIDENT_RELEASE_CATALOG[100],
+    200: INCIDENT_RELEASE_CATALOG[200].map((t) => (t.id === 2002 ? { ...t, foreignRecordingId: "rec-1" } : t)),
+  };
+  const dup = [INCIDENT_CANDIDATES[0], INCIDENT_CANDIDATES[1]];
+  const dupTracks = { 400: [2001], 401: [2002] };
+  await withServers(incidentOpts({ lidarrCandidates: dup, lidarrCandidateTracks: dupTracks, lidarrReleaseTrackCatalog: dupCatalog }), async (port) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: dup.map((c) => ({ candidateId: c.id })),
+    });
+    const impact = preview.payload.releaseSwitchImpact.find((i) => i.albumId === 9);
+    assert.equal(impact.preserveCurrentRelease.possible, false, "two candidates cannot share one destination track");
+    assert.match(JSON.stringify(impact.preserveCurrentRelease.problems), /more than one incoming candidate/i);
+    assert.ok(!impact.preserveCurrentRelease.itemOverrides || impact.preserveCurrentRelease.itemOverrides.length === 0, "no usable overrides emitted");
+  });
+});
+
+test("lidarr incident fixture still produces 11 unique safe remaps", async () => {
+  await withServers(incidentOpts(), async (port) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id })),
+    });
+    const impact = preview.payload.releaseSwitchImpact.find((i) => i.albumId === 9);
+    assert.equal(impact.assessmentAvailable, true);
+    assert.equal(impact.preserveCurrentRelease.possible, true);
+    const overrides = impact.preserveCurrentRelease.itemOverrides;
+    assert.equal(overrides.length, 11);
+    const destIds = overrides.flatMap((o) => o.trackIds);
+    assert.equal(new Set(destIds).size, 11, "11 unique destination current-release track ids");
   });
 });

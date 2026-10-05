@@ -3633,7 +3633,12 @@ interface LidarrAlbumIdentity {
   title: string | null;
   artistId: number;
   anyReleaseOk: boolean;
-  trackFileCount: number;
+  /**
+   * `null` means Lidarr did not report statistics — the existing-file state is
+   * UNKNOWN, which is NOT the same as a known zero. The release-switch guard
+   * fails closed on unknown; a known 0 is a legitimate first import.
+   */
+  trackFileCount: number | null;
   releases: Array<{
     id: number;
     albumId: number;
@@ -3644,6 +3649,12 @@ interface LidarrAlbumIdentity {
   }>;
 }
 
+/**
+ * Best-effort album identity for RELATIONSHIP validation. A null result means
+ * "unverifiable" and the caller degrades gracefully (preview reports the
+ * problem, it does not crash). This is the correct behavior for relationship
+ * checks — do NOT reuse it for release-switch safety, which must fail closed.
+ */
 async function getLidarrAlbumIdentity(
   client: LidarrClient,
   albumId: number,
@@ -3660,7 +3671,7 @@ async function getLidarrAlbumIdentity(
         title: album.title ?? null,
         artistId: album.artistId,
         anyReleaseOk: album.anyReleaseOk ?? false,
-        trackFileCount: album.statistics?.trackFileCount ?? 0,
+        trackFileCount: album.statistics?.trackFileCount ?? null,
         releases: album.releases ?? [],
       }
       : null;
@@ -3671,6 +3682,57 @@ async function getLidarrAlbumIdentity(
   }
   cache.set(albumId, resolved);
   return resolved;
+}
+
+/**
+ * RELEASE-SWITCH SAFETY album lookup — fails closed. Shares the same cache and
+ * native endpoint as the best-effort relationship lookup, but distinguishes
+ * success from unavailability: an ordinary fetch failure (500 / connection /
+ * malformed / unknown album) returns `{ available: false }` so the guard can
+ * refuse, instead of collapsing to "no files, no monitored release, safe".
+ *
+ * Request timeouts and operation aborts are NOT swallowed — they propagate
+ * exactly as the best-effort helper does, preserving the existing typed
+ * timeout / deadline / cancel semantics.
+ */
+type LidarrAlbumSafetyLookup =
+  | { available: true; album: LidarrAlbumIdentity }
+  | { available: false; reason: string };
+
+async function requireLidarrAlbumIdentityForReleaseSafety(
+  client: LidarrClient,
+  albumId: number,
+  cache: Map<number, LidarrAlbumIdentity | null>,
+  ctx: PreviewExecutionContext,
+): Promise<LidarrAlbumSafetyLookup> {
+  if (cache.has(albumId)) {
+    const cached = cache.get(albumId);
+    return cached
+      ? { available: true, album: cached }
+      : { available: false, reason: `album ${albumId} state is not available in Lidarr` };
+  }
+  try {
+    const album = await client.getAlbumById(albumId, ctx.signal);
+    const resolved: LidarrAlbumIdentity | null = album && album.id > 0
+      ? {
+        id: album.id,
+        title: album.title ?? null,
+        artistId: album.artistId,
+        anyReleaseOk: album.anyReleaseOk ?? false,
+        trackFileCount: album.statistics?.trackFileCount ?? null,
+        releases: album.releases ?? [],
+      }
+      : null;
+    cache.set(albumId, resolved);
+    return resolved
+      ? { available: true, album: resolved }
+      : { available: false, reason: `album ${albumId} could not be resolved from Lidarr` };
+  } catch (error) {
+    rethrowIfOperationAborted(ctx.signal);
+    if (error instanceof ArrRequestTimeoutError) throw error;
+    const detail = error instanceof Error ? error.message : String(error);
+    return { available: false, reason: `album ${albumId} lookup failed: ${detail}` };
+  }
 }
 
 /**
@@ -3879,6 +3941,12 @@ function buildLidarrPreserveCurrentRelease(
   currentReleaseId: number,
 ): LidarrReleaseSwitchImpact["preserveCurrentRelease"] {
   const itemOverrides: Array<{ candidateId: number; albumReleaseId: number; trackIds: number[]; disableReleaseSwitching: boolean }> = [];
+  // Global destination set: a current-release track may be the target of exactly
+  // one incoming file (Lidarr maps each track to one file). Detecting collisions
+  // here keeps the suggestion honest — execute's duplicate-track guard would
+  // reject it later, so a suggestion that maps two candidates to one track is
+  // not a usable safe remap and must not be presented as one.
+  const usedCurrentTrackIds = new Set<number>();
   for (const s of states) {
     const trackIds: number[] = [];
     for (const t of s.tracks) {
@@ -3896,7 +3964,15 @@ function buildLidarrPreserveCurrentRelease(
           problems: [`candidate ${s.candidateId} track ${t.id} (recording ${rec}) has ${matches.length} match(es) on the current release — the recording mapping is ambiguous, so no safe remap is suggested`],
         };
       }
-      trackIds.push(matches[0].id);
+      const destinationId = matches[0].id;
+      if (usedCurrentTrackIds.has(destinationId)) {
+        return {
+          possible: false,
+          problems: [`current-release track ${destinationId} (recording ${rec}) would be assigned to more than one incoming candidate — the preserve-current-release remap is not one-to-one, so no safe remap is suggested`],
+        };
+      }
+      usedCurrentTrackIds.add(destinationId);
+      trackIds.push(destinationId);
     }
     itemOverrides.push({ candidateId: s.candidateId, albumReleaseId: currentReleaseId, trackIds, disableReleaseSwitching: false });
   }
@@ -3928,17 +4004,40 @@ async function analyzeLidarrReleaseSwitches(
   const impacts: LidarrReleaseSwitchImpact[] = [];
   for (const [albumId, states] of byAlbum) {
     const proposedReleaseIds = [...new Set(states.map((s) => s.albumReleaseId).filter((id) => id > 0))];
-    const album = await getLidarrAlbumIdentity(client, albumId, albumCache, ctx);
-    const albumTitle = album?.title ?? null;
-    const albumHasExistingFiles = (album?.trackFileCount ?? 0) > 0;
-    const monitored = (album?.releases ?? []).filter((r) => r.monitored === true);
+    const mixedReleases = proposedReleaseIds.length > 1;
+    const proposedReleaseId = proposedReleaseIds.length === 1 ? proposedReleaseIds[0] : 0;
+
+    // SAFETY lookup (fails closed), NOT the best-effort relationship lookup:
+    // an unavailable album state must never collapse to "no files, safe".
+    const lookup = await requireLidarrAlbumIdentityForReleaseSafety(client, albumId, albumCache, ctx);
+    if (!lookup.available) {
+      impacts.push({
+        albumId,
+        albumTitle: null,
+        currentRelease: null,
+        proposedRelease: proposedReleaseId > 0 ? { id: proposedReleaseId, title: null, trackCount: 0 } : null,
+        releaseWillChange: false,
+        albumHasExistingFiles: false,
+        requiresAuthorization: true,
+        assessmentAvailable: false,
+        mixedReleases,
+        proposedReleaseIds,
+        warning: `Current Lidarr album/release state for album ${albumId} could not be fetched (${lookup.reason}), so release-switch safety cannot be assessed. Refusing to import — the album's edition may change.`,
+      });
+      continue;
+    }
+    const album = lookup.album;
+
+    const albumTitle = album.title;
+    // null trackFileCount = unknown existing-file state (statistics missing).
+    const existingFilesKnown = album.trackFileCount !== null;
+    const albumHasExistingFiles = album.trackFileCount !== null && album.trackFileCount > 0;
+    const monitored = album.releases.filter((r) => r.monitored === true);
     const currentRelease = monitored.length === 1
       ? { id: monitored[0].id, title: monitored[0].title ?? null, trackCount: monitored[0].trackCount ?? 0 }
       : null;
     const ambiguousCurrent = albumHasExistingFiles && monitored.length !== 1;
-    const mixedReleases = proposedReleaseIds.length > 1;
-    const proposedReleaseId = proposedReleaseIds.length === 1 ? proposedReleaseIds[0] : 0;
-    const releaseOf = (id: number) => (album?.releases ?? []).find((r) => r.id === id);
+    const releaseOf = (id: number) => album.releases.find((r) => r.id === id);
     const proposedRelease = proposedReleaseId > 0
       ? { id: proposedReleaseId, title: releaseOf(proposedReleaseId)?.title ?? null, trackCount: releaseOf(proposedReleaseId)?.trackCount ?? 0 }
       : null;
@@ -3952,14 +4051,25 @@ async function analyzeLidarrReleaseSwitches(
       releaseWillChange,
       albumHasExistingFiles,
       requiresAuthorization: false,
-      assessmentAvailable: !ambiguousCurrent,
+      assessmentAvailable: true,
       mixedReleases,
       proposedReleaseIds,
     };
 
     if (ambiguousCurrent) {
       impact.requiresAuthorization = true;
+      impact.assessmentAvailable = false;
       impact.warning = `Album ${albumId} has existing files but ${monitored.length} monitored release(s); the current edition cannot be determined, so a release switch cannot be assessed. Inspect/fix the album's release state (lidarr_get_albums) and preview again.`;
+      impacts.push(impact);
+      continue;
+    }
+
+    // A release switch on an album whose existing-file state is unknown cannot
+    // be assessed — fail closed rather than assume a safe first import.
+    if (releaseWillChange && !existingFilesKnown) {
+      impact.requiresAuthorization = true;
+      impact.assessmentAvailable = false;
+      impact.warning = `Album ${albumId} reports no statistics, so its existing-file state is unknown; a release switch to ${proposedReleaseId} cannot be assessed. Refusing to import — the album's edition may change. Re-preview once Lidarr reports the album's file count.`;
       impacts.push(impact);
       continue;
     }
