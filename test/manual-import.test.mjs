@@ -146,14 +146,18 @@ const LIDARR_CANDIDATE = {
 //   GET /api/v1/release?albumId= → the album's releases (release→album check)
 // Album 9 (artist 5): releases 77 (tracks 501,502) and 78 (track 503).
 // Album 10 (artist 5): release 79 (track 601). Album 11 (artist 6): release 80.
+// These library albums carry a KNOWN zero file count: the non-release-switch
+// tests exercise mapping/passthrough on a fresh album (a legitimate first
+// import), not on an unknown-file-state album, which the release-switch guard
+// now fails closed on. Release-switch tests use INCIDENT_ALBUM via incidentOpts.
 const LIDARR_ARTISTS = {
   5: { id: 5, artistName: "Some Artist" },
   6: { id: 6, artistName: "Other Artist" },
 };
 const LIDARR_ALBUMS = {
-  9: { id: 9, title: "Some Album", artistId: 5, releases: [{ id: 77, albumId: 9 }, { id: 78, albumId: 9 }] },
-  10: { id: 10, title: "Other Album", artistId: 5, releases: [{ id: 79, albumId: 10 }] },
-  11: { id: 11, title: "Foreign Album", artistId: 6, releases: [{ id: 80, albumId: 11 }] },
+  9: { id: 9, title: "Some Album", artistId: 5, statistics: { trackFileCount: 0, trackCount: 3, totalTrackCount: 3, sizeOnDisk: 0, percentOfTracks: 0 }, releases: [{ id: 77, albumId: 9 }, { id: 78, albumId: 9 }] },
+  10: { id: 10, title: "Other Album", artistId: 5, statistics: { trackFileCount: 0, trackCount: 1, totalTrackCount: 1, sizeOnDisk: 0, percentOfTracks: 0 }, releases: [{ id: 79, albumId: 10 }] },
+  11: { id: 11, title: "Foreign Album", artistId: 6, statistics: { trackFileCount: 0, trackCount: 1, totalTrackCount: 1, sizeOnDisk: 0, percentOfTracks: 0 }, releases: [{ id: 80, albumId: 11 }] },
 };
 
 // --- release-switch incident fixture (Adele "21": 17-track deluxe → 11-track standard) --
@@ -3566,6 +3570,7 @@ test("releaseSwitchAuthorizations are validated at the boundary before any nativ
       { albumId: 9, fromAlbumReleaseId: 100, toAlbumReleaseId: 100 },
       { albumId: 9, fromAlbumReleaseId: "100", toAlbumReleaseId: 200 },
       { albumId: 9, fromAlbumReleaseId: 100.5, toAlbumReleaseId: 200 },
+      { albumId: 9, fromAlbumReleaseId: -1, toAlbumReleaseId: 200 },
     ];
     for (const auth of bad) {
       const result = await callTool(port, "lidarr_execute_manual_import", {
@@ -3575,6 +3580,7 @@ test("releaseSwitchAuthorizations are validated at the boundary before any nativ
       });
       assert.equal(result.isError, true, `authorization ${JSON.stringify(auth)} must be refused`);
       assert.match(result.text, /releaseSwitchAuthorizations/i);
+      assert.equal(logs.lidarr.length, 0, `malformed authorization ${JSON.stringify(auth)} must be refused before ANY native Lidarr request`);
     }
     // Duplicate albumId refused.
     const dup = await callTool(port, "lidarr_execute_manual_import", {
@@ -3587,7 +3593,7 @@ test("releaseSwitchAuthorizations are validated at the boundary before any nativ
     });
     assert.equal(dup.isError, true, "duplicate albumId authorization must be refused");
     assert.match(dup.text, /releaseSwitchAuthorizations/i);
-    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0, "refused authorizations produce no command");
+    assert.equal(logs.lidarr.length, 0, "refused authorizations produce no native Lidarr request at all");
   });
 });
 
@@ -3758,5 +3764,117 @@ test("lidarr incident fixture still produces 11 unique safe remaps", async () =>
     assert.equal(overrides.length, 11);
     const destIds = overrides.flatMap((o) => o.trackIds);
     assert.equal(new Set(destIds).size, 11, "11 unique destination current-release track ids");
+  });
+});
+
+// --- missing statistics fails closed unless the proposed release is provably
+// the album's single monitored release -------------------------------------
+//
+// trackFileCount = null is UNKNOWN existing-file state, not zero. The MCP may
+// only proceed when it can positively prove the proposed release is already the
+// album's one and only monitored release. 0 / 2+ monitored releases with unknown
+// file state are unverifiable, so preview reports assessmentAvailable=false and
+// execute refuses with no command. A known 0 (first import) stays allowed.
+
+test("lidarr missing statistics + zero monitored releases fails closed", async () => {
+  const noStatsNoMonitored = {
+    ...INCIDENT_ALBUM,
+    statistics: undefined,
+    releases: [
+      { id: 100, albumId: 9, title: "Deluxe Edition", trackCount: 17, monitored: false },
+      { id: 200, albumId: 9, title: "Standard Edition", trackCount: 11, monitored: false },
+    ],
+  };
+  await withServers(incidentOpts({ lidarrAlbums: { 9: noStatsNoMonitored } }), async (port, logs) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id })),
+    });
+    const impact = preview.payload.releaseSwitchImpact.find((i) => i.albumId === 9);
+    assert.equal(impact.assessmentAvailable, false, "unknown file state with no monitored release is not assessable");
+    assert.equal(impact.requiresAuthorization, true);
+
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+    });
+    assert.equal(exec.isError, true, exec.text);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0);
+  });
+});
+
+test("lidarr missing statistics + multiple monitored releases fails closed", async () => {
+  const noStatsMultiMonitored = {
+    ...INCIDENT_ALBUM,
+    statistics: undefined,
+    releases: [
+      { id: 100, albumId: 9, title: "Deluxe Edition", trackCount: 17, monitored: true },
+      { id: 101, albumId: 9, title: "Deluxe Remaster", trackCount: 17, monitored: true },
+      { id: 200, albumId: 9, title: "Standard Edition", trackCount: 11, monitored: false },
+    ],
+  };
+  await withServers(incidentOpts({ lidarrAlbums: { 9: noStatsMultiMonitored } }), async (port, logs) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id })),
+    });
+    const impact = preview.payload.releaseSwitchImpact.find((i) => i.albumId === 9);
+    assert.equal(impact.assessmentAvailable, false, "unknown file state with multiple monitored releases is not assessable");
+    assert.equal(impact.requiresAuthorization, true);
+
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+    });
+    assert.equal(exec.isError, true, exec.text);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0);
+  });
+});
+
+test("lidarr missing statistics + proposed release is the single monitored release stays allowed", async () => {
+  const noStatsSameMonitored = {
+    ...INCIDENT_ALBUM,
+    statistics: undefined,
+    releases: [
+      { id: 100, albumId: 9, title: "Deluxe Edition", trackCount: 17, monitored: false },
+      { id: 200, albumId: 9, title: "Standard Edition", trackCount: 11, monitored: true },
+    ],
+  };
+  await withServers(incidentOpts({ lidarrAlbums: { 9: noStatsSameMonitored } }), async (port, logs) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id })),
+    });
+    const impact = preview.payload.releaseSwitchImpact.find((i) => i.albumId === 9);
+    assert.equal(impact.releaseWillChange, false, "importing the album's monitored release is not an edition switch");
+    assert.equal(impact.assessmentAvailable, true, "the proposed release is provably the single monitored release");
+    assert.equal(impact.requiresAuthorization, false);
+
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+    });
+    assert.equal(exec.isError, false, exec.text);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 1);
+  });
+});
+
+test("releaseSwitchAuthorizations cannot bypass an unknown file state", async () => {
+  const noStatsNoMonitored = {
+    ...INCIDENT_ALBUM,
+    statistics: undefined,
+    releases: [
+      { id: 100, albumId: 9, title: "Deluxe Edition", trackCount: 17, monitored: false },
+      { id: 200, albumId: 9, title: "Standard Edition", trackCount: 11, monitored: false },
+    ],
+  };
+  await withServers(incidentOpts({ lidarrAlbums: { 9: noStatsNoMonitored } }), async (port, logs) => {
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+      releaseSwitchAuthorizations: [{ albumId: 9, fromAlbumReleaseId: 100, toAlbumReleaseId: 200 }],
+    });
+    assert.equal(exec.isError, true, "authorization expresses intent, not evidence — it cannot prove from=100 when the state is unknown");
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0);
   });
 });

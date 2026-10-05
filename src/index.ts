@@ -4064,14 +4064,24 @@ async function analyzeLidarrReleaseSwitches(
       continue;
     }
 
-    // A release switch on an album whose existing-file state is unknown cannot
-    // be assessed — fail closed rather than assume a safe first import.
-    if (releaseWillChange && !existingFilesKnown) {
-      impact.requiresAuthorization = true;
-      impact.assessmentAvailable = false;
-      impact.warning = `Album ${albumId} reports no statistics, so its existing-file state is unknown; a release switch to ${proposedReleaseId} cannot be assessed. Refusing to import — the album's edition may change. Re-preview once Lidarr reports the album's file count.`;
-      impacts.push(impact);
-      continue;
+    // When the album's existing-file state is UNKNOWN (statistics missing), the
+    // MCP may only proceed if it can positively prove the proposed release is
+    // already the album's one and only monitored release. A known 0 is a
+    // legitimate first import (handled below); unknown is not, and a release
+    // switch is not required for the hole to exist — 0 / 2+ monitored releases
+    // with unknown file state are equally unverifiable, so fail closed.
+    if (!existingFilesKnown) {
+      const definitelySameRelease =
+        monitored.length === 1 &&
+        proposedReleaseId > 0 &&
+        monitored[0].id === proposedReleaseId;
+      if (!definitelySameRelease) {
+        impact.requiresAuthorization = true;
+        impact.assessmentAvailable = false;
+        impact.warning = `Album ${albumId} reports no file statistics, so its existing-file state is unknown; the MCP cannot prove that selecting ${proposedReleaseId > 0 ? `release ${proposedReleaseId}` : "these releases"} leaves the album's monitored edition unchanged. Refusing to import — the album's edition may change. Re-preview once Lidarr reports the album's file count, or import the album's single monitored release.`;
+        impacts.push(impact);
+        continue;
+      }
     }
 
     if (releaseWillChange && albumHasExistingFiles) {
@@ -4381,6 +4391,12 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown, ct
 async function executeLidarrManualImport(client: LidarrClient, args: unknown) {
   const { downloadId, items, importMode, replaceExistingFiles, filterExistingFiles } = parseManualImportArgs(args, "lidarr");
 
+  // Boundary validation BEFORE any native request: malformed release-switch
+  // authorizations (zero/negative/fractional/string ids, from==to, duplicate
+  // album) are refused here, so they never spend a candidate discovery, native
+  // reprocess, or release-track query. The parsed value is reused below.
+  const releaseSwitchAuthorizations = parseLidarrReleaseSwitchAuthorizations(args);
+
   const candidates = await client.getManualImportCandidates({ downloadId, filterExistingFiles, replaceExistingFiles });
   if (candidates.length === 0) {
     throw new Error(
@@ -4545,7 +4561,6 @@ async function executeLidarrManualImport(client: LidarrClient, args: unknown) {
   // SetMonitored(effectiveRelease) regardless of replaceExistingFiles, so an
   // unapproved switch silently changes the album's edition. allowRejected,
   // replaceExistingFiles and disableReleaseSwitching do NOT authorize it.
-  const releaseSwitchAuthorizations = parseLidarrReleaseSwitchAuthorizations(args);
   const releaseSwitchImpact = await analyzeLidarrReleaseSwitches(
     client, releaseStates, albumIdentityCache, releaseTrackCache, execCtx,
   );
@@ -4569,7 +4584,7 @@ async function executeLidarrManualImport(client: LidarrClient, args: unknown) {
       downloadId,
       releaseSwitchImpact,
       guidance: [
-        "The album has existing files but zero or multiple monitored releases. Inspect/fix the album's release state (lidarr_get_albums shows the monitored release), then preview again. releaseSwitchAuthorizations cannot authorize a switch from an unknown current release.",
+        "The album's current monitored release cannot be assessed — it has existing files with zero/multiple monitored releases, or it reports no file statistics and the proposed release is not provably the album's single monitored release. Inspect/fix the album's release state (lidarr_get_albums shows the monitored release), then preview again. releaseSwitchAuthorizations cannot authorize a switch from an unknown current release.",
       ],
     });
   }
