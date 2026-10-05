@@ -156,6 +156,58 @@ const LIDARR_ALBUMS = {
   11: { id: 11, title: "Foreign Album", artistId: 6, releases: [{ id: 80, albumId: 11 }] },
 };
 
+// --- release-switch incident fixture (Adele "21": 17-track deluxe → 11-track standard) --
+//
+// Reproduces the real incident the safety guard prevents. Album 9 has a
+// currently-monitored 17-track release (100, all with files) and an
+// unmonitored 11-track release (200). The 11 standard tracks share their
+// MusicBrainz recording ids (rec-1..rec-11) with the first 11 deluxe tracks;
+// the deluxe release has 6 recordings (rec-12..rec-17) the standard lacks.
+// Importing the 11 standard files as release 200 would silently switch the
+// album's monitored edition — the exact destructive outcome the guard blocks.
+const INCIDENT_ALBUM = {
+  id: 9,
+  title: "21",
+  artistId: 5,
+  anyReleaseOk: true,
+  statistics: { trackFileCount: 17, trackCount: 17, totalTrackCount: 17, sizeOnDisk: 0, percentOfTracks: 100 },
+  releases: [
+    { id: 100, albumId: 9, foreignReleaseId: "REL-100", title: "Deluxe Edition", status: "Official", duration: 0, trackCount: 17, monitored: true },
+    { id: 200, albumId: 9, foreignReleaseId: "REL-200", title: "Standard Edition", status: "Official", duration: 0, trackCount: 11, monitored: false },
+  ],
+};
+const INCIDENT_RELEASE_CATALOG = {
+  100: Array.from({ length: 17 }, (_, i) => ({ id: 1001 + i, foreignRecordingId: `rec-${i + 1}`, trackFileId: 9001 + i, hasFile: true })),
+  200: Array.from({ length: 11 }, (_, i) => ({ id: 2001 + i, foreignRecordingId: `rec-${i + 1}`, trackFileId: null, hasFile: false })),
+};
+const INCIDENT_CANDIDATES = Array.from({ length: 11 }, (_, i) => ({
+  id: 400 + i,
+  path: `/downloads/complete/Adele/21 (Standard)/${String(i + 1).padStart(2, "0")} - Track ${i + 1}.flac`,
+  name: `0${i + 1} - Track ${i + 1}`,
+  size: 700,
+  artist: { id: 5, artistName: "Adele" },
+  album: { id: 9, title: "21" },
+  albumReleaseId: 200,
+  tracks: [{ id: 2001 + i, title: `Track ${i + 1}`, trackNumber: i + 1, position: i + 1, mediumNumber: 1, foreignRecordingId: `rec-${i + 1}` }],
+  quality: QUALITY,
+  releaseGroup: "GROUP",
+  qualityWeight: 60,
+  downloadId: LIDARR_DOWNLOAD_ID,
+  indexerFlags: 0,
+  rejections: [{ reason: "Album match is not close enough", type: "permanent" }],
+  additionalFile: false,
+  replaceExistingFiles: false,
+  disableReleaseSwitching: false,
+}));
+const INCIDENT_CANDIDATE_TRACKS = Object.fromEntries(Array.from({ length: 11 }, (_, i) => [400 + i, [2001 + i]]));
+const incidentOpts = (extra = {}) => ({
+  lidarrAlbums: { 9: INCIDENT_ALBUM },
+  lidarrReleaseTrackCatalog: INCIDENT_RELEASE_CATALOG,
+  lidarrCandidates: INCIDENT_CANDIDATES,
+  lidarrCandidateTracks: INCIDENT_CANDIDATE_TRACKS,
+  ...extra,
+});
+
 // --- stub *arr apps -------------------------------------------------------
 
 function safeJson(raw) {
@@ -292,7 +344,26 @@ function lidarrReleaseTracks(opts) {
   return opts.lidarrReleaseTracks ?? { 77: [501, 502], 78: [503], 79: [601], 80: [701] };
 }
 
-function lidarrTrackResourcesForRelease(releaseId, opts) {
+// Full track objects for a release. When opts.lidarrReleaseTrackCatalog supplies
+// rich tracks (with foreignRecordingId / trackFileId / hasFile) for a release,
+// use them verbatim; otherwise synthesize minimal ones from the id list, exactly
+// as before. The release-switch analysis needs foreignRecordingId (cross-edition
+// identity) and trackFileId/hasFile (existing-file state), so the incident
+// fixtures supply a catalog.
+function lidarrTracksForRelease(releaseId, opts) {
+  const catalog = opts.lidarrReleaseTrackCatalog;
+  if (catalog && catalog[releaseId]) {
+    return catalog[releaseId].map((t) => ({
+      artistId: 5,
+      albumId: 9,
+      albumReleaseId: releaseId,
+      title: `Track ${t.id}`,
+      trackNumber: 1,
+      position: 1,
+      mediumNumber: 1,
+      ...t,
+    }));
+  }
   return (lidarrReleaseTracks(opts)[releaseId] ?? []).map((id) => ({
     id,
     artistId: 5,
@@ -305,6 +376,23 @@ function lidarrTrackResourcesForRelease(releaseId, opts) {
   }));
 }
 
+function lidarrTrackResourcesForRelease(releaseId, opts) {
+  return lidarrTracksForRelease(releaseId, opts);
+}
+
+// Resolve a track id to its full object (used for the server-side recomputed
+// tracks in lidarrUpdate, so they carry foreignRecordingId when a catalog is set).
+function lidarrTrackById(id, opts) {
+  const catalog = opts.lidarrReleaseTrackCatalog ?? {};
+  for (const list of Object.values(catalog)) {
+    const found = list.find((t) => t.id === id);
+    if (found) {
+      return { artistId: 5, albumId: 9, title: `Track ${id}`, trackNumber: 1, position: 1, mediumNumber: 1, ...found };
+    }
+  }
+  return { id, artistId: 5, albumId: 9, title: `Track ${id}`, trackNumber: 1, position: 1, mediumNumber: 1 };
+}
+
 function lidarrUpdate(items, opts) {
   // The update response's tracks are Lidarr's server-side recomputation.
   // opts.lidarrRecomputedTracks can inject a recomputed set that differs from
@@ -312,8 +400,14 @@ function lidarrUpdate(items, opts) {
   // the MCP layer must surface, not authorize).
   const artists = opts.lidarrArtists ?? LIDARR_ARTISTS;
   const albums = opts.lidarrAlbums ?? LIDARR_ALBUMS;
-  const recomputedFor = (releaseId) =>
-    (opts.lidarrRecomputedTracks ?? lidarrReleaseTracks(opts))[releaseId] ?? lidarrReleaseTracks(opts)[releaseId] ?? [];
+  // Per-candidate recomputation (opts.lidarrCandidateTracks) models a multi-file
+  // release where each file maps to its own single track; otherwise the stub
+  // recomputes the whole release's track list for every item.
+  const recomputedFor = (item, releaseId) =>
+    opts.lidarrCandidateTracks?.[item.id]
+    ?? (opts.lidarrRecomputedTracks ?? lidarrReleaseTracks(opts))[releaseId]
+    ?? lidarrReleaseTracks(opts)[releaseId]
+    ?? [];
   return items.map((item) => {
     // Native precedence (CandidateService.GetDbCandidatesFromTags): a forced
     // release wins; with only an album forced, the backend picks a release of
@@ -331,14 +425,11 @@ function lidarrUpdate(items, opts) {
       artist: artist ? { id: artist.id, artistName: artist.artistName } : null,
       album: album ? { id: album.id, title: album.title } : null,
       albumReleaseId: releaseId,
-      tracks: recomputedFor(releaseId).map((id) => ({
-        id,
-        artistId: album?.artistId ?? 5,
+      tracks: recomputedFor(item, releaseId).map((id) => ({
+        ...lidarrTrackById(id, opts),
+        albumReleaseId: releaseId,
         albumId: album?.id ?? 0,
-        title: `Track ${id}`,
-        trackNumber: 1,
-        position: 1,
-        mediumNumber: 1,
+        artistId: album?.artistId ?? 5,
       })),
       quality: item.quality,
       releaseGroup: item.releaseGroup,
@@ -410,6 +501,9 @@ function buildRoutes(opts) {
     "POST /api/v1/manualimport": (e) => ({ json: lidarrUpdate(e.body, opts) }),
     "POST /api/v1/command": () => ({ json: { id: opts.lidarrCommandId ?? 654, name: "ManualImport", status: "queued" } }),
     "GET /api/v1/track": (e) => ({ json: lidarrTrackResourcesForRelease(Number(e.params.albumReleaseId), opts) }),
+    "GET /api/v1/album": (e) => ({
+      json: Object.values(opts.lidarrAlbums ?? LIDARR_ALBUMS).filter((a) => !e.params.artistId || a.artistId === Number(e.params.artistId)),
+    }),
     "GET /api/v1/queue": () => ({ json: { records: [], totalRecords: 0 } }),
   };
   // GET /api/v1/album/{id} — the native source for BOTH relationship checks:
@@ -2944,8 +3038,8 @@ test("an unchanged candidate keeps its native mapping with no relationship looku
     const item = preview.payload.items[0];
     assert.equal(item.relationshipValidation.checked, false, "inherited ids are coherent by construction — nothing to validate");
     assert.equal(item.mappingOverridesApplied.disableReleaseSwitching, false, "no explicit release selection, so no release-switching change");
-    assert.equal(requestsTo(logs.lidarr, "GET", "/api/v1/release").length, 0, "no validation lookups for an unmodified candidate");
-    assert.equal(logs.lidarr.filter((r) => r.method === "GET" && r.path.startsWith("/api/v1/album/")).length, 0);
+    assert.equal(requestsTo(logs.lidarr, "GET", "/api/v1/release").length, 0, "no relationship-validation lookups for an unmodified candidate");
+    assert.equal(logs.lidarr.filter((r) => r.method === "GET" && r.path.startsWith("/api/v1/album/")).length, 1, "the album is read once for release-switch analysis (its monitored release/edition), not for relationship validation");
   });
 });
 
@@ -3186,7 +3280,7 @@ test("lidarr safe defaults: omitted flags resolve to Unmapped Files Only + Combi
     assert.equal(preview.payload.existingFilesPolicy.albumWidePreDelete, false);
     const get = requestsTo(logs.lidarr, "GET", "/api/v1/manualimport")[0];
     assert.equal(get.params.filterExistingFiles, "true", "default filter is sent explicitly");
-    assert.equal(get.params.replaceExistingFiles, "false", "default replacement policy is non-destructive");
+    assert.equal(get.params.replaceExistingFiles, "false", "default replacement policy is Combine with existing files (no album-wide pre-delete)");
   });
 });
 
@@ -3230,5 +3324,310 @@ test("lidarr execute echoes the destructive policy and sends replaceExistingFile
     assert.equal(result.payload.existingFilesPolicy.albumWidePreDelete, true);
     const command = requestsTo(logs.lidarr, "POST", "/api/v1/command")[0].body;
     assert.equal(command.replaceExistingFiles, true, "the native command receives the caller's explicit choice, never a safety rewrite");
+  });
+});
+
+// --- release-switch safety guard (the Adele "21" incident) -----------------
+//
+// Native Lidarr ImportApprovedTracks.Import calls SetMonitored(newRelease) for
+// the effective imported release, INDEPENDENT of replaceExistingFiles. So a
+// ManualImport targeting a different albumReleaseId silently changes the
+// album's monitored edition (17-track deluxe → 11-track standard) even with
+// replaceExistingFiles=false. allowRejected, replaceExistingFiles and
+// disableReleaseSwitching must NOT authorize that switch — it needs its own
+// exact album/from/to authorization.
+
+test("lidarr preview detects a cross-edition release switch (17-track deluxe → 11-track standard)", async () => {
+  await withServers(incidentOpts(), async (port) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id })),
+    });
+    assert.equal(preview.isError, false, preview.text);
+    const impact = preview.payload.releaseSwitchImpact.find((i) => i.albumId === 9);
+    assert.ok(impact, "releaseSwitchImpact present for album 9");
+    assert.equal(impact.releaseWillChange, true);
+    assert.equal(impact.currentRelease.id, 100);
+    assert.equal(impact.currentRelease.trackCount, 17);
+    assert.equal(impact.proposedRelease.id, 200);
+    assert.equal(impact.proposedRelease.trackCount, 11);
+    assert.equal(impact.sharedRecordingCount, 11);
+    assert.equal(impact.currentOnlyRecordingCount, 6);
+    assert.equal(impact.proposedOnlyRecordingCount, 0);
+    assert.equal(impact.albumHasExistingFiles, true);
+    assert.equal(impact.requiresAuthorization, true);
+    assert.match(impact.warning, /not merely a quality upgrade/i);
+    assert.match(impact.warning, /allowRejected does NOT authorize/i);
+    assert.match(JSON.stringify(preview.payload.notes), /not merely a quality upgrade|release switch/i);
+  });
+});
+
+test("lidarr preview suggests exact preserve-current-release remaps for the 11 shared recordings", async () => {
+  await withServers(incidentOpts(), async (port) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id })),
+    });
+    const impact = preview.payload.releaseSwitchImpact.find((i) => i.albumId === 9);
+    assert.equal(impact.preserveCurrentRelease.possible, true);
+    assert.equal(impact.preserveCurrentRelease.albumReleaseId, 100);
+    assert.equal(impact.preserveCurrentRelease.itemOverrides.length, 11);
+    for (let i = 0; i < 11; i++) {
+      const ov = impact.preserveCurrentRelease.itemOverrides[i];
+      assert.equal(ov.candidateId, 400 + i);
+      assert.equal(ov.albumReleaseId, 100, "the suggestion targets the CURRENT monitored release, not 200");
+      assert.deepEqual(ov.trackIds, [1001 + i], "the current-release-specific track id for recording rec-" + (i + 1));
+      assert.equal(ov.disableReleaseSwitching, false);
+    }
+    const item = preview.payload.items.find((it) => it.candidateId === 400);
+    assert.equal(item.currentReleaseEquivalent.available, true);
+    assert.equal(item.currentReleaseEquivalent.albumReleaseId, 100);
+    assert.deepEqual(item.currentReleaseEquivalent.trackIds, [1001]);
+  });
+});
+
+test("lidarr execute hard-blocks an unapproved release switch even with allowRejected=true on every candidate", async () => {
+  await withServers(incidentOpts(), async (port, logs) => {
+    const result = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+      replaceExistingFiles: false,
+      filterExistingFiles: false,
+    });
+    assert.equal(result.isError, true, "unapproved release switch must be blocked");
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0, "no command submitted");
+    assert.equal(result.payload.error, "Release switch requires explicit authorization.");
+    const impact = result.payload.releaseSwitchImpact.find((i) => i.albumId === 9);
+    assert.equal(impact.currentRelease.trackCount, 17);
+    assert.equal(impact.proposedRelease.trackCount, 11);
+    assert.equal(impact.currentOnlyRecordingCount, 6);
+  });
+});
+
+test("allowRejected=true on every candidate does not bypass the release-switch guard", async () => {
+  await withServers(incidentOpts(), async (port, logs) => {
+    const noAuth = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+    });
+    assert.equal(noAuth.isError, true, "allowRejected authorizes rejections, not an edition change");
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0);
+  });
+});
+
+test("replaceExistingFiles=true does not authorize a release switch", async () => {
+  await withServers(incidentOpts(), async (port, logs) => {
+    const result = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+      replaceExistingFiles: true,
+    });
+    assert.equal(result.isError, true, "the existing-file replacement policy is a separate axis from release switching");
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0);
+  });
+});
+
+test("disableReleaseSwitching=true does not authorize a release switch", async () => {
+  await withServers(incidentOpts(), async (port, logs) => {
+    const result = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true, disableReleaseSwitching: true })),
+    });
+    assert.equal(result.isError, true, "disableReleaseSwitching controls future auto-switching, not this import's SetMonitored");
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0);
+  });
+});
+
+test("lidarr execute permits an exactly authorized release switch and keeps the intended release", async () => {
+  await withServers(incidentOpts(), async (port, logs) => {
+    const result = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+      releaseSwitchAuthorizations: [{ albumId: 9, fromAlbumReleaseId: 100, toAlbumReleaseId: 200 }],
+    });
+    assert.equal(result.isError, false, result.text);
+    const command = requestsTo(logs.lidarr, "POST", "/api/v1/command")[0].body;
+    assert.equal(command.files.length, 11);
+    assert.ok(command.files.every((f) => f.albumReleaseId === 200), "the intended release 200 imports, no hidden rewrite");
+  });
+});
+
+test("lidarr execute rejects a stale release-switch authorization when the current release changed", async () => {
+  const staleAlbum = {
+    ...INCIDENT_ALBUM,
+    releases: [
+      { id: 101, albumId: 9, foreignReleaseId: "REL-101", title: "Deluxe Remaster", status: "Official", duration: 0, trackCount: 17, monitored: true },
+      { id: 200, albumId: 9, foreignReleaseId: "REL-200", title: "Standard Edition", status: "Official", duration: 0, trackCount: 11, monitored: false },
+    ],
+  };
+  await withServers(incidentOpts({ lidarrAlbums: { 9: staleAlbum } }), async (port, logs) => {
+    const result = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+      releaseSwitchAuthorizations: [{ albumId: 9, fromAlbumReleaseId: 100, toAlbumReleaseId: 200 }],
+    });
+    assert.equal(result.isError, true, "stale authorization (100→200) must not authorize a 101→200 switch");
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0);
+  });
+});
+
+test("lidarr same-release partial upgrade is allowed without authorization", async () => {
+  const sameReleaseCandidates = INCIDENT_CANDIDATES.map((c, i) => ({
+    ...c,
+    albumReleaseId: 100,
+    tracks: [{ id: 1001 + i, title: `Track ${i + 1}`, trackNumber: i + 1, position: i + 1, mediumNumber: 1, foreignRecordingId: `rec-${i + 1}` }],
+    rejections: [],
+  }));
+  const sameTracks = Object.fromEntries(Array.from({ length: 11 }, (_, i) => [400 + i, [1001 + i]]));
+  await withServers(incidentOpts({ lidarrCandidates: sameReleaseCandidates, lidarrCandidateTracks: sameTracks }), async (port, logs) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: sameReleaseCandidates.map((c) => ({ candidateId: c.id })),
+    });
+    const impact = preview.payload.releaseSwitchImpact.find((i) => i.albumId === 9);
+    assert.equal(impact.releaseWillChange, false);
+    assert.equal(impact.requiresAuthorization, false);
+
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: sameReleaseCandidates.map((c) => ({ candidateId: c.id })),
+    });
+    assert.equal(exec.isError, false, exec.text);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 1);
+  });
+});
+
+test("lidarr first import to an album with no files is allowed despite a release change", async () => {
+  const noFilesAlbum = { ...INCIDENT_ALBUM, statistics: { trackFileCount: 0, trackCount: 17, totalTrackCount: 17, sizeOnDisk: 0, percentOfTracks: 0 } };
+  await withServers(incidentOpts({ lidarrAlbums: { 9: noFilesAlbum } }), async (port, logs) => {
+    const preview = await callTool(port, "lidarr_preview_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id })),
+    });
+    const impact = preview.payload.releaseSwitchImpact.find((i) => i.albumId === 9);
+    assert.equal(impact.releaseWillChange, true);
+    assert.equal(impact.albumHasExistingFiles, false);
+    assert.equal(impact.requiresAuthorization, false);
+
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+    });
+    assert.equal(exec.isError, false, exec.text);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 1);
+  });
+});
+
+test("lidarr execute refuses when one album's candidates resolve to multiple releases", async () => {
+  const mixed = [
+    { ...INCIDENT_CANDIDATES[0], albumReleaseId: 100, tracks: [{ id: 1001, foreignRecordingId: "rec-1", title: "Track 1", trackNumber: 1, position: 1, mediumNumber: 1 }] },
+    { ...INCIDENT_CANDIDATES[1], albumReleaseId: 200, tracks: [{ id: 2002, foreignRecordingId: "rec-2", title: "Track 2", trackNumber: 2, position: 2, mediumNumber: 1 }] },
+  ];
+  const mixedTracks = { 400: [1001], 401: [2002] };
+  await withServers(incidentOpts({ lidarrCandidates: mixed, lidarrCandidateTracks: mixedTracks }), async (port, logs) => {
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: mixed.map((c) => ({ candidateId: c.id, allowRejected: true })),
+    });
+    assert.equal(exec.isError, true, exec.text);
+    assert.match(exec.text, /multiple album releases/i);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0);
+  });
+});
+
+test("lidarr execute refuses when the album's current monitored release is ambiguous", async () => {
+  const noMonitored = {
+    ...INCIDENT_ALBUM,
+    releases: [
+      { id: 100, albumId: 9, title: "Deluxe Edition", status: "Official", duration: 0, trackCount: 17, monitored: false },
+      { id: 200, albumId: 9, title: "Standard Edition", status: "Official", duration: 0, trackCount: 11, monitored: false },
+    ],
+  };
+  await withServers(incidentOpts({ lidarrAlbums: { 9: noMonitored } }), async (port, logs) => {
+    const exec = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+    });
+    assert.equal(exec.isError, true, exec.text);
+    assert.match(exec.text, /monitored release|cannot be (assessed|evaluated)/i);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0);
+  });
+});
+
+test("releaseSwitchAuthorizations are validated at the boundary before any native request", async () => {
+  await withServers(incidentOpts(), async (port, logs) => {
+    const bad = [
+      { albumId: 0, fromAlbumReleaseId: 100, toAlbumReleaseId: 200 },
+      { albumId: 9, fromAlbumReleaseId: 0, toAlbumReleaseId: 200 },
+      { albumId: 9, fromAlbumReleaseId: 100, toAlbumReleaseId: 0 },
+      { albumId: 9, fromAlbumReleaseId: 100, toAlbumReleaseId: 100 },
+      { albumId: 9, fromAlbumReleaseId: "100", toAlbumReleaseId: 200 },
+      { albumId: 9, fromAlbumReleaseId: 100.5, toAlbumReleaseId: 200 },
+    ];
+    for (const auth of bad) {
+      const result = await callTool(port, "lidarr_execute_manual_import", {
+        downloadId: LIDARR_DOWNLOAD_ID,
+        items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+        releaseSwitchAuthorizations: [auth],
+      });
+      assert.equal(result.isError, true, `authorization ${JSON.stringify(auth)} must be refused`);
+      assert.match(result.text, /releaseSwitchAuthorizations/i);
+    }
+    // Duplicate albumId refused.
+    const dup = await callTool(port, "lidarr_execute_manual_import", {
+      downloadId: LIDARR_DOWNLOAD_ID,
+      items: INCIDENT_CANDIDATES.map((c) => ({ candidateId: c.id, allowRejected: true })),
+      releaseSwitchAuthorizations: [
+        { albumId: 9, fromAlbumReleaseId: 100, toAlbumReleaseId: 200 },
+        { albumId: 9, fromAlbumReleaseId: 100, toAlbumReleaseId: 201 },
+      ],
+    });
+    assert.equal(dup.isError, true, "duplicate albumId authorization must be refused");
+    assert.match(dup.text, /releaseSwitchAuthorizations/i);
+    assert.equal(requestsTo(logs.lidarr, "POST", "/api/v1/command").length, 0, "refused authorizations produce no command");
+  });
+});
+
+test("lidarr execute schema documents release-switch authorization independence", async () => {
+  await withServers({}, async (port) => {
+    const tools = await lidarrToolSchemas(port);
+    const props = tools["lidarr_execute_manual_import"].inputSchema.properties;
+    const allow = props.items.items.properties.allowRejected.description;
+    assert.match(allow, /does NOT authorize.*release switch/i, "allowRejected must not authorize release switching");
+    const replace = props.replaceExistingFiles.description;
+    assert.match(replace, /does NOT authorize.*release switch/i, "replaceExistingFiles must not authorize release switching");
+    assert.doesNotMatch(replace, /non-destructive/i, "replaceExistingFiles=false must not be described as non-destructive");
+    const auth = props.releaseSwitchAuthorizations;
+    assert.ok(auth, "releaseSwitchAuthorizations present in the execute schema");
+    assert.match(auth.description, /album.*from.*to/i, "authorization is exact album/from/to authority");
+  });
+});
+
+test("lidarr disableReleaseSwitching schema states it does not keep the current release for this import", async () => {
+  await withServers({}, async (port) => {
+    const tools = await lidarrToolSchemas(port);
+    for (const tool of ["lidarr_preview_manual_import", "lidarr_execute_manual_import"]) {
+      const desc = tools[tool].inputSchema.properties.items.items.properties.disableReleaseSwitching.description;
+      assert.match(desc, /does NOT (prevent|keep)/i, "must clarify it does not prevent this import's release change");
+    }
+  });
+});
+
+test("lidarr_get_albums surfaces the monitored release and per-release track counts", async () => {
+  await withServers(incidentOpts(), async (port) => {
+    const result = await callTool(port, "lidarr_get_albums", { artistId: 5 });
+    assert.equal(result.isError, false, result.text);
+    const album = result.payload.albums.find((a) => a.id === 9);
+    assert.equal(album.anyReleaseOk, true);
+    assert.equal(album.monitoredRelease.id, 100);
+    assert.equal(album.monitoredRelease.trackCount, 17);
+    assert.equal(album.releases.length, 2);
+    const deluxe = album.releases.find((r) => r.id === 100);
+    const standard = album.releases.find((r) => r.id === 200);
+    assert.equal(deluxe.monitored, true);
+    assert.equal(deluxe.trackCount, 17);
+    assert.equal(standard.monitored, false);
+    assert.equal(standard.trackCount, 11);
+    assert.equal(standard.foreignReleaseId, "REL-200");
   });
 });

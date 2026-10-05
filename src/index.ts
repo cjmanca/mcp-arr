@@ -1227,7 +1227,7 @@ if (clients.lidarr) {
                 },
                 disableReleaseSwitching: {
                   type: "boolean",
-                  description: "Album-release policy. true = disable Lidarr's automatic release switching for this album; on import this persists by setting album.AnyReleaseOk=false, so it changes future album behavior — NOT only a one-import preference. false = keep automatic release switching allowed. When albumReleaseId is explicitly overridden, MCP/native Interactive Import semantics default this to true; set false explicitly to choose the release for this import without persistently disabling automatic switching.",
+                  description: "Album-release policy. true = disable Lidarr's automatic release switching for this album; on import this persists by setting album.AnyReleaseOk=false, so it changes FUTURE album behavior — NOT only a one-import preference. false = keep automatic release switching allowed. When albumReleaseId is explicitly overridden, MCP/native Interactive Import semantics default this to true; set false explicitly to choose the release for this import without persistently disabling automatic switching. IMPORTANT: this flag does NOT keep the currently selected release for THIS import and does NOT prevent a release switch — ManualImport always calls SetMonitored on the effective imported release, so switching editions still requires an exact releaseSwitchAuthorizations entry on execute.",
                 },
               },
               required: ["candidateId"],
@@ -1284,11 +1284,11 @@ if (clients.lidarr) {
                 },
                 disableReleaseSwitching: {
                   type: "boolean",
-                  description: "Album-release policy. true = disable Lidarr's automatic release switching for this album; on import this persists by setting album.AnyReleaseOk=false, so it changes future album behavior — NOT only a one-import preference. false = keep automatic release switching allowed. When albumReleaseId is explicitly overridden, MCP/native Interactive Import semantics default this to true; set false explicitly to choose the release for this import without persistently disabling automatic switching.",
+                  description: "Album-release policy. true = disable Lidarr's automatic release switching for this album; on import this persists by setting album.AnyReleaseOk=false, so it changes FUTURE album behavior — NOT only a one-import preference. false = keep automatic release switching allowed. When albumReleaseId is explicitly overridden, MCP/native Interactive Import semantics default this to true; set false explicitly to choose the release for this import without persistently disabling automatic switching. IMPORTANT: this flag does NOT keep the currently selected release for THIS import and does NOT prevent a release switch — ManualImport always calls SetMonitored on the effective imported release, so switching editions still requires an exact releaseSwitchAuthorizations entry on execute.",
                 },
                 allowRejected: {
                   type: "boolean",
-                  description: "Bypass Lidarr's remaining NATIVE IMPORT REJECTIONS for THIS candidate only (default false). This does NOT bypass MCP mapping safety: artist/album/release ownership checks, track-release validation, duplicate track ownership, candidate-id ambiguity, and other MCP hard validations still apply. Set true only after previewing and understanding each rejection.",
+                  description: "Bypass Lidarr's remaining NATIVE IMPORT REJECTIONS for THIS candidate only (default false). This does NOT bypass MCP mapping safety: artist/album/release ownership checks, track-release validation, duplicate track ownership, candidate-id ambiguity, and other MCP hard validations still apply. It also does NOT authorize a release switch (changing the album's monitored edition) — that requires an exact releaseSwitchAuthorizations entry. Set true only after previewing and understanding each rejection.",
                 },
               },
               required: ["candidateId"],
@@ -1301,11 +1301,24 @@ if (clients.lidarr) {
           },
           replaceExistingFiles: {
             type: "boolean",
-            description: "EXISTING LIBRARY FILE POLICY / DESTRUCTIVE EXECUTION BEHAVIOR (NOT the discovery filter — that is filterExistingFiles). false (default) = Lidarr UI 'Combine with existing files': no album-wide pre-delete; incoming files are combined with the album's existing files, subject to normal per-track import/upgrade behavior. true = Lidarr UI 'Replace Existing Files' / 'Existing files will be deleted': DESTRUCTIVE. Before importing the selected candidates, Lidarr removes ALL existing track files for EACH affected album, not only files for the selected tracks. A partial selection or later import failure can therefore leave the album missing files. importMode=copy does NOT neutralize this. Do not set true merely because some target tracks already have files.",
+            description: "EXISTING LIBRARY FILE POLICY / DESTRUCTIVE EXECUTION BEHAVIOR (NOT the discovery filter — that is filterExistingFiles; and NOT the release/edition switch — that is albumReleaseId / releaseSwitchAuthorizations). false (default) = Lidarr UI 'Combine with existing files': this skips Lidarr's album-wide pre-delete, but normal per-track import/upgrade processing still replaces/deletes the existing library files mapped to the incoming tracks. It also does NOT prevent Lidarr from changing the album's monitored release. true = Lidarr UI 'Replace Existing Files' / 'Existing files will be deleted': DESTRUCTIVE. Before importing the selected candidates, Lidarr removes ALL existing track files for EACH affected album, not only files for the selected tracks. A partial selection or later import failure can therefore leave the album missing files. importMode=copy does NOT neutralize this. Do not set true merely because some target tracks already have files. replaceExistingFiles does NOT authorize a release switch (edition change) — that requires an exact releaseSwitchAuthorizations entry.",
           },
           filterExistingFiles: {
             type: "boolean",
             description: "CANDIDATE VISIBILITY / DISCOVERY FILTER (NOT the existing-library-file policy — that is replaceExistingFiles). true (default) = UI 'Unmapped Files Only': omit unchanged files Lidarr already knows and has mapped to tracks. false = UI 'All Files': include those files as candidates too. Discovery only — it does NOT delete, replace, or authorize replacement. Pass the same value used for discovery/preview so execute re-fetches the identical candidate set.",
+          },
+          releaseSwitchAuthorizations: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                albumId: { type: "integer", minimum: 1, description: "Album whose monitored release/edition will change" },
+                fromAlbumReleaseId: { type: "integer", minimum: 1, description: "The album's CURRENTLY monitored release id" },
+                toAlbumReleaseId: { type: "integer", minimum: 1, description: "The release id this import will make monitored (must differ from from)" },
+              },
+              required: ["albumId", "fromAlbumReleaseId", "toAlbumReleaseId"],
+            },
+            description: "EXACT, scoped authorization for an intentional release/edition switch — one entry per album: 'authorize album {albumId} to change from release {fromAlbumReleaseId} to release {toAlbumReleaseId}'. Nothing broader. Required when an album already has files and the effective imported release differs from its monitored release; execute hard-blocks such a switch otherwise. Validated against the album's CURRENT monitored release at execute time, so a stale from-id (the release changed since preview) is refused — re-preview to get a fresh authorization. allowRejected, replaceExistingFiles and disableReleaseSwitching do NOT authorize a release switch. For a partial upgrade that KEEPS the current edition, use the preview's preserveCurrentRelease.itemOverrides instead (no authorization needed).",
           },
         },
         required: ["downloadId", "items"],
@@ -3617,8 +3630,18 @@ function lidarrDependencyProblems(
  */
 interface LidarrAlbumIdentity {
   id: number;
+  title: string | null;
   artistId: number;
-  releases: Array<{ id: number; albumId: number }>;
+  anyReleaseOk: boolean;
+  trackFileCount: number;
+  releases: Array<{
+    id: number;
+    albumId: number;
+    foreignReleaseId?: string;
+    title?: string;
+    trackCount?: number;
+    monitored?: boolean;
+  }>;
 }
 
 async function getLidarrAlbumIdentity(
@@ -3632,7 +3655,14 @@ async function getLidarrAlbumIdentity(
   try {
     const album = await client.getAlbumById(albumId, ctx.signal);
     resolved = album && album.id > 0
-      ? { id: album.id, artistId: album.artistId, releases: album.releases ?? [] }
+      ? {
+        id: album.id,
+        title: album.title ?? null,
+        artistId: album.artistId,
+        anyReleaseOk: album.anyReleaseOk ?? false,
+        trackFileCount: album.statistics?.trackFileCount ?? 0,
+        releases: album.releases ?? [],
+      }
       : null;
   } catch (error) {
     rethrowIfOperationAborted(ctx.signal);
@@ -3747,6 +3777,256 @@ async function resolveLidarrTrackIds(
   };
 }
 
+// --- Lidarr release/edition switching ---------------------------------------
+//
+// Native Lidarr `ImportApprovedTracks.Import` ends with
+//   album.AlbumReleases = _releaseService.SetMonitored(newRelease);
+// for the EFFECTIVE imported release, INDEPENDENT of replaceExistingFiles. So a
+// ManualImport command targeting a different albumReleaseId silently changes the
+// album's monitored edition (e.g. a 17-track deluxe → an 11-track standard) even
+// with replaceExistingFiles=false. That is a destructive, edition-level decision
+// that none of allowRejected / replaceExistingFiles / disableReleaseSwitching
+// authorizes, so it gets its own explicit album/from/to authorization.
+
+interface LidarrReleaseSwitchImpact {
+  albumId: number;
+  albumTitle: string | null;
+  currentRelease: { id: number; title: string | null; trackCount: number } | null;
+  proposedRelease: { id: number; title: string | null; trackCount: number } | null;
+  releaseWillChange: boolean;
+  albumHasExistingFiles: boolean;
+  requiresAuthorization: boolean;
+  assessmentAvailable: boolean;
+  mixedReleases: boolean;
+  proposedReleaseIds: number[];
+  sharedRecordingCount?: number;
+  currentOnlyRecordingCount?: number;
+  proposedOnlyRecordingCount?: number;
+  currentOnlyTracks?: Array<{ id: number; title: string | null; trackNumber: number | null; foreignRecordingId: string | null }>;
+  proposedOnlyTracks?: Array<{ id: number; title: string | null; trackNumber: number | null; foreignRecordingId: string | null }>;
+  preserveCurrentRelease?: {
+    possible: boolean;
+    albumReleaseId?: number;
+    itemOverrides?: Array<{ candidateId: number; albumReleaseId: number; trackIds: number[]; disableReleaseSwitching: boolean }>;
+    problems?: string[];
+  };
+  warning?: string;
+}
+
+interface LidarrCandidateReleaseState {
+  candidateId: number;
+  albumId: number;
+  albumReleaseId: number;
+  tracks: LidarrTrack[];
+}
+
+async function getLidarrReleaseTracks(
+  client: LidarrClient,
+  releaseId: number,
+  cache: Map<number, LidarrTrack[]>,
+  ctx: PreviewExecutionContext,
+): Promise<LidarrTrack[]> {
+  const cached = cache.get(releaseId);
+  if (cached) return cached;
+  const tracks = await client.getTracks({ albumReleaseId: releaseId }, ctx.signal);
+  cache.set(releaseId, tracks);
+  return tracks;
+}
+
+function compactLidarrTrackForImpact(t: LidarrTrack) {
+  return {
+    id: t.id,
+    title: t.title ?? null,
+    trackNumber: t.trackNumber ?? null,
+    foreignRecordingId: t.foreignRecordingId ?? null,
+  };
+}
+
+/**
+ * Compare two releases by MusicBrainz recording identity. Lidarr track ids are
+ * release-specific, so the same recording has a different `id` on each edition;
+ * `foreignRecordingId` is the stable join key. Counts are over DISTINCT
+ * recording ids (multiset-safe: a recording repeated on an edition counts once
+ * per release). Tracks with no recording id cannot be matched and are excluded
+ * from the overlap counts.
+ */
+function compareLidarrRecordings(currentTracks: LidarrTrack[], proposedTracks: LidarrTrack[]) {
+  const currentIds = new Set(currentTracks.map((t) => t.foreignRecordingId).filter((r): r is string => !!r));
+  const proposedIds = new Set(proposedTracks.map((t) => t.foreignRecordingId).filter((r): r is string => !!r));
+  let shared = 0;
+  for (const id of currentIds) if (proposedIds.has(id)) shared++;
+  const currentOnlyIds = new Set([...currentIds].filter((id) => !proposedIds.has(id)));
+  const proposedOnlyIds = new Set([...proposedIds].filter((id) => !currentIds.has(id)));
+  return {
+    shared,
+    currentOnly: currentOnlyIds.size,
+    proposedOnly: proposedOnlyIds.size,
+    currentOnlyTracks: currentTracks.filter((t) => t.foreignRecordingId && currentOnlyIds.has(t.foreignRecordingId)).map(compactLidarrTrackForImpact),
+    proposedOnlyTracks: proposedTracks.filter((t) => t.foreignRecordingId && proposedOnlyIds.has(t.foreignRecordingId)).map(compactLidarrTrackForImpact),
+  };
+}
+
+/**
+ * Build the safe partial-upgrade remap: for every selected candidate, map its
+ * proposed track(s) onto the CURRENTLY MONITORED release's tracks by exact
+ * recording id. Requires an unambiguous 1:1 match per proposed track — no fuzzy
+ * title matching. If any proposed track has no recording id, or 0 / >1 matches
+ * on the current release, the remap is not possible and the reason is reported.
+ */
+function buildLidarrPreserveCurrentRelease(
+  states: LidarrCandidateReleaseState[],
+  currentTracks: LidarrTrack[],
+  currentReleaseId: number,
+): LidarrReleaseSwitchImpact["preserveCurrentRelease"] {
+  const itemOverrides: Array<{ candidateId: number; albumReleaseId: number; trackIds: number[]; disableReleaseSwitching: boolean }> = [];
+  for (const s of states) {
+    const trackIds: number[] = [];
+    for (const t of s.tracks) {
+      const rec = t.foreignRecordingId;
+      if (!rec) {
+        return {
+          possible: false,
+          problems: [`candidate ${s.candidateId} track ${t.id} has no MusicBrainz recording id, so it cannot be mapped onto the current release`],
+        };
+      }
+      const matches = currentTracks.filter((ct) => ct.foreignRecordingId === rec);
+      if (matches.length !== 1) {
+        return {
+          possible: false,
+          problems: [`candidate ${s.candidateId} track ${t.id} (recording ${rec}) has ${matches.length} match(es) on the current release — the recording mapping is ambiguous, so no safe remap is suggested`],
+        };
+      }
+      trackIds.push(matches[0].id);
+    }
+    itemOverrides.push({ candidateId: s.candidateId, albumReleaseId: currentReleaseId, trackIds, disableReleaseSwitching: false });
+  }
+  return { possible: true, albumReleaseId: currentReleaseId, itemOverrides };
+}
+
+/**
+ * Analyze the EFFECTIVE (post-reprocess) release mappings against Lidarr's
+ * CURRENT album state. Never infers the current release from the incoming
+ * files — it reads GET /album/{id} (monitored release + trackFileCount) and,
+ * only when a switch is proposed, GET /track?albumReleaseId= for both releases.
+ * Returns one impact per affected album.
+ */
+async function analyzeLidarrReleaseSwitches(
+  client: LidarrClient,
+  candidateStates: LidarrCandidateReleaseState[],
+  albumCache: Map<number, LidarrAlbumIdentity | null>,
+  releaseTrackCache: Map<number, LidarrTrack[]>,
+  ctx: PreviewExecutionContext,
+): Promise<LidarrReleaseSwitchImpact[]> {
+  const byAlbum = new Map<number, LidarrCandidateReleaseState[]>();
+  for (const s of candidateStates) {
+    if (s.albumId <= 0) continue;
+    const list = byAlbum.get(s.albumId) ?? [];
+    list.push(s);
+    byAlbum.set(s.albumId, list);
+  }
+
+  const impacts: LidarrReleaseSwitchImpact[] = [];
+  for (const [albumId, states] of byAlbum) {
+    const proposedReleaseIds = [...new Set(states.map((s) => s.albumReleaseId).filter((id) => id > 0))];
+    const album = await getLidarrAlbumIdentity(client, albumId, albumCache, ctx);
+    const albumTitle = album?.title ?? null;
+    const albumHasExistingFiles = (album?.trackFileCount ?? 0) > 0;
+    const monitored = (album?.releases ?? []).filter((r) => r.monitored === true);
+    const currentRelease = monitored.length === 1
+      ? { id: monitored[0].id, title: monitored[0].title ?? null, trackCount: monitored[0].trackCount ?? 0 }
+      : null;
+    const ambiguousCurrent = albumHasExistingFiles && monitored.length !== 1;
+    const mixedReleases = proposedReleaseIds.length > 1;
+    const proposedReleaseId = proposedReleaseIds.length === 1 ? proposedReleaseIds[0] : 0;
+    const releaseOf = (id: number) => (album?.releases ?? []).find((r) => r.id === id);
+    const proposedRelease = proposedReleaseId > 0
+      ? { id: proposedReleaseId, title: releaseOf(proposedReleaseId)?.title ?? null, trackCount: releaseOf(proposedReleaseId)?.trackCount ?? 0 }
+      : null;
+    const releaseWillChange = proposedReleaseId > 0 && currentRelease !== null && currentRelease.id !== proposedReleaseId;
+
+    const impact: LidarrReleaseSwitchImpact = {
+      albumId,
+      albumTitle,
+      currentRelease,
+      proposedRelease,
+      releaseWillChange,
+      albumHasExistingFiles,
+      requiresAuthorization: false,
+      assessmentAvailable: !ambiguousCurrent,
+      mixedReleases,
+      proposedReleaseIds,
+    };
+
+    if (ambiguousCurrent) {
+      impact.requiresAuthorization = true;
+      impact.warning = `Album ${albumId} has existing files but ${monitored.length} monitored release(s); the current edition cannot be determined, so a release switch cannot be assessed. Inspect/fix the album's release state (lidarr_get_albums) and preview again.`;
+      impacts.push(impact);
+      continue;
+    }
+
+    if (releaseWillChange && albumHasExistingFiles) {
+      impact.requiresAuthorization = true;
+    }
+
+    if (releaseWillChange && currentRelease && proposedRelease) {
+      const currentTracks = await getLidarrReleaseTracks(client, currentRelease.id, releaseTrackCache, ctx);
+      const proposedTracks = await getLidarrReleaseTracks(client, proposedReleaseId, releaseTrackCache, ctx);
+      const cmp = compareLidarrRecordings(currentTracks, proposedTracks);
+      impact.sharedRecordingCount = cmp.shared;
+      impact.currentOnlyRecordingCount = cmp.currentOnly;
+      impact.proposedOnlyRecordingCount = cmp.proposedOnly;
+      impact.currentOnlyTracks = cmp.currentOnlyTracks;
+      impact.proposedOnlyTracks = cmp.proposedOnlyTracks;
+      impact.preserveCurrentRelease = buildLidarrPreserveCurrentRelease(states, currentTracks, currentRelease.id);
+      impact.warning = albumHasExistingFiles
+        ? `WARNING: this is not merely a quality upgrade. Lidarr ManualImport will change the album's monitored release/edition from release ${currentRelease.id} (${currentRelease.trackCount} tracks) to release ${proposedReleaseId} (${proposedRelease.trackCount} tracks). ${cmp.currentOnly} recording(s) exist only on the current release and fall outside the proposed edition. allowRejected does NOT authorize this release switch.`
+        : `This import will set the album's monitored release to ${proposedReleaseId} (${proposedRelease.trackCount} tracks); the album has no existing files, so no edition is being replaced.`;
+    }
+
+    impacts.push(impact);
+  }
+  return impacts;
+}
+
+/**
+ * Exact, scoped release-switch authorization (execute only). One entry per
+ * album: "I authorize album {albumId} to change from release {from} to release
+ * {to}". Validated at the boundary: positive integer ids, from != to, no
+ * duplicate album. Strings/zero/negatives/fractions are refused before any
+ * native request.
+ */
+function parseLidarrReleaseSwitchAuthorizations(args: unknown): Array<{ albumId: number; fromAlbumReleaseId: number; toAlbumReleaseId: number }> {
+  const a = (args ?? {}) as ManualImportToolArgs & { releaseSwitchAuthorizations?: unknown };
+  const raw = a.releaseSwitchAuthorizations;
+  if (raw === undefined) return [];
+  if (!Array.isArray(raw)) {
+    throw new Error("releaseSwitchAuthorizations must be an array of { albumId, fromAlbumReleaseId, toAlbumReleaseId } entries.");
+  }
+  const seenAlbums = new Set<number>();
+  const parsed: Array<{ albumId: number; fromAlbumReleaseId: number; toAlbumReleaseId: number }> = [];
+  for (const entry of raw) {
+    const e = (entry ?? {}) as Record<string, unknown>;
+    for (const key of ["albumId", "fromAlbumReleaseId", "toAlbumReleaseId"] as const) {
+      const v = e[key];
+      if (typeof v !== "number" || !Number.isInteger(v) || v <= 0) {
+        throw new Error(`releaseSwitchAuthorizations entry ${key} must be a positive integer id (0, negatives, fractions and strings are never valid).`);
+      }
+    }
+    const albumId = e.albumId as number;
+    const from = e.fromAlbumReleaseId as number;
+    const to = e.toAlbumReleaseId as number;
+    if (from === to) {
+      throw new Error(`releaseSwitchAuthorizations entry for album ${albumId} has fromAlbumReleaseId === toAlbumReleaseId (${from}); a release switch requires two different releases.`);
+    }
+    if (seenAlbums.has(albumId)) {
+      throw new Error(`releaseSwitchAuthorizations has more than one entry for album ${albumId}; authorize exactly one from→to switch per album.`);
+    }
+    seenAlbums.add(albumId);
+    parsed.push({ albumId, fromAlbumReleaseId: from, toAlbumReleaseId: to });
+  }
+  return parsed;
+}
+
 async function previewLidarrManualImport(client: LidarrClient, args: unknown, ctx: PreviewExecutionContext) {
   const { downloadId, items, replaceExistingFiles, filterExistingFiles } = parseManualImportArgs(args, "lidarr");
   const a = (args ?? {}) as ManualImportToolArgs;
@@ -3812,6 +4092,7 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown, ct
   // below — a mixed valid/invalid request reads in the order it was sent.
   const previewById = new Map<number, Record<string, unknown>>();
   const mismatches: Array<{ candidateId: number; tracksOutsideRelease: number[] }> = [];
+  const releaseStates: LidarrCandidateReleaseState[] = [];
   for (const { candidate, override, mapping, dependencyProblems, relationshipValidation } of previewable) {
     const r = byId.get(candidate.id);
     if (!r) {
@@ -3823,6 +4104,12 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown, ct
     if (resolvedTracks.releaseTrackMismatch.length > 0) {
       mismatches.push({ candidateId: candidate.id, tracksOutsideRelease: resolvedTracks.releaseTrackMismatch });
     }
+    releaseStates.push({
+      candidateId: candidate.id,
+      albumId: r.album?.id ?? 0,
+      albumReleaseId: r.albumReleaseId ?? 0,
+      tracks: resolvedTracks.tracks,
+    });
     const rejections = r.rejections ?? [];
     const mappingValid =
       (r.artist?.id ?? 0) > 0 &&
@@ -3919,19 +4206,60 @@ async function previewLidarrManualImport(client: LidarrClient, args: unknown, ct
   // Emit in the caller's original item order, not valid-then-invalid.
   const previews = mappings.map((m) => previewById.get(m.candidate.id)).filter((p): p is Record<string, unknown> => !!p);
 
+  // Release/edition-switch analysis against Lidarr's CURRENT album state. This
+  // is the safety boundary the native SetMonitored(newRelease) makes invisible:
+  // importing a candidate whose effective albumReleaseId differs from the
+  // album's monitored release changes the album's edition, independent of
+  // replaceExistingFiles. Preview only DETECTS and SUGGESTS; execute enforces.
+  ctx.setStage("analyzing-release-switches");
+  const releaseSwitchImpact = await analyzeLidarrReleaseSwitches(
+    client, releaseStates, albumIdentityCache, releaseTrackCache, ctx,
+  );
+  const impactByAlbum = new Map(releaseSwitchImpact.map((i) => [i.albumId, i]));
+  const overrideByCandidate = new Map<number, { albumReleaseId: number; trackIds: number[] }>();
+  for (const impact of releaseSwitchImpact) {
+    for (const ov of impact.preserveCurrentRelease?.itemOverrides ?? []) {
+      overrideByCandidate.set(ov.candidateId, { albumReleaseId: ov.albumReleaseId, trackIds: ov.trackIds });
+    }
+  }
+  for (const item of previews) {
+    const albumId = (item.album as { id?: number } | null)?.id ?? 0;
+    const impact = impactByAlbum.get(albumId);
+    if (!impact || !impact.releaseWillChange) continue;
+    const ov = overrideByCandidate.get(item.candidateId as number);
+    item.currentReleaseEquivalent = ov
+      ? { available: true, albumReleaseId: ov.albumReleaseId, trackIds: ov.trackIds }
+      : {
+        available: false,
+        albumReleaseId: impact.currentRelease?.id ?? null,
+        trackIds: [],
+        reason: impact.preserveCurrentRelease?.problems?.[0]
+          ?? "No unique recording match exists on the currently monitored release.",
+      };
+  }
+
+  const switchWarnings = releaseSwitchImpact.filter((i) => i.releaseWillChange && i.albumHasExistingFiles);
+
   return {
     verifyBeforeActing: LIDARR_VERIFY_DIRECTIVE,
     downloadId,
     existingFilesPolicy: lidarrExistingFilesPolicy(replaceExistingFiles),
     candidateFilterPolicy: lidarrCandidateFilterPolicy(filterExistingFiles),
+    releaseSwitchImpact,
     count: previews.length,
     items: previews,
     notes: [
       "Lidarr recomputes the track mapping server-side from the artist/album/release overrides; the tracks shown here are what lidarr_execute_manual_import will import.",
       "tracksSource=caller-override means your explicit trackIds were validated against the selected album release's track list (GET /track?albumReleaseId=…) and will be used as-is; tracksSource=lidarr-recomputed means Lidarr's server-side mapping is being used.",
       "The mapping is a hierarchy artist → album → album release → tracks: an artistId override clears the inherited album, release and tracks, an albumId override clears the inherited release and tracks, and an albumReleaseId override clears the inherited tracks (native Interactive Import behavior). Supply the full corrected selection below a changed parent — a cleared child is re-identified by Lidarr from the files, and execute refuses an incomplete mapping.",
-      "Supplying an explicit albumReleaseId defaults disableReleaseSwitching to true (native UI behavior; it persists as album.AnyReleaseOk=false on import). Set it to false explicitly to keep the album's automatic release selection.",
+      "Supplying an explicit albumReleaseId defaults disableReleaseSwitching to true (native UI behavior; it persists as album.AnyReleaseOk=false on import). Set it to false explicitly to keep the album's automatic release selection. disableReleaseSwitching controls FUTURE automatic switching — it does NOT keep the current release for THIS import: ManualImport always calls SetMonitored on the effective imported release.",
       "Items whose explicit ids break the hierarchy (nonexistent album/release, child under a cleared parent) are NOT sent to the native reprocess — Lidarr would throw on the lookup before it could diagnose them. They are returned with canPreview=false, dependencyProblems and relationshipValidation; fix the ids and preview again.",
+      ...(switchWarnings.length > 0
+        ? switchWarnings.map((i) => `RELEASE SWITCH: ${i.warning} To upgrade these recordings WITHOUT changing the edition, apply releaseSwitchImpact[].preserveCurrentRelease.itemOverrides (albumReleaseId ${i.currentRelease?.id} + the current-release trackIds) and run lidarr_preview_manual_import again — verify releaseWillChange becomes false before execute. Do not skip preview and go straight to execute with the generated overrides.`)
+        : []),
+      ...(releaseSwitchImpact.some((i) => i.releaseWillChange && i.albumHasExistingFiles)
+        ? ["Lidarr rejections such as 'Album match is not close enough' / 'Has unmatched tracks' alongside releaseWillChange=true are evidence it is matching a DIFFERENT EDITION, not merely a quality mismatch. Do not set allowRejected=true until the release-switch impact is resolved — allowRejected does NOT authorize a release switch."]
+        : []),
       ...(mismatches.length > 0
         ? [`Inconsistency surfaced (not authorized): Lidarr's recomputed mapping for ${mismatches.map((m) => `candidate ${m.candidateId} [tracks ${m.tracksOutsideRelease.join(", ")}]`).join("; ")} includes tracks outside the selected release's track query. The caller-override allowlist stays the release list; review the release selection if this is unexpected.`]
         : []),
@@ -4007,6 +4335,7 @@ async function executeLidarrManualImport(client: LidarrClient, args: unknown) {
   const trackOwners = new Map<number, number>();
   const releaseTrackCache = new Map<number, LidarrTrack[]>();
   const mismatches: Array<{ candidateId: number; tracksOutsideRelease: number[] }> = [];
+  const releaseStates: LidarrCandidateReleaseState[] = [];
 
   for (const { candidate, override } of resolved) {
     const r = byId.get(candidate.id);
@@ -4086,6 +4415,7 @@ async function executeLidarrManualImport(client: LidarrClient, args: unknown) {
       downloadId: r.downloadId ?? downloadId,
       disableReleaseSwitching: r.disableReleaseSwitching ?? false,
     });
+    releaseStates.push({ candidateId: candidate.id, albumId, albumReleaseId, tracks: resolvedTracks.tracks });
   }
 
   if (blocked.length > 0) {
@@ -4100,6 +4430,59 @@ async function executeLidarrManualImport(client: LidarrClient, args: unknown) {
     });
   }
 
+  // Release/edition-switch enforcement, computed from FRESH native state (the
+  // preview is never import authority). Native ImportApprovedTracks.Import calls
+  // SetMonitored(effectiveRelease) regardless of replaceExistingFiles, so an
+  // unapproved switch silently changes the album's edition. allowRejected,
+  // replaceExistingFiles and disableReleaseSwitching do NOT authorize it.
+  const releaseSwitchAuthorizations = parseLidarrReleaseSwitchAuthorizations(args);
+  const releaseSwitchImpact = await analyzeLidarrReleaseSwitches(
+    client, releaseStates, albumIdentityCache, releaseTrackCache, execCtx,
+  );
+
+  const mixedReleaseAlbums = releaseSwitchImpact.filter((i) => i.mixedReleases);
+  if (mixedReleaseAlbums.length > 0) {
+    return jsonTextError({
+      error: "Candidates for one album resolve to multiple album releases; refusing to let native command ordering decide the monitored edition.",
+      downloadId,
+      releaseSwitchImpact,
+      guidance: [
+        "Native Lidarr sets the album's monitored release from the group's first release, so a mixed-release command is ambiguous. Select exactly one albumReleaseId per album (preview shows each candidate's effective release) and preview again.",
+      ],
+    });
+  }
+
+  const ambiguousAlbums = releaseSwitchImpact.filter((i) => !i.assessmentAvailable);
+  if (ambiguousAlbums.length > 0) {
+    return jsonTextError({
+      error: "The album's current monitored release cannot be assessed, so a release switch cannot be evaluated safely; execution refused.",
+      downloadId,
+      releaseSwitchImpact,
+      guidance: [
+        "The album has existing files but zero or multiple monitored releases. Inspect/fix the album's release state (lidarr_get_albums shows the monitored release), then preview again. releaseSwitchAuthorizations cannot authorize a switch from an unknown current release.",
+      ],
+    });
+  }
+
+  const authKey = (albumId: number, from: number, to: number) => `${albumId}:${from}:${to}`;
+  const authorized = new Set(releaseSwitchAuthorizations.map((a) => authKey(a.albumId, a.fromAlbumReleaseId, a.toAlbumReleaseId)));
+  const unapprovedSwitches = releaseSwitchImpact.filter(
+    (i) => i.requiresAuthorization && i.releaseWillChange && i.albumHasExistingFiles
+      && !authorized.has(authKey(i.albumId, i.currentRelease?.id ?? 0, i.proposedRelease?.id ?? 0)),
+  );
+  if (unapprovedSwitches.length > 0) {
+    return jsonTextError({
+      error: "Release switch requires explicit authorization.",
+      downloadId,
+      releaseSwitchImpact,
+      guidance: [
+        "This import would change the album's monitored release/edition (native ManualImport calls SetMonitored on the effective release). allowRejected, replaceExistingFiles and disableReleaseSwitching do NOT authorize a release switch.",
+        "For a partial quality upgrade WITHOUT changing the edition, apply releaseSwitchImpact[].preserveCurrentRelease.itemOverrides (albumReleaseId = the current monitored release + the current-release trackIds), preview again, and verify releaseWillChange is false before execute.",
+        "To intentionally switch editions, pass releaseSwitchAuthorizations=[{ albumId, fromAlbumReleaseId: <current monitored release>, toAlbumReleaseId: <proposed release> }] — an exact album/from/to authorization. Re-preview first: the authorization is validated against the current release at execute time, so a stale from-id is refused.",
+      ],
+    });
+  }
+
   const command = await client.executeManualImport(files, importMode, replaceExistingFiles);
 
   return jsonText({
@@ -4109,6 +4492,7 @@ async function executeLidarrManualImport(client: LidarrClient, args: unknown) {
     replaceExistingFiles,
     existingFilesPolicy: lidarrExistingFilesPolicy(replaceExistingFiles),
     candidateFilterPolicy: lidarrCandidateFilterPolicy(filterExistingFiles),
+    releaseSwitchImpact,
     downloadId,
     files: files.map((f) => ({
       path: f.path,
@@ -5237,17 +5621,31 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
             type: "text",
             text: JSON.stringify({
               count: albums.length,
-              albums: albums.map(a => ({
-                id: a.id,
-                title: a.title,
-                releaseDate: a.releaseDate,
-                albumType: a.albumType,
-                monitored: a.monitored,
-                tracks: a.statistics ? `${a.statistics.trackFileCount}/${a.statistics.totalTrackCount}` : 'unknown',
-                sizeOnDisk: formatBytes(a.statistics?.sizeOnDisk || 0),
-                percentComplete: a.statistics?.percentOfTracks || 0,
-                grabbed: a.grabbed,
-              })),
+              albums: albums.map(a => {
+                const releases = (a.releases ?? []).map(r => ({
+                  id: r.id,
+                  title: r.title ?? null,
+                  foreignReleaseId: r.foreignReleaseId ?? null,
+                  trackCount: r.trackCount ?? 0,
+                  monitored: r.monitored === true,
+                }));
+                const monitoredRelease = releases.find(r => r.monitored) ?? null;
+                return {
+                  id: a.id,
+                  title: a.title,
+                  releaseDate: a.releaseDate,
+                  albumType: a.albumType,
+                  monitored: a.monitored,
+                  anyReleaseOk: a.anyReleaseOk ?? false,
+                  tracks: a.statistics ? `${a.statistics.trackFileCount}/${a.statistics.totalTrackCount}` : 'unknown',
+                  trackFileCount: a.statistics?.trackFileCount ?? 0,
+                  monitoredRelease,
+                  releases,
+                  sizeOnDisk: formatBytes(a.statistics?.sizeOnDisk || 0),
+                  percentComplete: a.statistics?.percentOfTracks || 0,
+                  grabbed: a.grabbed,
+                };
+              }),
             }, null, 2),
           }],
         };

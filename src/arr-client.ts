@@ -723,15 +723,31 @@ export interface LidarrManualImportUpdateItem {
   disableReleaseSwitching?: boolean;
 }
 
-/** One native Lidarr `TrackResource` (GET /api/v1/track?albumId=…). */
+/**
+ * One native Lidarr `TrackResource` (GET /api/v1/track?albumReleaseId=…).
+ *
+ * The safety-critical fields are declared explicitly (not left to the index
+ * signature) because cross-edition identity and existing-file state drive the
+ * release-switch guard:
+ *   - `foreignRecordingId` is the MusicBrainz recording id. Lidarr track ids are
+ *     release-specific, so the same recording has a DIFFERENT `id` on the deluxe
+ *     and standard releases; `foreignRecordingId` is the stable join key.
+ *   - `trackFileId` / `hasFile` report whether this release track already has a
+ *     library file.
+ */
 export interface LidarrTrack {
   id: number;
   artistId?: number;
   albumId?: number;
+  albumReleaseId?: number;
   title?: string;
   trackNumber?: number;
   position?: number;
   mediumNumber?: number;
+  foreignTrackId?: string;
+  foreignRecordingId?: string;
+  trackFileId?: number | null;
+  hasFile?: boolean;
   [key: string]: unknown;
 }
 
