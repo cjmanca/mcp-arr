@@ -1,12 +1,15 @@
 /**
- * Runtime configuration for long-running preview operations and upstream API
- * timeouts.
+ * Runtime configuration for long-running manual-import operations (candidate
+ * discovery and preview) and upstream API timeouts.
  *
  * Values are read from the environment on each call (not frozen at import) so
  * tests can set a small budget/timeout and have it take effect without a
  * rebuild. Each getter validates its variable: a missing, non-numeric,
  * non-integer, out-of-range, or nonsensical value falls back to the documented
  * default rather than throwing at startup.
+ *
+ * The PREVIEW_* names are kept for compatibility; they now govern BOTH
+ * non-importing manual-import operations — candidate discovery and preview.
  */
 
 function envInt(name: string, fallback: number, min: number, max: number): number {
@@ -34,16 +37,16 @@ export function manualImportApiTimeoutMs(): number {
 }
 
 /**
- * Soft synchronous response budget. A preview that finishes within this window
- * returns its result directly (unchanged fast path); a preview still running
- * after it returns a pollable operation handle. 0 means "always return a
- * handle". This never cancels the operation.
+ * Soft synchronous response budget for discovery and preview. An operation that
+ * finishes within this window returns its result directly (unchanged fast
+ * path); one still running after it returns a pollable operation handle. 0
+ * means "always return a handle". This never cancels the operation.
  */
 export function previewSyncBudgetMs(): number {
   return envInt("PREVIEW_SYNC_BUDGET_MS", 8000, 0, 600_000);
 }
 
-/** Absolute deadline for a whole preview operation (discovery → result). */
+/** Absolute deadline for a whole discovery/preview operation (request → result). */
 export function previewMaxRuntimeMs(): number {
   return envInt("PREVIEW_MAX_RUNTIME_MS", 300000, 1, 3_600_000);
 }

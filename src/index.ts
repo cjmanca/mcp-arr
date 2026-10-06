@@ -56,9 +56,10 @@ import { trashClient, TrashService } from "./trash-client.js";
 import {
   previewOperations,
   kindLabel,
-  type PreviewExecutionContext,
-  type PreviewOperation,
-  type PreviewOperationKind,
+  kindAction,
+  type OperationExecutionContext,
+  type ManagedOperation,
+  type OperationKind,
 } from "./preview-operations.js";
 import {
   previewSyncBudgetMs,
@@ -68,28 +69,28 @@ import {
 /**
  * A context for the synchronous (non-async-wrapped) execute path: a signal that
  * is never aborted (so only the per-request API timeouts apply) and a no-op
- * stage reporter. Execute is deliberately NOT registered as a preview
- * operation — it is destructive and revalidates from native state on every
- * call, so it must stay independent of the preview registry.
+ * stage reporter. Execute is deliberately NOT registered in the operation
+ * registry — it is destructive and revalidates from native state on every
+ * call, so it must stay independent of the discovery/preview registry.
  */
-function standaloneContext(): PreviewExecutionContext {
+function standaloneContext(): OperationExecutionContext {
   return { signal: new AbortController().signal, setStage: () => {} };
 }
 
 /**
  * Best-effort preview helpers swallow native lookup failures (404/500/connection
  * errors) and return a fallback so a preview can still report a candidate. A
- * whole-preview deadline or an explicit arr_cancel_operation aborts the
+ * whole-operation deadline or an explicit arr_cancel_operation aborts the
  * operation's own signal, and that abort must NOT be mistaken for an ordinary
- * metadata failure — it unwinds the preview so the manager records the terminal
- * operation state. Keyed strictly on the operation signal, so a request's
+ * metadata failure — it unwinds the operation so the manager records the
+ * terminal state. Keyed strictly on the operation signal, so a request's
  * private per-request timeout (a distinct controller) still surfaces its own
  * error normally, and execute's never-aborted signal makes this a no-op.
  */
 function rethrowIfOperationAborted(signal: AbortSignal): void {
   if (!signal.aborted) return;
   if (signal.reason instanceof Error) throw signal.reason;
-  throw new Error("Preview operation aborted.");
+  throw new Error("Operation aborted.");
 }
 
 // Read from package.json rather than hardcoding, so the version reported to
@@ -178,22 +179,22 @@ const TOOLS: Tool[] = [
   },
   {
     name: "arr_get_operation",
-    description: "Poll a long-running preview operation by operationId. A *_preview_manual_import that outlives the synchronous response budget returns a running handle with an operationId; poll this tool at the handle's pollAfterMs. Statuses: running (stage + pollAfterMs), completed (the exact normal preview result), failed (error), timed_out (preview exceeded its operation deadline), cancelled. An unknown/expired id returns status expired-or-unknown. Operations live only in this running mcp-arr process.",
+    description: "Poll a long-running manual-import operation by operationId. A *_get_manual_import_candidates (candidate discovery) or *_preview_manual_import (preview) that outlives the synchronous response budget returns a running handle with an operationId; poll this tool at the handle's pollAfterMs. Statuses: running (stage + pollAfterMs), completed (the exact normal discovery/preview result), failed (error), timed_out (the operation exceeded its deadline), cancelled. A completed discovery means candidate analysis finished — it does NOT mean an import was submitted. An unknown/expired id returns status expired-or-unknown. Operations live only in this running mcp-arr process.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        operationId: { type: "string", description: "The operationId from a *_preview_manual_import running handle" },
+        operationId: { type: "string", description: "The operationId from a *_get_manual_import_candidates or *_preview_manual_import running handle" },
       },
       required: ["operationId"],
     },
   },
   {
     name: "arr_cancel_operation",
-    description: "Cancel a running preview operation by operationId (e.g. you previewed the wrong candidates). Applies only to operations owned by this running mcp-arr process. A running operation is aborted and marked cancelled; a completed/failed/timed_out/cancelled operation keeps its terminal status unchanged; an unknown id returns expired-or-unknown. Aborting stops mcp-arr waiting and aborts the in-flight API request, but cannot guarantee the app stops CPU-side work already in progress.",
+    description: "Cancel a running manual-import discovery or preview operation by operationId (e.g. you discovered or previewed the wrong candidates). Applies only to operations owned by this running mcp-arr process. A running operation is aborted and marked cancelled; a completed/failed/timed_out/cancelled operation keeps its terminal status unchanged; an unknown id returns expired-or-unknown. Aborting stops mcp-arr waiting and aborts the in-flight API request, but cannot guarantee the app stops CPU-side work already in progress.",
     inputSchema: {
       type: "object" as const,
       properties: {
-        operationId: { type: "string", description: "The operationId from a *_preview_manual_import running handle" },
+        operationId: { type: "string", description: "The operationId from a *_get_manual_import_candidates or *_preview_manual_import running handle" },
       },
       required: ["operationId"],
     },
@@ -394,7 +395,7 @@ if (clients.sonarr) {
     },
     {
       name: "sonarr_get_manual_import_candidates",
-      description: "Discover Sonarr's native manual-import candidates for a tracked download (read-only). Sonarr resolves the download location from the downloadId — never supply a path. Returns each candidate's candidateId (the native manual-import resource id), display path, quality, languages, mapped series/season/episodes, custom formats, and structured rejections (e.g. 'Unable to determine if file is a sample'). IMPORTANT: the returned mapping and rejection reasons are Sonarr's parse PROPOSAL derived from the release name — not verified facts. Verify against sonarr_get_episodes before recommending execute/allowRejected. Titles and numbering are both evidence and neither is conclusive alone; when they conflict, treat the mapping as ambiguous and investigate (including seasonNumber=0 for specials) rather than trusting the proposal or overriding it. Use sonarr_get_queue first to find the downloadId. Workflow: get candidates -> preview corrected mapping if needed -> execute manual import -> re-check queue.",
+      description: "Discover Sonarr's native manual-import candidates for a tracked download (read-only). Sonarr resolves the download location from the downloadId — never supply a path. Returns each candidate's candidateId (the native manual-import resource id), display path, quality, languages, mapped series/season/episodes, custom formats, and structured rejections (e.g. 'Unable to determine if file is a sample'). IMPORTANT: the returned mapping and rejection reasons are Sonarr's parse PROPOSAL derived from the release name — not verified facts. Verify against sonarr_get_episodes before recommending execute/allowRejected. Titles and numbering are both evidence and neither is conclusive alone; when they conflict, treat the mapping as ambiguous and investigate (including seasonNumber=0 for specials) rather than trusting the proposal or overriding it. Use sonarr_get_queue first to find the downloadId. Workflow: get candidates -> preview corrected mapping if needed -> execute manual import -> re-check queue. Normally returns the candidate list directly; if native analysis takes longer than the synchronous response budget, it returns a running operationId handle (with no candidates — do not read it as an empty result) — poll arr_get_operation at the indicated interval for the completed candidate list instead of starting another identical discovery.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -845,7 +846,7 @@ if (clients.radarr) {
     },
     {
       name: "radarr_get_manual_import_candidates",
-      description: "Discover Radarr's native manual-import candidates for a tracked download (read-only). Radarr resolves the download location from the downloadId — never supply a path. Returns each candidate's candidateId (the native manual-import resource id), display path, quality, languages, mapped movie, custom formats, and structured rejections. Use radarr_get_queue first to find the downloadId. Workflow: get candidates -> preview corrected mapping if needed -> execute manual import -> re-check queue.",
+      description: "Discover Radarr's native manual-import candidates for a tracked download (read-only). Radarr resolves the download location from the downloadId — never supply a path. Returns each candidate's candidateId (the native manual-import resource id), display path, quality, languages, mapped movie, custom formats, and structured rejections. Use radarr_get_queue first to find the downloadId. Workflow: get candidates -> preview corrected mapping if needed -> execute manual import -> re-check queue. Normally returns the candidate list directly; if native analysis takes longer than the synchronous response budget, it returns a running operationId handle (with no candidates — do not read it as an empty result) — poll arr_get_operation at the indicated interval for the completed candidate list instead of starting another identical discovery.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -1163,7 +1164,7 @@ if (clients.lidarr) {
     },
     {
       name: "lidarr_get_manual_import_candidates",
-      description: "Discover Lidarr's native manual-import candidates for a tracked download (read-only). Lidarr resolves the download location from the downloadId — never supply a path. Returns each candidate's candidateId (the native manual-import resource id), display path, quality, mapped artist/album/albumReleaseId/tracks, additionalFile/replaceExistingFiles/disableReleaseSwitching flags, and structured native rejections normalized as {reason, type} — Lidarr may serialize an empty rejection object, which is represented as null reason/type rather than discarded. An untracked downloadId yields an empty list. Use lidarr_get_queue first to find the downloadId. Workflow: get candidates -> preview corrected mapping if needed -> execute manual import -> re-check queue. Two independent options govern existing files: filterExistingFiles is a CANDIDATE VISIBILITY / DISCOVERY FILTER only, while replaceExistingFiles is the EXISTING LIBRARY FILE POLICY (destructive on execute). Choose both before discovery and use the same values for discovery, preview and execute; re-run this tool after changing either.",
+      description: "Discover Lidarr's native manual-import candidates for a tracked download (read-only). Lidarr resolves the download location from the downloadId — never supply a path. Returns each candidate's candidateId (the native manual-import resource id), display path, quality, mapped artist/album/albumReleaseId/tracks, additionalFile/replaceExistingFiles/disableReleaseSwitching flags, and structured native rejections normalized as {reason, type} — Lidarr may serialize an empty rejection object, which is represented as null reason/type rather than discarded. An untracked downloadId yields an empty list. Use lidarr_get_queue first to find the downloadId. Workflow: get candidates -> preview corrected mapping if needed -> execute manual import -> re-check queue. Two independent options govern existing files: filterExistingFiles is a CANDIDATE VISIBILITY / DISCOVERY FILTER only, while replaceExistingFiles is the EXISTING LIBRARY FILE POLICY (destructive on execute). Choose both before discovery and use the same values for discovery, preview and execute; re-run this tool after changing either. Normally returns the candidate list directly; if native analysis takes longer than the synchronous response budget, it returns a running operationId handle (with no candidates — do not read it as an empty result) — poll arr_get_operation at the indicated interval for the completed candidate list instead of starting another identical discovery.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -2344,7 +2345,7 @@ async function getSonarrSeasonEpisodes(
   seriesId: number,
   seasonNumber: number,
   cache: Map<string, SonarrEpisodeWithFile[]>,
-  ctx: PreviewExecutionContext,
+  ctx: OperationExecutionContext,
 ): Promise<SonarrEpisodeWithFile[]> {
   const key = `${seriesId}:${seasonNumber}`;
   const cached = cache.get(key);
@@ -2365,7 +2366,7 @@ async function joinSonarrSeasonEpisodeFiles(
   seasonNumber: number,
   episodeCache: Map<string, SonarrEpisodeWithFile[]>,
   fileCache: Map<number, SonarrEpisodeFile[]>,
-  ctx: PreviewExecutionContext,
+  ctx: OperationExecutionContext,
 ): Promise<Array<SonarrEpisodeWithFile & { _file?: SonarrEpisodeFile }>> {
   const episodes = await getSonarrSeasonEpisodes(client, seriesId, seasonNumber, episodeCache, ctx);
 
@@ -2392,7 +2393,7 @@ async function validateSonarrEpisodeIds(
   mapping: SonarrEffectiveMapping,
   callerSupplied: boolean,
   cache: Map<string, SonarrEpisodeWithFile[]>,
-  ctx: PreviewExecutionContext,
+  ctx: OperationExecutionContext,
 ): Promise<Record<string, unknown>> {
   const { seriesId, seasonNumber, episodeIds } = mapping;
   const base = {
@@ -2449,7 +2450,7 @@ async function sonarrEffectiveSeries(
   seriesId: number,
   candidate: SonarrManualImportCandidate,
   cache: Map<number, { id: number; title: string | null }>,
-  ctx: PreviewExecutionContext,
+  ctx: OperationExecutionContext,
 ): Promise<{ id: number; title: string | null }> {
   if (seriesId <= 0) return { id: seriesId, title: null };
 
@@ -2490,7 +2491,7 @@ interface SonarrReleaseContext {
   reason: string | null;
 }
 
-async function findSonarrReleaseContext(client: SonarrClient, downloadId: string, ctx: PreviewExecutionContext): Promise<SonarrReleaseContext> {
+async function findSonarrReleaseContext(client: SonarrClient, downloadId: string, ctx: OperationExecutionContext): Promise<SonarrReleaseContext> {
   const pageSize = 100;
   let page = 1;
   while (true) {
@@ -2534,7 +2535,7 @@ async function resolveSonarrProfileCFScores(
   client: SonarrClient,
   seriesId: number,
   profileCache: Map<number, Map<number, { name: string; score: number }> | null>,
-  ctx: PreviewExecutionContext,
+  ctx: OperationExecutionContext,
 ): Promise<Map<number, { name: string; score: number }> | null> {
   if (seriesId <= 0) return null;
   if (profileCache.has(seriesId)) return profileCache.get(seriesId) ?? null;
@@ -2716,7 +2717,7 @@ async function assessSonarrUpgrade(
   fileCache: Map<number, SonarrEpisodeFile[]>,
   releaseContext: SonarrReleaseContext,
   profileCache: Map<number, Map<number, { name: string; score: number }> | null>,
-  ctx: PreviewExecutionContext,
+  ctx: OperationExecutionContext,
 ): Promise<Record<string, unknown>> {
   const newQualityWeight = reprocessed.qualityWeight ?? candidate.qualityWeight ?? 0;
   const fileCustomFormats = reprocessed.customFormats ?? candidate.customFormats ?? [];
@@ -2910,7 +2911,7 @@ function mappingRequiredEntry(candidateId: number, name: string | null, path: st
   };
 }
 
-async function previewSonarrManualImport(client: SonarrClient, args: unknown, ctx: PreviewExecutionContext) {
+async function previewSonarrManualImport(client: SonarrClient, args: unknown, ctx: OperationExecutionContext) {
   const { downloadId, items } = parseManualImportArgs(args, "sonarr");
   const a = (args ?? {}) as ManualImportToolArgs;
 
@@ -3244,7 +3245,7 @@ async function radarrEffectiveMovie(
   candidate: RadarrManualImportCandidate,
   reprocessed: RadarrManualImportCandidate,
   cache: Map<number, { id: number; title: string | null; year: number | null }>,
-  ctx: PreviewExecutionContext,
+  ctx: OperationExecutionContext,
 ): Promise<{ id: number; title: string | null; year: number | null }> {
   if (movieId <= 0) return { id: movieId, title: null, year: null };
 
@@ -3288,7 +3289,7 @@ function buildRadarrReprocessItem(
   };
 }
 
-async function previewRadarrManualImport(client: RadarrClient, args: unknown, ctx: PreviewExecutionContext) {
+async function previewRadarrManualImport(client: RadarrClient, args: unknown, ctx: OperationExecutionContext) {
   const { downloadId, items } = parseManualImportArgs(args, "radarr");
   const a = (args ?? {}) as ManualImportToolArgs;
 
@@ -3659,7 +3660,7 @@ async function getLidarrAlbumIdentity(
   client: LidarrClient,
   albumId: number,
   cache: Map<number, LidarrAlbumIdentity | null>,
-  ctx: PreviewExecutionContext,
+  ctx: OperationExecutionContext,
 ): Promise<LidarrAlbumIdentity | null> {
   if (cache.has(albumId)) return cache.get(albumId) ?? null;
   let resolved: LidarrAlbumIdentity | null;
@@ -3703,7 +3704,7 @@ async function requireLidarrAlbumIdentityForReleaseSafety(
   client: LidarrClient,
   albumId: number,
   cache: Map<number, LidarrAlbumIdentity | null>,
-  ctx: PreviewExecutionContext,
+  ctx: OperationExecutionContext,
 ): Promise<LidarrAlbumSafetyLookup> {
   if (cache.has(albumId)) {
     const cached = cache.get(albumId);
@@ -3751,7 +3752,7 @@ async function validateLidarrRelationships(
   mapping: LidarrEffectiveMapping,
   override: ManualImportOverrideItem,
   albumCache: Map<number, LidarrAlbumIdentity | null>,
-  ctx: PreviewExecutionContext,
+  ctx: OperationExecutionContext,
 ): Promise<{ checked: boolean; ok: boolean; problems: string[] }> {
   const problems: string[] = [];
   const checked = override.albumId !== undefined || override.albumReleaseId !== undefined;
@@ -3797,7 +3798,7 @@ async function resolveLidarrTrackIds(
   reprocessed: LidarrManualImportCandidate,
   override: ManualImportOverrideItem,
   releaseTrackCache: Map<number, LidarrTrack[]>,
-  ctx: PreviewExecutionContext,
+  ctx: OperationExecutionContext,
 ): Promise<{
   trackIds: number[];
   source: "caller-override" | "lidarr-recomputed";
@@ -3886,7 +3887,7 @@ async function getLidarrReleaseTracks(
   client: LidarrClient,
   releaseId: number,
   cache: Map<number, LidarrTrack[]>,
-  ctx: PreviewExecutionContext,
+  ctx: OperationExecutionContext,
 ): Promise<LidarrTrack[]> {
   const cached = cache.get(releaseId);
   if (cached) return cached;
@@ -3991,7 +3992,7 @@ async function analyzeLidarrReleaseSwitches(
   candidateStates: LidarrCandidateReleaseState[],
   albumCache: Map<number, LidarrAlbumIdentity | null>,
   releaseTrackCache: Map<number, LidarrTrack[]>,
-  ctx: PreviewExecutionContext,
+  ctx: OperationExecutionContext,
 ): Promise<LidarrReleaseSwitchImpact[]> {
   const byAlbum = new Map<number, LidarrCandidateReleaseState[]>();
   for (const s of candidateStates) {
@@ -4147,7 +4148,7 @@ function parseLidarrReleaseSwitchAuthorizations(args: unknown): Array<{ albumId:
   return parsed;
 }
 
-async function previewLidarrManualImport(client: LidarrClient, args: unknown, ctx: PreviewExecutionContext) {
+async function previewLidarrManualImport(client: LidarrClient, args: unknown, ctx: OperationExecutionContext) {
   const { downloadId, items, replaceExistingFiles, filterExistingFiles } = parseManualImportArgs(args, "lidarr");
   const a = (args ?? {}) as ManualImportToolArgs;
 
@@ -4642,6 +4643,211 @@ async function executeLidarrManualImport(client: LidarrClient, args: unknown) {
   });
 }
 
+// --- Manual-import candidate discovery (standalone tools) -------------------
+
+/**
+ * Normalized arguments for a standalone *_get_manual_import_candidates call.
+ * Discovery accepts no `items` list, so it uses its own small validation path
+ * rather than the preview/execute parser. The normalized values are used for
+ * BOTH the dedup fingerprint and the native request, so the two can never
+ * disagree. Caller-supplied filesystem paths are never accepted.
+ */
+interface SonarrDiscoveryArgs {
+  downloadId: string;
+  seriesId?: number;
+  seasonNumber?: number;
+  filterExistingFiles?: boolean;
+}
+interface RadarrDiscoveryArgs {
+  downloadId: string;
+  movieId?: number;
+  filterExistingFiles?: boolean;
+}
+interface LidarrDiscoveryArgs {
+  downloadId: string;
+  artistId?: number;
+  filterExistingFiles: boolean;
+  replaceExistingFiles: boolean;
+}
+
+function parseSonarrDiscoveryArgs(args: unknown): SonarrDiscoveryArgs {
+  const a = (args ?? {}) as ManualImportToolArgs;
+  if (typeof a.downloadId !== "string" || a.downloadId.trim() === "") {
+    throw new Error("downloadId is required (from sonarr_get_queue). Candidates are discovered from the tracked download, never from a caller-supplied path.");
+  }
+  assertPositiveEntityId(a.seriesId, "seriesId");
+  assertSonarrSeasonNumber(a.seasonNumber, "seasonNumber");
+  // filterExistingFiles keeps its omission/passthrough semantics: an omitted
+  // flag sends no query parameter, an explicit value is forwarded literally.
+  return {
+    downloadId: a.downloadId.trim(),
+    seriesId: a.seriesId,
+    seasonNumber: a.seasonNumber,
+    filterExistingFiles: a.filterExistingFiles,
+  };
+}
+
+function parseRadarrDiscoveryArgs(args: unknown): RadarrDiscoveryArgs {
+  const a = (args ?? {}) as ManualImportToolArgs;
+  if (typeof a.downloadId !== "string" || a.downloadId.trim() === "") {
+    throw new Error("downloadId is required (from radarr_get_queue). Candidates are discovered from the tracked download, never from a caller-supplied path.");
+  }
+  assertPositiveEntityId(a.movieId, "movieId");
+  return {
+    downloadId: a.downloadId.trim(),
+    movieId: a.movieId,
+    filterExistingFiles: a.filterExistingFiles,
+  };
+}
+
+function parseLidarrDiscoveryArgs(args: unknown): LidarrDiscoveryArgs {
+  const a = (args ?? {}) as ManualImportToolArgs;
+  if (typeof a.downloadId !== "string" || a.downloadId.trim() === "") {
+    throw new Error("downloadId is required (from lidarr_get_queue). Candidates are discovered from the tracked download, never from a caller-supplied path.");
+  }
+  assertPositiveEntityId(a.artistId, "artistId");
+  return {
+    downloadId: a.downloadId.trim(),
+    artistId: a.artistId,
+    filterExistingFiles: resolvedLidarrFilterExistingFiles(a.filterExistingFiles),
+    replaceExistingFiles: a.replaceExistingFiles === true,
+  };
+}
+
+/**
+ * Deterministic fingerprint of a discovery request: the ACTION kind plus the
+ * canonical normalized arguments, with stable field ordering. Discovery and
+ * preview for the same download never share a fingerprint, and a discovery
+ * never deduplicates against a preview. Only ACTIVE equivalent discoveries
+ * deduplicate; terminal results are never reused as a cache, so a re-run
+ * always performs fresh native discovery.
+ */
+function discoveryFingerprint(
+  service: "sonarr" | "radarr" | "lidarr",
+  n: SonarrDiscoveryArgs | RadarrDiscoveryArgs | LidarrDiscoveryArgs,
+): string {
+  const args: Record<string, unknown> = { downloadId: n.downloadId };
+  if (service === "sonarr") {
+    const s = n as SonarrDiscoveryArgs;
+    if (s.seriesId !== undefined) args.seriesId = s.seriesId;
+    // seasonNumber 0 (Specials) is a real hint and must stay in the fingerprint.
+    if (s.seasonNumber !== undefined) args.seasonNumber = s.seasonNumber;
+    if (s.filterExistingFiles !== undefined) args.filterExistingFiles = s.filterExistingFiles;
+  } else if (service === "radarr") {
+    const r = n as RadarrDiscoveryArgs;
+    if (r.movieId !== undefined) args.movieId = r.movieId;
+    if (r.filterExistingFiles !== undefined) args.filterExistingFiles = r.filterExistingFiles;
+  } else {
+    const l = n as LidarrDiscoveryArgs;
+    if (l.artistId !== undefined) args.artistId = l.artistId;
+    args.filterExistingFiles = l.filterExistingFiles;
+    args.replaceExistingFiles = l.replaceExistingFiles;
+  }
+  return JSON.stringify({ kind: `${service}-manual-import-discovery`, args });
+}
+
+/**
+ * Discovery executors: the native GET /manualimport plus the exact result
+ * building the standalone discovery tools returned before operations existed.
+ * They return the plain discovery payload (the shared runner serializes the
+ * MCP envelope exactly once) and thread the operation's abort signal into the
+ * native request. Discovery is a GET only — it never reprocesses, never POSTs,
+ * and never imports. An empty candidate list is a successful discovery result.
+ */
+async function discoverSonarrManualImportCandidates(
+  client: SonarrClient,
+  args: SonarrDiscoveryArgs,
+  ctx: OperationExecutionContext,
+) {
+  ctx.setStage("discovering-candidates");
+  const candidates = await client.getManualImportCandidates(
+    {
+      downloadId: args.downloadId,
+      seriesId: args.seriesId,
+      seasonNumber: args.seasonNumber,
+      filterExistingFiles: args.filterExistingFiles,
+    },
+    ctx.signal,
+  );
+  rethrowIfOperationAborted(ctx.signal);
+  ctx.setStage("building-result");
+  return {
+    verifyBeforeActing: SONARR_VERIFY_DIRECTIVE,
+    downloadId: args.downloadId,
+    count: candidates.length,
+    candidates: candidates.map(compactSonarrCandidate),
+    notes: [
+      "candidateId is the native manual-import resource id; pass it to sonarr_preview_manual_import / sonarr_execute_manual_import.",
+      "Paths are shown for diagnosis only — the import tools resolve paths from native candidates and never accept caller-supplied paths.",
+      "See verifyBeforeActing above: the mapping is a proposal, not ground truth — verify it against sonarr_get_episodes.",
+      "If a candidate has rejections, decide via preview whether overriding them (allowRejected=true on that item in execute) is appropriate.",
+    ],
+  };
+}
+
+async function discoverRadarrManualImportCandidates(
+  client: RadarrClient,
+  args: RadarrDiscoveryArgs,
+  ctx: OperationExecutionContext,
+) {
+  ctx.setStage("discovering-candidates");
+  const candidates = await client.getManualImportCandidates(
+    {
+      downloadId: args.downloadId,
+      movieId: args.movieId,
+      filterExistingFiles: args.filterExistingFiles,
+    },
+    ctx.signal,
+  );
+  rethrowIfOperationAborted(ctx.signal);
+  ctx.setStage("building-result");
+  return {
+    verifyBeforeActing: RADARR_VERIFY_DIRECTIVE,
+    downloadId: args.downloadId,
+    count: candidates.length,
+    candidates: candidates.map(compactRadarrCandidate),
+    notes: [
+      "candidateId is the native manual-import resource id; pass it to radarr_preview_manual_import / radarr_execute_manual_import.",
+      "Paths are shown for diagnosis only — the import tools resolve paths from native candidates and never accept caller-supplied paths.",
+      "If a candidate has rejections, decide via preview whether overriding them (allowRejected=true on that item in execute) is appropriate.",
+    ],
+  };
+}
+
+async function discoverLidarrManualImportCandidates(
+  client: LidarrClient,
+  args: LidarrDiscoveryArgs,
+  ctx: OperationExecutionContext,
+) {
+  ctx.setStage("discovering-candidates");
+  const candidates = await client.getManualImportCandidates(
+    {
+      downloadId: args.downloadId,
+      artistId: args.artistId,
+      filterExistingFiles: args.filterExistingFiles,
+      replaceExistingFiles: args.replaceExistingFiles,
+    },
+    ctx.signal,
+  );
+  rethrowIfOperationAborted(ctx.signal);
+  ctx.setStage("building-result");
+  return {
+    verifyBeforeActing: LIDARR_VERIFY_DIRECTIVE,
+    downloadId: args.downloadId,
+    existingFilesPolicy: lidarrExistingFilesPolicy(args.replaceExistingFiles),
+    candidateFilterPolicy: lidarrCandidateFilterPolicy(args.filterExistingFiles),
+    count: candidates.length,
+    candidates: candidates.map(compactLidarrCandidate),
+    notes: [
+      "candidateId is the native manual-import resource id; pass it to lidarr_preview_manual_import / lidarr_execute_manual_import.",
+      "Paths are shown for diagnosis only — the import tools resolve paths from native candidates and never accept caller-supplied paths.",
+      "Lidarr recomputes the track mapping server-side during preview; the preview result is authoritative for what execute will import.",
+      "If a candidate has rejections, decide via preview whether overriding them (allowRejected=true on that item in execute) is appropriate.",
+      "filterExistingFiles (candidate visibility: Unmapped Files Only / All Files) and replaceExistingFiles (existing-library-file policy: Combine with existing files / Replace Existing Files) are independent axes. Use the same values for discovery, preview and execute; re-run this tool after changing either.",
+    ],
+  };
+}
+
 // --- Preview operation registry (soft-budget fast path + async handle) -----
 
 /**
@@ -4687,7 +4893,8 @@ function previewFingerprint(service: "sonarr" | "radarr" | "lidarr", args: unkno
   return JSON.stringify(norm);
 }
 
-function runningHandle(op: PreviewOperation, deduplicated: boolean) {
+function runningHandle(op: ManagedOperation, deduplicated: boolean) {
+  const action = kindAction(op.kind);
   const handle: Record<string, unknown> = {
     status: "running",
     operationId: op.id,
@@ -4697,32 +4904,31 @@ function runningHandle(op: PreviewOperation, deduplicated: boolean) {
     hardTimeoutAt: new Date(op.deadlineAt).toISOString(),
     elapsedMs: Date.now() - op.startedAt,
     pollAfterMs: operationPollIntervalMs(),
-    guidance: `The ${kindLabel(op.kind)} is still running in the app. Poll arr_get_operation with this operationId at the indicated interval instead of starting another identical preview.`,
+    guidance: `The ${kindLabel(op.kind)} is still running in the app. Poll arr_get_operation with this operationId at the indicated interval. Do not start another identical ${action} or proceed to import from this running response.`,
   };
   if (deduplicated) handle.deduplicated = true;
   return handle;
 }
 
 /**
- * Run a preview with a soft synchronous response budget. Fast previews return
- * the exact normal preview result (unchanged shape, no wrapper). A preview
- * still running when the budget expires returns a pollable handle; the work
- * continues in the module-level registry, independent of this MCP request.
+ * Shared soft-budget runner for the non-importing manual-import operations
+ * (discovery and preview). Fast work returns the exact normal result (unchanged
+ * shape, no wrapper). Work still running when the budget expires returns a
+ * pollable handle; the operation continues in the module-level registry,
+ * independent of this MCP request. Validation happens in the caller BEFORE this
+ * is reached, so a malformed request never creates an operation.
  */
-async function runPreviewTool<C>(
-  kind: PreviewOperationKind,
-  service: "sonarr" | "radarr" | "lidarr",
-  client: C,
-  args: unknown,
-  executor: (client: C, args: unknown, ctx: PreviewExecutionContext) => Promise<unknown>,
+async function runOperationTool(
+  kind: OperationKind,
+  fingerprint: string,
+  start: (ctx: OperationExecutionContext) => Promise<unknown>,
 ): Promise<ReturnType<typeof jsonText> | ReturnType<typeof textError>> {
-  const fingerprint = previewFingerprint(service, args);
   const existing = previewOperations.findRunning(fingerprint);
   if (existing) {
     return jsonText(runningHandle(existing, true));
   }
 
-  const op = previewOperations.start(kind, fingerprint, (ctx) => executor(client, args, ctx));
+  const op = previewOperations.start(kind, fingerprint, start);
   const settled = await previewOperations.awaitWithBudget(op, previewSyncBudgetMs());
 
   if (settled.status === "running") {
@@ -4743,7 +4949,42 @@ async function runPreviewTool<C>(
   });
 }
 
-function operationPollView(op: PreviewOperation) {
+/**
+ * Run a preview with a soft synchronous response budget. Fast previews return
+ * the exact normal preview result (unchanged shape, no wrapper). A preview
+ * still running when the budget expires returns a pollable handle; the work
+ * continues in the module-level registry, independent of this MCP request.
+ */
+async function runPreviewTool<C>(
+  kind: OperationKind,
+  service: "sonarr" | "radarr" | "lidarr",
+  client: C,
+  args: unknown,
+  executor: (client: C, args: unknown, ctx: OperationExecutionContext) => Promise<unknown>,
+): Promise<ReturnType<typeof jsonText> | ReturnType<typeof textError>> {
+  const fingerprint = previewFingerprint(service, args);
+  return runOperationTool(kind, fingerprint, (ctx) => executor(client, args, ctx));
+}
+
+/**
+ * Run a standalone candidate discovery with the same soft-budget/handle
+ * lifecycle as preview. `normalized` must come from the discovery-specific
+ * parser so validation happens before the fingerprint lookup and operation
+ * creation. Discovery is a GET-only workload: it never nests a preview and
+ * preview/execute never nest a discovery.
+ */
+async function runDiscoveryTool<C, A extends { downloadId: string }>(
+  kind: OperationKind,
+  service: "sonarr" | "radarr" | "lidarr",
+  client: C,
+  normalized: A,
+  executor: (client: C, args: A, ctx: OperationExecutionContext) => Promise<unknown>,
+): Promise<ReturnType<typeof jsonText> | ReturnType<typeof textError>> {
+  const fingerprint = discoveryFingerprint(service, normalized);
+  return runOperationTool(kind, fingerprint, (ctx) => executor(client, normalized, ctx));
+}
+
+function operationPollView(op: ManagedOperation) {
   const base = { operationId: op.id, status: op.status, operation: op.kind };
   if (op.status === "running") {
     return {
@@ -4764,7 +5005,7 @@ function operationPollView(op: PreviewOperation) {
       ...base,
       stage: op.stage ?? null,
       elapsedMs: (op.completedAt ?? Date.now()) - op.startedAt,
-      error: op.error ?? "preview exceeded the configured operation timeout.",
+      error: op.error ?? "the operation exceeded the configured operation timeout.",
     };
   }
   return { ...base };
@@ -4800,14 +5041,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "arr_get_operation": {
         const operationId = (args as { operationId?: string })?.operationId;
         if (typeof operationId !== "string" || operationId.trim() === "") {
-          throw new Error("operationId is required (from a *_preview_manual_import running handle).");
+          throw new Error("operationId is required (from a *_get_manual_import_candidates or *_preview_manual_import running handle).");
         }
         const op = previewOperations.get(operationId.trim());
         if (!op) {
           return jsonText({
             status: "expired-or-unknown",
             operationId,
-            guidance: "This operation is no longer available (completed and expired, cancelled, or never existed). Run the preview again.",
+            guidance: "The operation is no longer available (completed and expired, cancelled, or never existed). Re-run the original discovery or preview tool with its original arguments to obtain fresh results.",
           });
         }
         return jsonText(operationPollView(op));
@@ -4816,14 +5057,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       case "arr_cancel_operation": {
         const operationId = (args as { operationId?: string })?.operationId;
         if (typeof operationId !== "string" || operationId.trim() === "") {
-          throw new Error("operationId is required (from a *_preview_manual_import running handle).");
+          throw new Error("operationId is required (from a *_get_manual_import_candidates or *_preview_manual_import running handle).");
         }
         const op = previewOperations.cancel(operationId.trim());
         if (!op) {
           return jsonText({
             status: "expired-or-unknown",
             operationId,
-            guidance: "This operation is no longer available. Run the preview again.",
+            guidance: "The operation is no longer available. Re-run the original discovery or preview tool with its original arguments to obtain fresh results.",
           });
         }
         return jsonText({
@@ -5212,30 +5453,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "sonarr_get_manual_import_candidates": {
         if (!clients.sonarr) throw new Error("Sonarr not configured");
-        const a = (args ?? {}) as ManualImportToolArgs;
-        if (typeof a.downloadId !== "string" || a.downloadId.trim() === "") {
-          throw new Error("downloadId is required (from sonarr_get_queue). Candidates are discovered from the tracked download, never from a caller-supplied path.");
-        }
-        assertSonarrSeasonNumber(a.seasonNumber, "seasonNumber");
-        assertPositiveEntityId(a.seriesId, "seriesId");
-        const candidates = await clients.sonarr.getManualImportCandidates({
-          downloadId: a.downloadId.trim(),
-          seriesId: a.seriesId,
-          seasonNumber: a.seasonNumber,
-          filterExistingFiles: a.filterExistingFiles,
-        });
-        return jsonText({
-          verifyBeforeActing: SONARR_VERIFY_DIRECTIVE,
-          downloadId: a.downloadId.trim(),
-          count: candidates.length,
-          candidates: candidates.map(compactSonarrCandidate),
-          notes: [
-            "candidateId is the native manual-import resource id; pass it to sonarr_preview_manual_import / sonarr_execute_manual_import.",
-            "Paths are shown for diagnosis only — the import tools resolve paths from native candidates and never accept caller-supplied paths.",
-            "See verifyBeforeActing above: the mapping is a proposal, not ground truth — verify it against sonarr_get_episodes.",
-            "If a candidate has rejections, decide via preview whether overriding them (allowRejected=true on that item in execute) is appropriate.",
-          ],
-        });
+        const normalized = parseSonarrDiscoveryArgs(args);
+        return await runDiscoveryTool(
+          "sonarr-manual-import-discovery",
+          "sonarr",
+          clients.sonarr,
+          normalized,
+          discoverSonarrManualImportCandidates,
+        );
       }
 
       case "sonarr_preview_manual_import": {
@@ -5577,27 +5802,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "radarr_get_manual_import_candidates": {
         if (!clients.radarr) throw new Error("Radarr not configured");
-        const a = (args ?? {}) as ManualImportToolArgs;
-        if (typeof a.downloadId !== "string" || a.downloadId.trim() === "") {
-          throw new Error("downloadId is required (from radarr_get_queue). Candidates are discovered from the tracked download, never from a caller-supplied path.");
-        }
-        assertPositiveEntityId(a.movieId, "movieId");
-        const candidates = await clients.radarr.getManualImportCandidates({
-          downloadId: a.downloadId.trim(),
-          movieId: a.movieId,
-          filterExistingFiles: a.filterExistingFiles,
-        });
-        return jsonText({
-          verifyBeforeActing: RADARR_VERIFY_DIRECTIVE,
-          downloadId: a.downloadId.trim(),
-          count: candidates.length,
-          candidates: candidates.map(compactRadarrCandidate),
-          notes: [
-            "candidateId is the native manual-import resource id; pass it to radarr_preview_manual_import / radarr_execute_manual_import.",
-            "Paths are shown for diagnosis only — the import tools resolve paths from native candidates and never accept caller-supplied paths.",
-            "If a candidate has rejections, decide via preview whether overriding them (allowRejected=true on that item in execute) is appropriate.",
-          ],
-        });
+        const normalized = parseRadarrDiscoveryArgs(args);
+        return await runDiscoveryTool(
+          "radarr-manual-import-discovery",
+          "radarr",
+          clients.radarr,
+          normalized,
+          discoverRadarrManualImportCandidates,
+        );
       }
 
       case "radarr_preview_manual_import": {
@@ -5697,34 +5909,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "lidarr_get_manual_import_candidates": {
         if (!clients.lidarr) throw new Error("Lidarr not configured");
-        const a = (args ?? {}) as ManualImportToolArgs;
-        if (typeof a.downloadId !== "string" || a.downloadId.trim() === "") {
-          throw new Error("downloadId is required (from lidarr_get_queue). Candidates are discovered from the tracked download, never from a caller-supplied path.");
-        }
-        assertPositiveEntityId(a.artistId, "artistId");
-        const filterExistingFiles = a.filterExistingFiles !== false;
-        const replaceExistingFiles = a.replaceExistingFiles === true;
-        const candidates = await clients.lidarr.getManualImportCandidates({
-          downloadId: a.downloadId.trim(),
-          artistId: a.artistId,
-          filterExistingFiles,
-          replaceExistingFiles,
-        });
-        return jsonText({
-          verifyBeforeActing: LIDARR_VERIFY_DIRECTIVE,
-          downloadId: a.downloadId.trim(),
-          existingFilesPolicy: lidarrExistingFilesPolicy(replaceExistingFiles),
-          candidateFilterPolicy: lidarrCandidateFilterPolicy(filterExistingFiles),
-          count: candidates.length,
-          candidates: candidates.map(compactLidarrCandidate),
-          notes: [
-            "candidateId is the native manual-import resource id; pass it to lidarr_preview_manual_import / lidarr_execute_manual_import.",
-            "Paths are shown for diagnosis only — the import tools resolve paths from native candidates and never accept caller-supplied paths.",
-            "Lidarr recomputes the track mapping server-side during preview; the preview result is authoritative for what execute will import.",
-            "If a candidate has rejections, decide via preview whether overriding them (allowRejected=true on that item in execute) is appropriate.",
-            "filterExistingFiles (candidate visibility: Unmapped Files Only / All Files) and replaceExistingFiles (existing-library-file policy: Combine with existing files / Replace Existing Files) are independent axes. Use the same values for discovery, preview and execute; re-run this tool after changing either.",
-          ],
-        });
+        const normalized = parseLidarrDiscoveryArgs(args);
+        return await runDiscoveryTool(
+          "lidarr-manual-import-discovery",
+          "lidarr",
+          clients.lidarr,
+          normalized,
+          discoverLidarrManualImportCandidates,
+        );
       }
 
       case "lidarr_preview_manual_import": {
