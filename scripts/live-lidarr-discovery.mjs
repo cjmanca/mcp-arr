@@ -4,125 +4,303 @@
 // execute). PREVIEW_SYNC_BUDGET_MS=0 forces the async handle path so the
 // handle → poll → completed-result flow is exercised against the live app.
 //
+// The polling watchdog is derived from the handle's own hardTimeoutAt (plus a
+// bounded grace), not a fixed attempt count, so a legitimately slow discovery
+// is never misreported as a failure. Success and failure both clean up the
+// child this script spawned before exiting; failures exit nonzero.
+//
 // Usage: node scripts/live-lidarr-discovery.mjs <downloadId>
 import { spawn } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { once } from "node:events";
-
-const env = Object.fromEntries(
-  readFileSync(new URL("../.env.local", import.meta.url), "utf8")
-    .split(/\r?\n/)
-    .filter((l) => l && !l.startsWith("#") && l.includes("="))
-    .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim()]),
-);
-
-const PORT = process.env.__SMOKE_PORT || "39881";
-const downloadId = process.argv[2];
-if (!downloadId) {
-  console.log("usage: node scripts/live-lidarr-discovery.mjs <downloadId>");
-  process.exit(1);
-}
-
-const child = spawn(process.execPath, ["dist/index.js"], {
-  cwd: new URL("..", import.meta.url),
-  env: {
-    ...process.env,
-    ...env,
-    MCP_TRANSPORT: "http",
-    HOST: "127.0.0.1",
-    PORT,
-    PREVIEW_SYNC_BUDGET_MS: "0",
-    PREVIEW_MAX_RUNTIME_MS: "300000",
-    OPERATION_POLL_INTERVAL_MS: "2000",
-  },
-  stdio: ["ignore", "ignore", "pipe"],
-});
-let stderr = "";
-child.stderr.on("data", (d) => (stderr += d));
+import { pathToFileURL } from "node:url";
+import { trackChildExit, stopOwnedChild } from "./managed-child.mjs";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-async function waitForHealth() {
-  for (let i = 0; i < 60; i++) {
-    try {
-      const r = await fetch(`http://127.0.0.1:${PORT}/health`);
-      if (r.ok) return true;
-    } catch {}
+
+function loadLocalEnv() {
+  try {
+    return Object.fromEntries(
+      readFileSync(new URL("../.env.local", import.meta.url), "utf8")
+        .split(/\r?\n/)
+        .filter((l) => l && !l.startsWith("#") && l.includes("="))
+        .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim()]),
+    );
+  } catch {
+    return {};
+  }
+}
+
+function truncate(text, max = 400) {
+  const t = String(text ?? "");
+  return t.length <= max ? t : `${t.slice(0, max)}…`;
+}
+
+/** Bounded HTTP request: the AbortSignal.timeout covers headers AND body. */
+async function fetchBounded(url, init, timeoutMs) {
+  const response = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
+  const text = await response.text();
+  return { status: response.status, text };
+}
+
+/**
+ * Resolve a poll interval from the handle/poll response. Malformed values get
+ * a bounded fallback; the latest advertised interval wins.
+ */
+function pollIntervalMs(value) {
+  return Number.isFinite(value) && value > 0 && value <= 60_000 ? value : 2_000;
+}
+
+/**
+ * Absolute validation deadline from the operation's own hard deadline plus a
+ * grace for observing the server's terminal response. A missing/malformed
+ * hardTimeoutAt is a protocol error — never an unbounded loop.
+ */
+function validationDeadlineMs(hardTimeoutAt, graceMs) {
+  const at = typeof hardTimeoutAt === "string" || typeof hardTimeoutAt === "number" ? Date.parse(hardTimeoutAt) : NaN;
+  if (!Number.isFinite(at)) {
+    throw new Error("protocol error: running handle has no valid hardTimeoutAt; cannot derive a bounded validation deadline");
+  }
+  return at + graceMs;
+}
+
+function parseRpcBody(rawText) {
+  const dataLine = rawText.split("\n").find((l) => l.startsWith("data: "));
+  let body;
+  try {
+    body = JSON.parse(dataLine ? dataLine.slice(6) : rawText);
+  } catch {
+    throw new Error(`malformed MCP response (not JSON): ${truncate(rawText)}`);
+  }
+  if (body?.error) {
+    throw new Error(`JSON-RPC error: ${body.error.message ?? JSON.stringify(body.error)}`);
+  }
+  if (!body?.result || typeof body.result !== "object") {
+    throw new Error(`MCP response has no result object: ${truncate(rawText)}`);
+  }
+  return body;
+}
+
+/**
+ * Send one JSON-RPC request over the stateless HTTP endpoint. Every request is
+ * bounded, and a child that dies mid-request fails the call fast instead of
+ * hanging.
+ */
+async function sendRequest(port, method, params, { timeoutMs, exited }) {
+  const request = { jsonrpc: "2.0", id: 3, method, params };
+  const gone = exited.then(() => ({ childExited: true }));
+  const raced = await Promise.race([
+    fetchBounded(
+      `http://127.0.0.1:${port}/mcp`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+        body: JSON.stringify(request),
+      },
+      timeoutMs,
+    ),
+    gone,
+  ]);
+  if (raced?.childExited) throw new Error(`MCP child exited before ${method} responded`);
+  return { body: parseRpcBody(raced.text), text: raced.text };
+}
+
+async function callTool(port, name, args, bounds) {
+  const { body, text } = await sendRequest(port, "tools/call", { name, arguments: args }, bounds);
+  const content = body.result.content;
+  if (!Array.isArray(content) || typeof content[0]?.text !== "string") {
+    throw new Error(`${name} returned a malformed MCP result (no content[0].text): ${truncate(text)}`);
+  }
+  if (body.result.isError === true) {
+    throw new Error(`${name} reported a tool-level error: ${truncate(content[0].text)}`);
+  }
+  let payload = null;
+  try { payload = JSON.parse(content[0].text); } catch { /* non-JSON tool text */ }
+  return { payload, text: content[0].text };
+}
+
+async function waitForHealth(port, { timeoutMs, exited }) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    const gone = exited.then(() => ({ childExited: true }));
+    const raced = await Promise.race([
+      fetchBounded(`http://127.0.0.1:${port}/health`, {}, Math.min(2_000, Math.max(100, deadline - Date.now())))
+        .catch(() => null),
+      gone,
+    ]);
+    if (raced?.childExited) throw new Error("MCP child exited before becoming healthy");
+    if (raced && raced.status === 200) return;
     await sleep(100);
   }
-  return false;
+  throw new Error(`MCP server did not become healthy within ${timeoutMs}ms`);
 }
 
-async function callTool(name, args) {
-  const res = await fetch(`http://127.0.0.1:${PORT}/mcp`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 3, method: "tools/call", params: { name, arguments: args } }),
-  });
-  const text = await res.text();
-  const dataLine = text.split("\n").find((l) => l.startsWith("data: "));
-  const body = JSON.parse(dataLine ? dataLine.slice(6) : text);
-  const t = body.result.content[0].text;
-  let payload = null;
-  try { payload = JSON.parse(t); } catch {}
-  return { isError: body.result.isError === true, payload, text };
+/**
+ * Discovery invariants for a completed poll. A zero-candidate result is a
+ * successful discovery; a completed discovery is NOT an import.
+ */
+function validateDiscoveryResult(pollPayload, { operationId, downloadId }) {
+  if (pollPayload.operationId !== operationId) {
+    throw new Error(`poll returned a different operationId (${pollPayload.operationId})`);
+  }
+  if (pollPayload.operation !== "lidarr-manual-import-discovery") {
+    throw new Error(`poll returned the wrong operation kind: ${pollPayload.operation}`);
+  }
+  const result = pollPayload.result;
+  if (!result || typeof result !== "object") {
+    throw new Error("completed poll carries no result payload");
+  }
+  if (result.status !== undefined || result.operationId !== undefined) {
+    throw new Error("completed result is not a plain discovery payload (nested operation envelope)");
+  }
+  if (result.downloadId !== downloadId) {
+    throw new Error(`result downloadId '${result.downloadId}' does not match the requested '${downloadId}'`);
+  }
+  if (!Array.isArray(result.candidates)) {
+    throw new Error("result.candidates is not an array");
+  }
+  if (result.count !== result.candidates.length) {
+    throw new Error(`result.count (${result.count}) disagrees with returned candidates (${result.candidates.length})`);
+  }
+  return result;
 }
 
-try {
-  if (!(await waitForHealth())) { console.log("server failed to start:", stderr); process.exit(1); }
-  await fetch(`http://127.0.0.1:${PORT}/mcp`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "live-validation", version: "0" } } }),
+/**
+ * Run the live discovery validation. Throws on any validation failure; the
+ * owned child is stopped on success AND on failure before this settles.
+ */
+export async function runLiveDiscovery(options = {}) {
+  const {
+    downloadId,
+    spawnCmd = process.execPath,
+    spawnArgs = ["dist/index.js"],
+    env = loadLocalEnv(),
+    port = process.env.__SMOKE_PORT || "39881",
+    requestTimeoutMs = 15_000,
+    healthTimeoutMs = 10_000,
+    graceMs = 10_000,
+    onChild = () => {},
+  } = options;
+
+  if (typeof downloadId !== "string" || downloadId.trim() === "") {
+    throw new Error("usage: node scripts/live-lidarr-discovery.mjs <downloadId>");
+  }
+
+  const child = spawn(spawnCmd, spawnArgs, {
+    cwd: new URL("..", import.meta.url),
+    env: {
+      ...process.env,
+      ...env,
+      MCP_TRANSPORT: "http",
+      HOST: "127.0.0.1",
+      PORT: port,
+      PREVIEW_SYNC_BUDGET_MS: "0",
+      PREVIEW_MAX_RUNTIME_MS: "300000",
+      OPERATION_POLL_INTERVAL_MS: "2000",
+    },
+    stdio: ["ignore", "ignore", "pipe"],
   });
+  let stderr = "";
+  child.stderr.on("data", (d) => (stderr += d));
+  const exited = trackChildExit(child);
+  onChild(child);
 
-  const started = Date.now();
-  const disc = await callTool("lidarr_get_manual_import_candidates", { downloadId });
-  if (disc.isError) { console.log("discovery failed:", disc.text); process.exit(1); }
-  console.log(`=== discovery response (${Date.now() - started}ms) ===`);
-  console.log(JSON.stringify({
-    status: disc.payload.status,
-    operation: disc.payload.operation,
-    operationId: disc.payload.operationId,
-    stage: disc.payload.stage,
-    pollAfterMs: disc.payload.pollAfterMs,
-    countInHandle: disc.payload.count ?? null,
-  }, null, 1));
-  if (disc.payload.status !== "running") {
-    console.log("expected a running handle at budget 0; got the fast path:", disc.payload.count, "candidates");
-    process.exit(1);
-  }
+  try {
+    await waitForHealth(port, { timeoutMs: healthTimeoutMs, exited });
+    const bounds = { timeoutMs: requestTimeoutMs, exited };
+    const init = await sendRequest(port, "initialize", {
+      protocolVersion: "2025-06-18",
+      capabilities: {},
+      clientInfo: { name: "live-validation", version: "0" },
+    }, bounds);
+    if (!init.body.result.serverInfo?.name) {
+      throw new Error(`initialize response has no serverInfo.name: ${truncate(init.text)}`);
+    }
 
-  const id = disc.payload.operationId;
-  let poll = null;
-  for (let i = 0; i < 60; i++) {
-    await sleep(disc.payload.pollAfterMs || 2000);
-    poll = await callTool("arr_get_operation", { operationId: id });
-    console.log(`poll ${i + 1} (${Date.now() - started}ms): ${poll.payload.status}${poll.payload.stage ? ` [${poll.payload.stage}]` : ""}`);
-    if (poll.payload.status !== "running") break;
-  }
-  if (poll.payload.status !== "completed") {
-    console.log("terminal status:", poll.payload.status, poll.payload.error ?? "");
-    process.exit(1);
-  }
-  const result = poll.payload.result;
-  console.log(`=== completed result (${Date.now() - started}ms total) ===`);
-  console.log(JSON.stringify({
-    downloadId: result.downloadId,
-    count: result.count,
-    existingFilesPolicy: result.existingFilesPolicy,
-    candidateFilterPolicy: result.candidateFilterPolicy,
-    hasVerifyDirective: Array.isArray(result.verifyBeforeActing),
-    notes: result.notes?.length,
-  }, null, 1));
-  for (const c of (result.candidates ?? []).slice(0, 5)) {
+    const started = Date.now();
+    const disc = await callTool(port, "lidarr_get_manual_import_candidates", { downloadId }, bounds);
+    const handle = disc.payload;
+    console.log(`=== discovery response (${Date.now() - started}ms) ===`);
     console.log(JSON.stringify({
-      candidateId: c.candidateId, name: c.name,
-      artist: c.artist, album: c.album, albumReleaseId: c.albumReleaseId,
-      rejections: c.rejections,
-    }));
+      status: handle?.status,
+      operation: handle?.operation,
+      operationId: handle?.operationId,
+      stage: handle?.stage,
+      pollAfterMs: handle?.pollAfterMs,
+      hardTimeoutAt: handle?.hardTimeoutAt,
+      countInHandle: handle?.count ?? null,
+    }, null, 1));
+    if (handle?.status !== "running") {
+      throw new Error(`expected a running handle at budget 0; got status '${handle?.status}' with ${handle?.count} candidates`);
+    }
+    const operationId = handle.operationId;
+    if (typeof operationId !== "string" || operationId === "") {
+      throw new Error("protocol error: running handle has no operationId");
+    }
+    if (handle.count !== undefined || handle.candidates !== undefined) {
+      throw new Error("protocol error: running handle must not carry count/candidates");
+    }
+
+    const deadlineAt = validationDeadlineMs(handle.hardTimeoutAt, graceMs);
+    let interval = pollIntervalMs(handle.pollAfterMs);
+    let poll = null;
+    let polls = 0;
+    for (;;) {
+      const remaining = deadlineAt - Date.now();
+      if (remaining <= 0) {
+        throw new Error(
+          `validation watchdog: operation ${operationId} was still running when the validation deadline (hardTimeoutAt + ${graceMs}ms grace) passed — the server reported NO terminal state; the operation was not failed, timed out, or cancelled by the app`,
+        );
+      }
+      await sleep(Math.min(interval, remaining));
+      poll = await callTool(port, "arr_get_operation", { operationId }, bounds);
+      polls += 1;
+      const p = poll.payload;
+      if (!p || typeof p.status !== "string") {
+        throw new Error(`poll returned a malformed response: ${truncate(poll.text)}`);
+      }
+      console.log(`poll ${polls} (${Date.now() - started}ms): ${p.status}${p.stage ? ` [${p.stage}]` : ""}`);
+      if (p.status === "running") {
+        interval = pollIntervalMs(p.pollAfterMs);
+        continue;
+      }
+      break;
+    }
+
+    if (poll.payload.status !== "completed") {
+      throw new Error(`discovery operation ended ${poll.payload.status}${poll.payload.error ? `: ${poll.payload.error}` : ""}`);
+    }
+    const result = validateDiscoveryResult(poll.payload, { operationId, downloadId });
+
+    console.log(`=== completed discovery (${Date.now() - started}ms total, ${polls} polls) ===`);
+    console.log(JSON.stringify({
+      downloadId: result.downloadId,
+      count: result.count,
+      existingFilesPolicy: result.existingFilesPolicy,
+      candidateFilterPolicy: result.candidateFilterPolicy,
+      hasVerifyDirective: Array.isArray(result.verifyBeforeActing),
+      notes: result.notes?.length,
+    }, null, 1));
+    for (const c of result.candidates.slice(0, 5)) {
+      console.log(JSON.stringify({
+        candidateId: c.candidateId, name: c.name,
+        artist: c.artist, album: c.album, albumReleaseId: c.albumReleaseId,
+        rejections: c.rejections,
+      }));
+    }
+    console.log(`(showing ${Math.min(5, result.count)} of ${result.count} candidates; completed discovery means candidate analysis finished — nothing was imported)`);
+    return { count: result.count, polls };
+  } catch (error) {
+    const tail = stderr.trim().split(/\r?\n/).slice(-5).join(" | ");
+    if (tail) console.error(`server stderr: ${truncate(tail)}`);
+    throw error;
+  } finally {
+    await stopOwnedChild(child, exited);
   }
-  console.log(`(showing ${Math.min(5, result.count)} of ${result.count} candidates)`);
-} finally {
-  child.kill("SIGTERM");
-  await once(child, "exit").catch(() => {});
+}
+
+if (process.argv[1] && pathToFileURL(process.argv[1]).href === import.meta.url) {
+  runLiveDiscovery({ downloadId: process.argv[2] }).catch((error) => {
+    console.error(`live discovery validation failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  });
 }

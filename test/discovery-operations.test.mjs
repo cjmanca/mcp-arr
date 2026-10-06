@@ -246,7 +246,10 @@ async function callTool(port, name, args) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function withServers(env, opts, fn) {
-  const port = String(35000 + Math.floor(Math.random() * 1000));
+  // Distinct port band from preview-operations.test.mjs (35000+): both suites
+  // spawn many servers in parallel under `node --test`, and a collision would
+  // make one suite's health check attach to the other suite's server.
+  const port = String(37000 + Math.floor(Math.random() * 1000));
   const lidarrStub = await startStub(lidarrRoutes(opts));
   const sonarrStub = await startStub(sonarrRoutes(opts));
   const radarrStub = await startStub(radarrRoutes(opts));
