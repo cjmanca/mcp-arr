@@ -416,8 +416,11 @@ test("fetchBounded rejects an overdue response even when its timeout callback ha
   child.stderr.on("data", (d) => (err += d.toString()));
   const code = await onceP(child, "exit");
   assert.equal(code, 0, `deadline-acceptance fixture reported failures (exit ${code}):\n${out}${err}`);
-  assert.match(out, /validation-earlier: PASS \(watchdog/, "validation deadline earlier -> watchdog");
-  assert.match(out, /request-earlier: PASS \(request/, "request deadline earlier -> request timeout");
-  assert.match(out, /both-earliest-validation: PASS \(watchdog/, "both elapsed -> earliest deadline wins, not conditional order");
-  assert.match(out, /on-time: PASS \(success/, "an in-time completed result is accepted");
+  // Each PASS line must show the intended request + body-read path actually ran
+  // (fetch=1 body=1), so a case cannot pass by rejecting a deadline that expired
+  // before its own request started.
+  assert.match(out, /validation-earlier: PASS \(watchdog: fetch=1 body=1/, "validation deadline earlier -> watchdog, request+body path exercised");
+  assert.match(out, /request-earlier: PASS \(request: fetch=1 body=1/, "request deadline earlier -> request timeout, request+body path exercised");
+  assert.match(out, /both-earliest-validation: PASS \(watchdog: fetch=1 body=1/, "both deadlines expire DURING the request; earliest (validation) wins, request+body path exercised");
+  assert.match(out, /on-time: PASS \(success: fetch=1 body=1/, "an in-time completed result is accepted, request+body path exercised");
 });
