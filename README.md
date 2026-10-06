@@ -286,7 +286,7 @@ The existing service-specific tools remain available for richer local or power-u
 | `sonarr_add_series` | Add a TV series to Sonarr (supports tags) |
 | `sonarr_get_root_folders` | Get available root folders for adding series |
 | `sonarr_get_quality_profiles` | Get available quality profiles for adding series |
-| `sonarr_get_queue` | View current download queue with `limit` and `offset` pagination|
+| `sonarr_get_queue` | View current download queue with `limit` and `offset` pagination; includes tracked downloads the app has not matched to a series (entity IDs may be absent) |
 | `sonarr_delete_queue_item` | Remove a queue item; `removeFromClient` (default true), `blocklist`, `skipRedownload`, `changeCategory` |
 | `sonarr_get_manual_import_candidates` | List Sonarr's native manual-import candidates for a `downloadId` (read-only, no paths accepted); a slow discovery returns a pollable `operationId` handle |
 | `sonarr_preview_manual_import` | Reprocess candidate mappings via Sonarr's native endpoint **without importing**; shows recalculated episodes and rejections; unmapped candidates return `mappingRequired` (never sent with a 0 `seriesId`); a slow preview returns a pollable `operationId` handle |
@@ -306,7 +306,7 @@ The existing service-specific tools remain available for richer local or power-u
 | `radarr_add_movie` | Add a movie to Radarr (supports tags) |
 | `radarr_get_root_folders` | Get available root folders for adding movies |
 | `radarr_get_quality_profiles` | Get available quality profiles for adding movies |
-| `radarr_get_queue` | View current download queue with `limit` and `offset` pagination |
+| `radarr_get_queue` | View current download queue with `limit` and `offset` pagination; includes tracked downloads the app has not matched to a movie (entity IDs may be absent) |
 | `radarr_get_calendar` | See upcoming releases |
 | `radarr_search_movie` | Trigger search to download a movie in your library |
 | `radarr_search_movies` | Bulk-trigger searches for multiple movie IDs at once |
@@ -327,7 +327,7 @@ The existing service-specific tools remain available for richer local or power-u
 | `lidarr_get_root_folders` | Get available root folders for adding artists |
 | `lidarr_get_quality_profiles` | Get available quality profiles for adding artists |
 | `lidarr_get_metadata_profiles` | Get available metadata profiles for adding artists |
-| `lidarr_get_queue` | View current download queue with `limit` and `offset` pagination |
+| `lidarr_get_queue` | View current download queue with `limit` and `offset` pagination; includes tracked downloads the app has not matched to an artist (entity IDs may be absent) |
 | `lidarr_delete_queue_item` | Remove a queue item; `removeFromClient` (default true), `blocklist`, `skipRedownload`, `changeCategory` |
 | `lidarr_get_manual_import_candidates` | List Lidarr's native manual-import candidates for a `downloadId` (read-only, no paths accepted); a slow discovery returns a pollable `operationId` handle |
 | `lidarr_preview_manual_import` | Reprocess candidate mappings via Lidarr's native update endpoint **without importing**; Lidarr recomputes track mappings server-side; explicit `trackIds` are validated against the selected album release and preserved (`tracksSource` shows which mapping will import); overrides follow the native hierarchy artist → album → album release → tracks (a parent change clears inherited children — `mappingOverridesApplied`), and explicit `albumId`/`albumReleaseId` are validated against the album's native artist/release membership (`relationshipValidation`); an explicit `albumReleaseId` defaults `disableReleaseSwitching` to true (native UI behavior); reports `releaseSwitchImpact` (edition change vs the album's monitored release, recording overlap, and a `preserveCurrentRelease` remap suggestion) and per-item `currentReleaseEquivalent`; a slow preview returns a pollable `operationId` handle |
@@ -390,6 +390,8 @@ Data is cached for 1 hour to minimize GitHub API calls.
 ## Manual Import Workflow (stuck downloads)
 
 When Sonarr/Radarr/Lidarr finish a download but cannot import it automatically — unparseable filenames, missing episode/movie/album mapping, `Unable to determine if file is a sample`, partial multi-file imports — the manual-import tools reproduce the native **Interactive Import** workflow through MCP:
+
+Sonarr, Radarr, and Lidarr queue tools include tracked downloads the app has not matched to a series/movie/artist. Those unidentified entries surface with their `downloadId` and diagnostics so you can start candidate discovery, and their entity IDs may be absent until mappings are resolved.
 
 ```text
 *_get_queue                      → find the stuck item's downloadId + statusMessages

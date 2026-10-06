@@ -869,11 +869,25 @@ export class ArrClient {
    */
   async getQueue(page = 1, pageSize = 100, signal?: AbortSignal): Promise<{ records: QueueItem[]; totalRecords: number }> {
     const params = new URLSearchParams({
-      includeUnknownSeriesItems: "true",
-      includeUnknownMovieItems: "true",
       page: String(page),
       pageSize: String(pageSize),
     });
+    // Each native queue API hides tracked downloads it has not matched to a
+    // series/movie/artist UNLESS its own inclusion flag is sent, and the native
+    // filter runs before pagination/totalRecords. Send only the flag this
+    // service understands so unidentified entries stay visible on every page.
+    // (Prowlarr is not a queue-capable service and is intentionally left out.)
+    switch (this.serviceName) {
+      case "sonarr":
+        params.set("includeUnknownSeriesItems", "true");
+        break;
+      case "radarr":
+        params.set("includeUnknownMovieItems", "true");
+        break;
+      case "lidarr":
+        params.set("includeUnknownArtistItems", "true");
+        break;
+    }
     return this.request<{ records: QueueItem[]; totalRecords: number }>(`/queue?${params.toString()}`, { signal });
   }
 

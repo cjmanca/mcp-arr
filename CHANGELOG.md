@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - **Queue `progress` no longer reports `NaN%` when the app returns the camelCase `sizeLeft` spelling** (used by Sonarr/Radarr v3). The mapping now falls back to `sizeLeft` when `sizeleft` is absent.
 - **`removeFromClient=false` is now honored.** The parameter was omitted when false, so the apps' server-side default (`true`) deleted the release from the download client while the response reported it was kept. Every supplied option is now transmitted with its literal value.
 - **Sonarr queue items keep their `seasonNumber`.** The native queue exposes `seasonNumber` at the top level; the mapper only read the nested `episode.seasonNumber`.
+- **Lidarr queue now shows unidentified tracked downloads.** The queue request omitted Lidarr's native `includeUnknownArtistItems` flag, so downloads the app had not matched to an artist were hidden from `lidarr_get_queue` — the ones most in need of manual import. (Sonarr and Radarr inclusion was already enabled.) All three queue tools now include their app's unidentified entries on every page, carrying their `downloadId` and diagnostics; entity IDs may be absent until mappings are resolved. Queue fields, pagination, and manual-import safeguards are unchanged.
 
 ## [1.7.3] - 2026-07-29
 

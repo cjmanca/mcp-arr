@@ -347,7 +347,7 @@ if (clients.sonarr) {
     },
     {
       name: "sonarr_get_queue",
-      description: "Get Sonarr download queue, including import diagnostics: structured statusMessages (per-file import rejection reasons), errorMessage, trackedDownloadStatus/State, downloadId, outputPath, indexer, seriesId/episodeId/seasonNumber, and the tracked release's customFormats/customFormatScore for correlating with the library. Use these to understand why a completed download was not imported automatically. Supports pagination with limit and offset.",
+      description: "Get Sonarr download queue, including import diagnostics: structured statusMessages (per-file import rejection reasons), errorMessage, trackedDownloadStatus/State, downloadId, outputPath, indexer, seriesId/episodeId/seasonNumber, and the tracked release's customFormats/customFormatScore for correlating with the library. Use these to understand why a completed download was not imported automatically. Supports pagination with limit and offset. Includes tracked downloads the app has not matched to a series; such entries may lack entity IDs. Use their downloadId for manual-import candidate discovery, then verify/correct mappings before execution. Follow pagination to inspect the remaining queue.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -680,7 +680,7 @@ if (clients.radarr) {
     },
     {
       name: "radarr_get_queue",
-      description: "Get Radarr download queue, including import diagnostics: structured statusMessages (per-file import rejection reasons), errorMessage, trackedDownloadStatus/State, downloadId, outputPath, indexer, and movieId for correlating with the library. Use these to understand why a completed download was not imported automatically. Supports pagination with limit and offset.",
+      description: "Get Radarr download queue, including import diagnostics: structured statusMessages (per-file import rejection reasons), errorMessage, trackedDownloadStatus/State, downloadId, outputPath, indexer, and movieId for correlating with the library. Use these to understand why a completed download was not imported automatically. Supports pagination with limit and offset. Includes tracked downloads the app has not matched to a movie; such entries may lack entity IDs. Use their downloadId for manual-import candidate discovery, then verify/correct mappings before execution. Follow pagination to inspect the remaining queue.",
       inputSchema: {
         type: "object" as const,
         properties: {
@@ -994,7 +994,7 @@ if (clients.lidarr) {
     },
     {
       name: "lidarr_get_queue",
-      description: "Get Lidarr download queue, including import diagnostics: structured statusMessages (per-file import rejection reasons), errorMessage, trackedDownloadStatus/State, downloadId, outputPath, indexer, and artistId/albumId for correlating with the library. Use these to understand why a completed download was not imported automatically. Supports pagination with limit and offset.",
+      description: "Get Lidarr download queue, including import diagnostics: structured statusMessages (per-file import rejection reasons), errorMessage, trackedDownloadStatus/State, downloadId, outputPath, indexer, and artistId/albumId for correlating with the library. Use these to understand why a completed download was not imported automatically. Supports pagination with limit and offset. Includes tracked downloads the app has not matched to an artist; such entries may lack entity IDs. Use their downloadId for manual-import candidate discovery, then verify/correct mappings before execution. Follow pagination to inspect the remaining queue.",
       inputSchema: {
         type: "object" as const,
         properties: {
