@@ -1,7 +1,8 @@
 // Mock stdio MCP server for validation-script regressions. Responds to
 // initialize / tools/list / tools/call with scenarios driven by env:
 //   MOCK_STDIO_TOOLS   JSON array of tool names for tools/list
-//   MOCK_STDIO_MODE    ok | rpc-error | exit-early | tool-error | garbage | silent
+//   MOCK_STDIO_MODE    ok | rpc-error | exit-early | tool-error | garbage |
+//                      silent | garbage-after-list | garbage-after-status
 const TOOLS = JSON.parse(process.env.MOCK_STDIO_TOOLS || JSON.stringify([
   "arr_get_operation",
   "arr_cancel_operation",
@@ -42,11 +43,18 @@ function handle(msg) {
     return;
   }
   if (msg.method === "tools/list") {
-    send({
+    const response = {
       jsonrpc: "2.0",
       id: msg.id,
       result: { tools: TOOLS.map((name) => ({ name, description: `mock ${name}`, inputSchema: { type: "object", properties: {} } })) },
-    });
+    };
+    if (MODE === "garbage-after-list") {
+      // Valid response AND a malformed line in ONE stdout write: the fatal
+      // error must survive even though the pending entry already resolved.
+      process.stdout.write(`${JSON.stringify(response)}\nnot-json\n`);
+      return;
+    }
+    send(response);
     return;
   }
   if (msg.method === "tools/call") {
@@ -61,11 +69,16 @@ function handle(msg) {
       send({ jsonrpc: "2.0", id: msg.id, result: { content: [{ type: "text", text: "mock tool failure" }], isError: true } });
       return;
     }
-    send({
+    const response = {
       jsonrpc: "2.0",
       id: msg.id,
       result: { content: [{ type: "text", text: JSON.stringify({ sonarr: { configured: true, connected: true, version: "0", appName: "mock" } }) }] },
-    });
+    };
+    if (MODE === "garbage-after-status") {
+      process.stdout.write(`${JSON.stringify(response)}\nnot-json\n`);
+      return;
+    }
+    send(response);
     return;
   }
 }

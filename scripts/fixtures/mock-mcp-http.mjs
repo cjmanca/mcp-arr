@@ -5,6 +5,10 @@
 //   MOCK_OP_MS          operation hardTimeoutAt horizon (default 5000)
 //   MOCK_POLL_MS        advertised pollAfterMs (default 10)
 //   MOCK_RUNNING_POLLS  running polls before completion (default 70)
+//   MOCK_POLL1_DELAY_MS delay applied to the FIRST arr_get_operation response
+//   MOCK_DELAY_PHASE    headers (default: delay before writeHead) | body
+//                       (headers sent, response BODY delayed — exercises the
+//                       bounded response-body read)
 import { createServer } from "node:http";
 
 const PORT = Number(process.env.PORT || "39885");
@@ -12,6 +16,10 @@ const SCENARIO = process.env.MOCK_HTTP_SCENARIO || "complete";
 const OP_MS = Number(process.env.MOCK_OP_MS || "5000");
 const POLL_MS = Number(process.env.MOCK_POLL_MS || "10");
 const RUNNING_POLLS = Number(process.env.MOCK_RUNNING_POLLS || "70");
+const POLL1_DELAY_MS = Number(process.env.MOCK_POLL1_DELAY_MS || "0");
+const DELAY_PHASE = process.env.MOCK_DELAY_PHASE || "headers";
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 if (SCENARIO === "crash") process.exit(7);
 
@@ -70,61 +78,79 @@ const server = createServer(async (req, res) => {
     }
     if (name === "arr_get_operation") {
       polls += 1;
-      if (SCENARIO === "watchdog") {
-        return reply(envelope(msg.id, {
-          operationId: "op-1",
-          status: "running",
-          operation: "lidarr-manual-import-discovery",
-          stage: "discovering-candidates",
-          elapsedMs: polls * POLL_MS,
-          pollAfterMs: POLL_MS,
-        }));
+      const payload = pollPayload();
+      const delay = polls === 1 ? POLL1_DELAY_MS : 0;
+      if (delay > 0 && DELAY_PHASE === "body") {
+        // Headers arrive immediately; the BODY is delayed, so the client's
+        // response.text() is what must be bounded.
+        res.writeHead(200, { "content-type": "application/json" });
+        res.write("");
+        await sleep(delay);
+        res.end(JSON.stringify(envelope(msg.id, payload)));
+        return;
       }
-      if (SCENARIO === "failed") {
-        return reply(envelope(msg.id, {
-          operationId: "op-1",
-          status: "failed",
-          operation: "lidarr-manual-import-discovery",
-          error: "mock request timed out",
-        }));
+      if (delay > 0) {
+        await sleep(delay);
       }
-      if (polls > RUNNING_POLLS) {
-        const count = SCENARIO === "zero" ? 0 : 1;
-        return reply(envelope(msg.id, {
-          operationId: "op-1",
-          status: "completed",
-          operation: "lidarr-manual-import-discovery",
-          result: {
-            verifyBeforeActing: ["mock verify directive"],
-            downloadId: requestedDownloadId,
-            existingFilesPolicy: { replaceExistingFiles: false, lidarrUiMode: "Combine with existing files", albumWidePreDelete: false },
-            candidateFilterPolicy: { filterExistingFiles: true, lidarrUiMode: "Unmapped Files Only" },
-            count,
-            candidates: count === 0 ? [] : [{
-              candidateId: 5,
-              path: "/downloads/complete/Artist/Album/01 - Track.flac",
-              name: "01 - Track",
-              artist: { id: 1, artistName: "Artist" },
-              album: { id: 2, title: "Album" },
-              albumReleaseId: 3,
-              tracks: [{ id: 10, title: "Track", trackNumber: 1 }],
-              rejections: [],
-            }],
-            notes: ["mock note"],
-          },
-        }));
-      }
-      return reply(envelope(msg.id, {
-        operationId: "op-1",
-        status: "running",
-        operation: "lidarr-manual-import-discovery",
-        stage: "discovering-candidates",
-        elapsedMs: polls * POLL_MS,
-        pollAfterMs: POLL_MS,
-      }));
+      return reply(envelope(msg.id, payload));
     }
   }
   return reply({ jsonrpc: "2.0", id: msg.id, error: { code: -32601, message: `mock: unsupported ${msg.method}` } });
 });
+
+function pollPayload() {
+  if (SCENARIO === "watchdog") {
+    return {
+      operationId: "op-1",
+      status: "running",
+      operation: "lidarr-manual-import-discovery",
+      stage: "discovering-candidates",
+      elapsedMs: polls * POLL_MS,
+      pollAfterMs: POLL_MS,
+    };
+  }
+  if (SCENARIO === "failed") {
+    return {
+      operationId: "op-1",
+      status: "failed",
+      operation: "lidarr-manual-import-discovery",
+      error: "mock request timed out",
+    };
+  }
+  if (polls > RUNNING_POLLS) {
+    const count = SCENARIO === "zero" ? 0 : 1;
+    return {
+      operationId: "op-1",
+      status: "completed",
+      operation: "lidarr-manual-import-discovery",
+      result: {
+        verifyBeforeActing: ["mock verify directive"],
+        downloadId: requestedDownloadId,
+        existingFilesPolicy: { replaceExistingFiles: false, lidarrUiMode: "Combine with existing files", albumWidePreDelete: false },
+        candidateFilterPolicy: { filterExistingFiles: true, lidarrUiMode: "Unmapped Files Only" },
+        count,
+        candidates: count === 0 ? [] : [{
+          candidateId: 5,
+          path: "/downloads/complete/Artist/Album/01 - Track.flac",
+          name: "01 - Track",
+          artist: { id: 1, artistName: "Artist" },
+          album: { id: 2, title: "Album" },
+          albumReleaseId: 3,
+          tracks: [{ id: 10, title: "Track", trackNumber: 1 }],
+          rejections: [],
+        }],
+        notes: ["mock note"],
+      },
+    };
+  }
+  return {
+    operationId: "op-1",
+    status: "running",
+    operation: "lidarr-manual-import-discovery",
+    stage: "discovering-candidates",
+    elapsedMs: polls * POLL_MS,
+    pollAfterMs: POLL_MS,
+  };
+}
 
 server.listen(PORT, "127.0.0.1");

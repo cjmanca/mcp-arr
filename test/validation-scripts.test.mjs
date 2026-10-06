@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 import { runStdioSmoke } from "../scripts/smoke-stdio.mjs";
 import { runLiveDiscovery } from "../scripts/live-lidarr-discovery.mjs";
+import { trackChildExit, stopOwnedChild } from "../scripts/managed-child.mjs";
 
 // ---------------------------------------------------------------------------
 // Regression tests for the validation scripts themselves (no live services,
@@ -174,4 +176,105 @@ test("live script succeeds on handle → poll → completed, and a zero-candidat
   const zeroSummary = await zero.run;
   assert.equal(zeroSummary.count, 0, "an empty candidate list is a successful discovery");
   assertOwnedChildStopped(zero.getChild());
+});
+
+// --- A/B. The absolute validation deadline bounds in-flight polls -----------
+
+const STALL_ENV = {
+  MOCK_HTTP_SCENARIO: "complete",
+  MOCK_OP_MS: "250",
+  MOCK_POLL_MS: "10",
+  MOCK_RUNNING_POLLS: "0",
+  MOCK_POLL1_DELAY_MS: "1000",
+};
+
+test("a poll stalling past the validation deadline fails as watchdog near the deadline, not at requestTimeoutMs (headers phase)", async () => {
+  const { run, getChild } = live({ env: STALL_ENV, requestTimeoutMs: 2_000, graceMs: 50 });
+  const started = Date.now();
+  // The mock's completed response arrives at ~1000ms — after the ~300ms
+  // validation deadline. Accepting it would be the old bug.
+  await assert.rejects(run, /validation watchdog/);
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed >= 250, `watchdog must not fire before the deadline (${elapsed}ms)`);
+  assert.ok(elapsed < 1_200, `watchdog must fire near the deadline, not at requestTimeoutMs (${elapsed}ms)`);
+  assertOwnedChildStopped(getChild());
+});
+
+test("a delayed response BODY is bounded by the validation deadline too", async () => {
+  const { run, getChild } = live({
+    env: { ...STALL_ENV, MOCK_DELAY_PHASE: "body" },
+    requestTimeoutMs: 2_000,
+    graceMs: 50,
+  });
+  const started = Date.now();
+  await assert.rejects(run, /validation watchdog/);
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 1_200, `body-read stall must be cut off at the deadline (${elapsed}ms)`);
+  assertOwnedChildStopped(getChild());
+});
+
+test("a request timeout before the validation deadline stays a request failure, not watchdog", async () => {
+  const { run, getChild } = live({
+    env: { ...STALL_ENV, MOCK_OP_MS: "5000" },
+    requestTimeoutMs: 300,
+    graceMs: 1_000,
+  });
+  await assert.rejects(run, /request timeout/);
+  assertOwnedChildStopped(getChild());
+});
+
+// --- C. Fatal stdout errors survive gaps between pending requests -----------
+
+test("malformed stdout after a valid tools/list response cannot be forgotten", async () => {
+  const { run, getChild } = smoke({ env: { MOCK_STDIO_MODE: "garbage-after-list" } });
+  await assert.rejects(run, /malformed protocol output/);
+  assertOwnedChildStopped(getChild());
+});
+
+test("malformed stdout in the same chunk as the final valid arr_status response fails the run", async () => {
+  const { run, getChild } = smoke({ env: { MOCK_STDIO_MODE: "garbage-after-status" } });
+  await assert.rejects(run, /malformed protocol output/);
+  assertOwnedChildStopped(getChild());
+});
+
+// --- D. Successful cleanup leaves no timer keeping the CLI alive ------------
+
+test("stopOwnedChild clears its race timers: the parent process exits promptly after cleanup", async () => {
+  const fixture = fileURLToPath(new URL("../scripts/fixtures/child-cleanup-timer.mjs", import.meta.url));
+  const child = spawn(process.execPath, [fixture], {
+    env: { ...process.env, CLEANUP_GRACE_MS: "3000" },
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  let out = "";
+  let cleanupAt = null;
+  const done = new Promise((resolve) => child.once("exit", resolve));
+  child.stdout.on("data", (d) => {
+    out += d.toString();
+    if (cleanupAt === null && /cleanup-ms=/.test(out)) cleanupAt = Date.now();
+  });
+  let capTimer;
+  const raced = await Promise.race([
+    done.then(() => ({ exited: true })),
+    new Promise((resolve) => { capTimer = setTimeout(() => resolve({ exited: false }), 10_000); }),
+  ]);
+  clearTimeout(capTimer);
+  if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  assert.ok(raced.exited, "fixture subprocess must exit on its own");
+  assert.ok(cleanupAt !== null, `fixture must report cleanup completion (stdout: ${out})`);
+  const cleanupMs = Number(/cleanup-ms=(\d+)/.exec(out)[1]);
+  assert.ok(cleanupMs < 1_000, `stopOwnedChild itself resolved promptly (${cleanupMs}ms)`);
+  const linger = Date.now() - cleanupAt;
+  // Generous margin: a leaked 3000ms grace timer would keep the parent alive
+  // for ~3s after the cleanup line.
+  assert.ok(linger < 1_500, `parent lingered ${linger}ms after cleanup — a cleanup timer is still scheduled`);
+});
+
+test("unconfirmed termination is reported as cleanup failure, not successful cleanup", async () => {
+  // Stub child: kill() is a no-op and no exit event ever fires.
+  const stub = { exitCode: null, signalCode: null, killed: false, kill: () => true, once: () => {} };
+  const tracked = trackChildExit(stub);
+  await assert.rejects(
+    stopOwnedChild(stub, tracked, { graceMs: 40, killMs: 40 }),
+    /cleanup failure/,
+  );
 });

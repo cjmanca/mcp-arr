@@ -5,8 +5,11 @@
 // handle → poll → completed-result flow is exercised against the live app.
 //
 // The polling watchdog is derived from the handle's own hardTimeoutAt (plus a
-// bounded grace), not a fixed attempt count, so a legitimately slow discovery
-// is never misreported as a failure. Success and failure both clean up the
+// bounded grace), not a fixed attempt count, and it is enforced THROUGH the
+// in-flight request: every poll's HTTP request and response-body read is
+// bounded by the earlier of the per-request timeout and the absolute
+// validation deadline, and a response obtained after the deadline can never
+// turn the validation into a success. Success and failure both clean up the
 // child this script spawned before exiting; failures exit nonzero.
 //
 // Usage: node scripts/live-lidarr-discovery.mjs <downloadId>
@@ -35,11 +38,49 @@ function truncate(text, max = 400) {
   return t.length <= max ? t : `${t.slice(0, max)}…`;
 }
 
-/** Bounded HTTP request: the AbortSignal.timeout covers headers AND body. */
-async function fetchBounded(url, init, timeoutMs) {
-  const response = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
-  const text = await response.text();
-  return { status: response.status, text };
+/**
+ * Bounded HTTP request with composed cancellation, compatible with Node >=18
+ * (no AbortSignal.any): one controller is aborted by the FIRST of
+ *   - the per-request timeout,
+ *   - the absolute validation deadline (when supplied),
+ *   - the owned child exiting.
+ * The first reason wins and is preserved; the abort covers headers AND the
+ * response-body read, and every timer/listener is cleared when the request
+ * settles. A losing request is aborted, not abandoned.
+ */
+async function fetchBounded(url, init, { timeoutMs, deadlineAt, exited }) {
+  const controller = new AbortController();
+  let failure = null;
+  const failWith = (error) => {
+    if (failure) return;
+    failure = error;
+    controller.abort(error);
+  };
+  const timers = [];
+  if (timeoutMs > 0) {
+    timers.push(setTimeout(() => failWith(new Error(`request timeout: ${url} did not respond within ${timeoutMs}ms`)), timeoutMs));
+  }
+  if (deadlineAt !== undefined) {
+    timers.push(setTimeout(
+      () => failWith(new Error(
+        `validation watchdog: no terminal result was obtained before the validation deadline (hardTimeoutAt + grace); the script cannot tell whether the server finished internally`,
+      )),
+      Math.max(0, deadlineAt - Date.now()),
+    ));
+  }
+  const onChildExit = () => failWith(new Error(`MCP child exited before ${url} responded`));
+  if (exited) exited.then(onChildExit);
+  try {
+    const response = await fetch(url, { ...init, signal: controller.signal });
+    const text = await response.text();
+    if (failure) throw failure;
+    return { status: response.status, text };
+  } catch (error) {
+    if (failure) throw failure;
+    throw error;
+  } finally {
+    for (const timer of timers) clearTimeout(timer);
+  }
 }
 
 /**
@@ -63,6 +104,12 @@ function validationDeadlineMs(hardTimeoutAt, graceMs) {
   return at + graceMs;
 }
 
+function watchdogError(operationId, graceMs) {
+  return new Error(
+    `validation watchdog: no terminal result for operation ${operationId} was obtained before the validation deadline (hardTimeoutAt + ${graceMs}ms grace); the script cannot tell whether the server finished internally`,
+  );
+}
+
 function parseRpcBody(rawText) {
   const dataLine = rawText.split("\n").find((l) => l.startsWith("data: "));
   let body;
@@ -81,26 +128,22 @@ function parseRpcBody(rawText) {
 }
 
 /**
- * Send one JSON-RPC request over the stateless HTTP endpoint. Every request is
- * bounded, and a child that dies mid-request fails the call fast instead of
- * hanging.
+ * Send one JSON-RPC request over the stateless HTTP endpoint. Every request
+ * (and its body read) is bounded by the per-request timeout and, during
+ * polling, by the absolute validation deadline; a child that dies mid-request
+ * aborts it.
  */
-async function sendRequest(port, method, params, { timeoutMs, exited }) {
+async function sendRequest(port, method, params, { timeoutMs, deadlineAt, exited }) {
   const request = { jsonrpc: "2.0", id: 3, method, params };
-  const gone = exited.then(() => ({ childExited: true }));
-  const raced = await Promise.race([
-    fetchBounded(
-      `http://127.0.0.1:${port}/mcp`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
-        body: JSON.stringify(request),
-      },
-      timeoutMs,
-    ),
-    gone,
-  ]);
-  if (raced?.childExited) throw new Error(`MCP child exited before ${method} responded`);
+  const raced = await fetchBounded(
+    `http://127.0.0.1:${port}/mcp`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
+      body: JSON.stringify(request),
+    },
+    { timeoutMs, deadlineAt, exited },
+  );
   return { body: parseRpcBody(raced.text), text: raced.text };
 }
 
@@ -118,17 +161,21 @@ async function callTool(port, name, args, bounds) {
   return { payload, text: content[0].text };
 }
 
-async function waitForHealth(port, { timeoutMs, exited }) {
+async function waitForHealth(port, { timeoutMs, exited, state }) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
-    const gone = exited.then(() => ({ childExited: true }));
-    const raced = await Promise.race([
-      fetchBounded(`http://127.0.0.1:${port}/health`, {}, Math.min(2_000, Math.max(100, deadline - Date.now())))
-        .catch(() => null),
-      gone,
-    ]);
-    if (raced?.childExited) throw new Error("MCP child exited before becoming healthy");
-    if (raced && raced.status === 200) return;
+    try {
+      const r = await fetchBounded(
+        `http://127.0.0.1:${port}/health`,
+        {},
+        { timeoutMs: Math.min(2_000, Math.max(100, deadline - Date.now())), exited },
+      );
+      if (r.status === 200) return;
+    } catch (error) {
+      if (state.exit || /child exited/.test(String(error?.message))) {
+        throw new Error("MCP child exited before becoming healthy");
+      }
+    }
     await sleep(100);
   }
   throw new Error(`MCP server did not become healthy within ${timeoutMs}ms`);
@@ -201,11 +248,13 @@ export async function runLiveDiscovery(options = {}) {
   });
   let stderr = "";
   child.stderr.on("data", (d) => (stderr += d));
-  const exited = trackChildExit(child);
+  const tracked = trackChildExit(child);
+  const { exited, state } = tracked;
   onChild(child);
 
+  let primaryError = null;
   try {
-    await waitForHealth(port, { timeoutMs: healthTimeoutMs, exited });
+    await waitForHealth(port, { timeoutMs: healthTimeoutMs, exited, state });
     const bounds = { timeoutMs: requestTimeoutMs, exited };
     const init = await sendRequest(port, "initialize", {
       protocolVersion: "2025-06-18",
@@ -240,19 +289,23 @@ export async function runLiveDiscovery(options = {}) {
       throw new Error("protocol error: running handle must not carry count/candidates");
     }
 
+    // Absolute validation deadline: computed ONCE, enforced through every
+    // poll's request AND body read, never reset by a later response.
     const deadlineAt = validationDeadlineMs(handle.hardTimeoutAt, graceMs);
     let interval = pollIntervalMs(handle.pollAfterMs);
     let poll = null;
     let polls = 0;
     for (;;) {
       const remaining = deadlineAt - Date.now();
-      if (remaining <= 0) {
-        throw new Error(
-          `validation watchdog: operation ${operationId} was still running when the validation deadline (hardTimeoutAt + ${graceMs}ms grace) passed — the server reported NO terminal state; the operation was not failed, timed out, or cancelled by the app`,
-        );
-      }
+      if (remaining <= 0) throw watchdogError(operationId, graceMs);
       await sleep(Math.min(interval, remaining));
-      poll = await callTool(port, "arr_get_operation", { operationId }, bounds);
+      const remainingAfterSleep = deadlineAt - Date.now();
+      if (remainingAfterSleep <= 0) throw watchdogError(operationId, graceMs);
+      poll = await callTool(port, "arr_get_operation", { operationId }, {
+        timeoutMs: requestTimeoutMs,
+        deadlineAt,
+        exited,
+      });
       polls += 1;
       const p = poll.payload;
       if (!p || typeof p.status !== "string") {
@@ -290,11 +343,18 @@ export async function runLiveDiscovery(options = {}) {
     console.log(`(showing ${Math.min(5, result.count)} of ${result.count} candidates; completed discovery means candidate analysis finished — nothing was imported)`);
     return { count: result.count, polls };
   } catch (error) {
+    primaryError = error;
     const tail = stderr.trim().split(/\r?\n/).slice(-5).join(" | ");
     if (tail) console.error(`server stderr: ${truncate(tail)}`);
     throw error;
   } finally {
-    await stopOwnedChild(child, exited);
+    try {
+      await stopOwnedChild(child, tracked);
+    } catch (cleanupError) {
+      // A validation failure keeps its own reason; cleanup failure is only
+      // reported when the run itself succeeded.
+      if (!primaryError) throw cleanupError;
+    }
   }
 }
 

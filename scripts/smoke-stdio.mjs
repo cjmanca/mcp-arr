@@ -5,6 +5,13 @@
 // malformed output), all waits are bounded, and the child this script spawned
 // is cleaned up on success AND failure before the script exits.
 //
+// A fatal protocol/transport error (malformed stdout, premature child exit,
+// spawn/stdin errors, request deadline) is RETAINED for the whole run: it
+// rejects outstanding requests, refuses later send()/notify() calls, and
+// cannot be erased by a valid response arriving later in the stream. The
+// success report checks the retained error. Intentional termination during
+// cleanup is not a fatal error.
+//
 // arr_status establishes that the server answers a tool call over stdio; it is
 // NOT proof that every configured service is connected. Per-service connection
 // status is reported from the payload, and unconfigured optional services are
@@ -79,20 +86,46 @@ export async function runStdioSmoke(options = {}) {
   });
   let stderr = "";
   child.stderr.on("data", (d) => (stderr += d));
-  const exited = trackChildExit(child);
+  const tracked = trackChildExit(child);
+  const { exited } = tracked;
   onChild(child);
 
   const pending = new Map();
-  const failPending = (reason) => {
+  // First fatal protocol/transport error wins and is retained for the whole
+  // run — a later valid response cannot erase it.
+  let fatalError = null;
+  // Intentional shutdown (stopOwnedChild in finally) is cleanup, not a
+  // protocol failure.
+  let closing = false;
+  function recordFatal(reason) {
+    const error = reason instanceof Error ? reason : new Error(String(reason));
+    fatalError ??= error;
     for (const entry of pending.values()) {
       clearTimeout(entry.timer);
-      entry.reject(new Error(reason));
+      entry.reject(error);
     }
     pending.clear();
-  };
-  child.once("exit", (code, signal) => failPending(`MCP child exited before responding (code=${code ?? "null"}, signal=${signal ?? "none"})`));
-  child.once("error", (error) => failPending(`MCP child process error: ${error.message}`));
-  child.stdin.on("error", (error) => failPending(`stdin write failed: ${error.message}`));
+  }
+
+  child.once("exit", (code, signal) => {
+    if (closing) {
+      // Expected cleanup termination: reject stragglers without latching a
+      // fatal protocol error.
+      for (const entry of pending.values()) {
+        clearTimeout(entry.timer);
+        entry.reject(new Error(`MCP child closed during cleanup (code=${code ?? "null"}, signal=${signal ?? "none"})`));
+      }
+      pending.clear();
+      return;
+    }
+    recordFatal(`MCP child exited before responding (code=${code ?? "null"}, signal=${signal ?? "none"})`);
+  });
+  child.once("error", (error) => {
+    if (!closing) recordFatal(`MCP child process error: ${error.message}`);
+  });
+  child.stdin.on("error", (error) => {
+    if (!closing) recordFatal(`stdin write failed: ${error.message}`);
+  });
 
   let buffer = "";
   child.stdout.on("data", (chunk) => {
@@ -106,7 +139,7 @@ export async function runStdioSmoke(options = {}) {
       try {
         message = JSON.parse(line);
       } catch {
-        failPending(`malformed protocol output: non-JSON line on stdout: ${truncate(line)}`);
+        recordFatal(`malformed protocol output: non-JSON line on stdout: ${truncate(line)}`);
         return;
       }
       if (message?.id !== undefined && pending.has(message.id)) {
@@ -119,10 +152,12 @@ export async function runStdioSmoke(options = {}) {
   });
 
   function send(method, params, id) {
+    if (fatalError) return Promise.reject(fatalError);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         pending.delete(id);
-        reject(new Error(`no response to ${method} within ${requestTimeoutMs}ms`));
+        recordFatal(`no response to ${method} within ${requestTimeoutMs}ms`);
+        reject(fatalError);
       }, requestTimeoutMs);
       pending.set(id, { resolve, reject, timer });
       child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", id, method, params })}\n`, (error) => {
@@ -131,18 +166,28 @@ export async function runStdioSmoke(options = {}) {
           if (entry) {
             pending.delete(id);
             clearTimeout(entry.timer);
-            entry.reject(new Error(`stdin write failed: ${error.message}`));
+            recordFatal(`stdin write failed: ${error.message}`);
+            entry.reject(fatalError);
           }
         }
       });
     });
   }
+  async function sendChecked(method, params, id) {
+    const message = await send(method, params, id);
+    // A fatal error recorded in the same stream chunk that carried this
+    // response must not be forgotten.
+    if (fatalError) throw fatalError;
+    return message;
+  }
   function notify(method, params) {
+    if (fatalError) throw fatalError;
     child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
   }
 
+  let primaryError = null;
   try {
-    const init = assertRpcResult(await send("initialize", {
+    const init = assertRpcResult(await sendChecked("initialize", {
       protocolVersion: "2025-06-18",
       capabilities: {},
       clientInfo: { name: "smoke", version: "0.0.0" },
@@ -151,7 +196,7 @@ export async function runStdioSmoke(options = {}) {
     console.log("initialize:", init.serverInfo.name, init.serverInfo.version ?? "?");
     notify("notifications/initialized", {});
 
-    const listed = assertRpcResult(await send("tools/list", {}, 2), "tools/list");
+    const listed = assertRpcResult(await sendChecked("tools/list", {}, 2), "tools/list");
     if (!Array.isArray(listed.tools)) throw new Error("tools/list returned no tools array");
     const names = new Set(listed.tools.map((t) => t?.name).filter(Boolean));
     const missing = REQUIRED_TOOLS.filter((name) => !names.has(name));
@@ -160,23 +205,35 @@ export async function runStdioSmoke(options = {}) {
     }
     console.log(`tools/list: ${names.size} tools registered; all ${REQUIRED_TOOLS.length} required tools present`);
 
-    const status = assertRpcResult(await send("tools/call", { name: "arr_status", arguments: {} }, 3), "arr_status");
+    const status = assertRpcResult(await sendChecked("tools/call", { name: "arr_status", arguments: {} }, 3), "arr_status");
     const statusText = Array.isArray(status.content) ? status.content[0]?.text : undefined;
     if (typeof statusText !== "string") throw new Error("arr_status returned a malformed MCP result (no content[0].text)");
     if (status.isError === true) {
       throw new Error(`arr_status reported a tool-level error: ${truncate(statusText)}`);
     }
+    // The final success gate: an already-observed fatal error (e.g. a
+    // malformed line in the same chunk as the valid arr_status response)
+    // cannot be rescued by that valid response.
+    if (fatalError) throw fatalError;
     let statusPayload = null;
     try { statusPayload = JSON.parse(statusText); } catch { /* reported below as unparsable */ }
     console.log(`arr_status: server answered a tool call over stdio; per-service status: ${describeServices(statusPayload)}`);
     console.log("stdio smoke passed");
     return { toolCount: names.size };
   } catch (error) {
+    primaryError = error;
     const tail = stderr.trim().split(/\r?\n/).slice(-5).join(" | ");
     if (tail) console.error(`server stderr: ${truncate(tail)}`);
     throw error;
   } finally {
-    await stopOwnedChild(child, exited);
+    closing = true;
+    try {
+      await stopOwnedChild(child, tracked);
+    } catch (cleanupError) {
+      // A protocol failure keeps its own reason; cleanup failure is only
+      // reported when the run itself succeeded.
+      if (!primaryError) throw cleanupError;
+    }
   }
 }
 
