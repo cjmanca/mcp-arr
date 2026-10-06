@@ -87,7 +87,6 @@ export async function runStdioSmoke(options = {}) {
   let stderr = "";
   child.stderr.on("data", (d) => (stderr += d));
   const tracked = trackChildExit(child);
-  const { exited } = tracked;
   onChild(child);
 
   const pending = new Map();

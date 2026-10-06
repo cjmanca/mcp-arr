@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { spawn } from "node:child_process";
+import { EventEmitter } from "node:events";
 import { fileURLToPath } from "node:url";
 
 import { runStdioSmoke } from "../scripts/smoke-stdio.mjs";
@@ -271,10 +272,152 @@ test("stopOwnedChild clears its race timers: the parent process exits promptly a
 
 test("unconfirmed termination is reported as cleanup failure, not successful cleanup", async () => {
   // Stub child: kill() is a no-op and no exit event ever fires.
-  const stub = { exitCode: null, signalCode: null, killed: false, kill: () => true, once: () => {} };
+  const stub = { exitCode: null, signalCode: null, killed: false, kill: () => true, on: () => {}, once: () => {} };
   const tracked = trackChildExit(stub);
   await assert.rejects(
     stopOwnedChild(stub, tracked, { graceMs: 40, killMs: 40 }),
     /cleanup failure/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// Child-lifecycle regressions. No live services, no privileged kills.
+// ---------------------------------------------------------------------------
+
+const onceP = (emitter, event) => new Promise((resolve) => emitter.once(event, resolve));
+
+function killSpy(child) {
+  const calls = [];
+  const realKill = child.kill.bind(child);
+  child.kill = (sig) => { calls.push(sig); return realKill(sig); };
+  return calls;
+}
+
+// A realistic child double that separates spawn, runtime error, signalling
+// error, and confirmed exit — the exact distinction the old `exited` promise
+// collapsed.
+class FakeChild extends EventEmitter {
+  constructor({ exitAfterKillMs = 30 } = {}) {
+    super();
+    this.exitCode = null;
+    this.signalCode = null;
+    this.killed = false;
+    this.killSignals = [];
+    this._exitAfterKillMs = exitAfterKillMs;
+  }
+  kill(signal) {
+    this.killSignals.push(signal);
+    if (signal === "SIGTERM") {
+      // A signalling error with NO exit — must not be treated as termination.
+      this.emit("error", new Error("simulated signalling error on SIGTERM"));
+      return true;
+    }
+    if (signal === "SIGKILL") {
+      this.killed = true;
+      setTimeout(() => {
+        this.signalCode = "SIGKILL";
+        this.emit("exit", null, "SIGKILL");
+      }, this._exitAfterKillMs);
+      return true;
+    }
+    return true;
+  }
+}
+
+// --- A. Runtime error AFTER a successful spawn ------------------------------
+
+test("an error from an already-started child never means 'nothing to clean up'", async () => {
+  // Real disposable child, kept alive by a timer, with an IPC channel to break.
+  const child = spawn(process.execPath, ["-e", "process.on('message', () => {}); setInterval(() => {}, 10_000)"], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+  const tracked = trackChildExit(child);
+  try {
+    await onceP(child, "spawn");
+    assert.ok(child.pid > 0, "child started successfully (has a pid)");
+    assert.equal(child.exitCode, null, "child is running");
+    // Induce a controlled post-start child-process error: closing the IPC channel
+    // then sending emits ERR_IPC_CHANNEL_CLOSED on the child WITHOUT exiting it.
+    child.disconnect();
+    child.send("mcp-arr-trigger-ipc-error");
+    await onceP(child, "error");
+    assert.ok(tracked.state.spawned, "spawn was recorded");
+    assert.equal(tracked.state.exit, null, "the child errored but did NOT exit");
+    assert.equal(tracked.state.spawnFailed, false, "a started child is not a spawn failure");
+    await stopOwnedChild(child, tracked, { graceMs: 2_000, killMs: 2_000 });
+    // Regression: the old code returned "success" here while the child lived.
+    assert.ok(
+      child.exitCode !== null || child.signalCode !== null,
+      "cleanup must not report success while a started child is still alive (it must drive the child to a confirmed exit)",
+    );
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  }
+});
+
+// --- B. Signalling error, then a delayed forced-exit ----------------------------
+
+test("cleanup waits for the real exit when a signalling error precedes a delayed SIGKILL", async () => {
+  const child = new FakeChild({ exitAfterKillMs: 30 });
+  const tracked = trackChildExit(child); // attach lifecycle listeners BEFORE emitting
+  child.emit("spawn");
+  assert.ok(tracked.state.spawned, "spawn recorded");
+  const started = Date.now();
+  // Must RESOLVE: SIGTERM's signalling error resolves nothing, cleanup escalates
+  // to SIGKILL, then the real exit arrives inside the forced-exit budget.
+  await stopOwnedChild(child, tracked, { graceMs: 80, killMs: 300 });
+  const elapsed = Date.now() - started;
+  assert.deepEqual(child.killSignals, ["SIGTERM", "SIGKILL"], "escalation must run SIGTERM then SIGKILL");
+  assert.equal(child.signalCode, "SIGKILL", "termination confirmed by the exit event, not the signalling error");
+  assert.ok(elapsed < 400, `must succeed within the configured budget, not reject immediately (${elapsed}ms)`);
+});
+
+// --- C. Genuine spawn failure --------------------------------------------------
+
+test("a verified spawn failure cleans up without signalling a process that never started", async () => {
+  const child = spawn("mcp-arr-not-a-real-executable", [], { stdio: "ignore" });
+  const killSignals = killSpy(child);
+  const tracked = trackChildExit(child);
+  await onceP(child, "error");
+  assert.ok(tracked.state.spawnFailed, "spawn failure recorded");
+  assert.equal(tracked.state.spawned, false, "no process ever started");
+  await stopOwnedChild(child, tracked, { graceMs: 100, killMs: 100 });
+  assert.deepEqual(killSignals, [], "cleanup must not signal a process that never started");
+});
+
+test("stdio smoke fails promptly on a startup spawn error (bounded, not the request timeout)", async () => {
+  const started = Date.now();
+  const { run } = smoke({ spawnCmd: "mcp-arr-not-a-real-executable", spawnArgs: [] });
+  await assert.rejects(run, /child process error|spawn|ENOENT|ENOENT/i);
+  const elapsed = Date.now() - started;
+  assert.ok(elapsed < 8_000, `startup failure must fail promptly via the child error, not after requestTimeoutMs (${elapsed}ms)`);
+});
+
+// --- D. Already-exited child ---------------------------------------------------
+
+test("stopOwnedChild returns immediately for a child that already exited, without signalling", async () => {
+  const child = spawn(process.execPath, ["-e", "process.exit(0)"], { stdio: "ignore" });
+  const killSignals = killSpy(child);
+  const tracked = trackChildExit(child);
+  await onceP(child, "exit");
+  await stopOwnedChild(child, tracked, { graceMs: 100, killMs: 100 });
+  assert.deepEqual(killSignals, [], "an already-exited child must not be signalled");
+});
+
+// --- Deadline acceptance: overdue results are rejected, not accepted -----------
+
+test("fetchBounded rejects an overdue response even when its timeout callback has not run", async () => {
+  // Isolated subprocess: a synchronous busy-block in the response-body read
+  // prevents fetchBounded's cancellation timers from firing, so only its own
+  // elapsed-deadline check can reject the result. Classification, not ms.
+  const fixture = fileURLToPath(new URL("../scripts/fixtures/fetch-deadline.mjs", import.meta.url));
+  const child = spawn(process.execPath, [fixture], { stdio: ["ignore", "pipe", "pipe"] });
+  let out = "";
+  let err = "";
+  child.stdout.on("data", (d) => (out += d.toString()));
+  child.stderr.on("data", (d) => (err += d.toString()));
+  const code = await onceP(child, "exit");
+  assert.equal(code, 0, `deadline-acceptance fixture reported failures (exit ${code}):\n${out}${err}`);
+  assert.match(out, /validation-earlier: PASS \(watchdog/, "validation deadline earlier -> watchdog");
+  assert.match(out, /request-earlier: PASS \(request/, "request deadline earlier -> request timeout");
+  assert.match(out, /both-earliest-validation: PASS \(watchdog/, "both elapsed -> earliest deadline wins, not conditional order");
+  assert.match(out, /on-time: PASS \(success/, "an in-time completed result is accepted");
 });

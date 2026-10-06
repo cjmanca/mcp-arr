@@ -43,39 +43,77 @@ function truncate(text, max = 400) {
  * (no AbortSignal.any): one controller is aborted by the FIRST of
  *   - the per-request timeout,
  *   - the absolute validation deadline (when supplied),
- *   - the owned child exiting.
+ *   - the owned child exiting,
+ *   - the owned child hitting a process error.
  * The first reason wins and is preserved; the abort covers headers AND the
  * response-body read, and every timer/listener is cleared when the request
  * settles. A losing request is aborted, not abandoned.
+ *
+ * Timers are cancellation opportunities, NOT proof of the current
+ * time. The request's own deadline and the validation
+ * deadline are also recorded as absolute timestamps and re-checked at points
+ * control returns: a result arriving after an elapsed deadline is REJECTED
+ * (classified by the earliest elapsed deadline) even if its timer callback never
+ * ran, and a request whose applicable deadline is already elapsed is refused
+ * before it starts.
  */
-async function fetchBounded(url, init, { timeoutMs, deadlineAt, exited }) {
+export async function fetchBounded(url, init, { timeoutMs, deadlineAt, childExited, childFailed }) {
   const controller = new AbortController();
+  const requestTimeoutMs = timeoutMs > 0;
+  const requestDeadlineAt = timeoutMs > 0 ? Date.now() + timeoutMs : undefined;
   let failure = null;
   const failWith = (error) => {
     if (failure) return;
     failure = error;
     controller.abort(error);
   };
+  // The first already-recorded failure wins. When no callback has run, classify a
+  // clock-elapsed deadline by the EARLIEST applicable deadline,
+  // not by the order of the checks below.
+  const elapsedReason = () => {
+    if (failure) return failure;
+    const now = Date.now();
+    const candidates = [];
+    if (requestDeadlineAt !== undefined && now > requestDeadlineAt)
+      candidates.push({ at: requestDeadlineAt, error: new Error(`request timeout: ${url} did not respond within ${timeoutMs}ms`) });
+    if (deadlineAt !== undefined && now > deadlineAt)
+      candidates.push({ at: deadlineAt, error: new Error(`validation watchdog: no terminal result was obtained before the validation deadline (hardTimeoutAt + grace); the script cannot tell whether the server finished internally`) });
+    if (candidates.length === 0) return null;
+    candidates.sort((a, b) => a.at - b.at);
+    return candidates[0].error;
+  };
+
   const timers = [];
-  if (timeoutMs > 0) {
-    timers.push(setTimeout(() => failWith(new Error(`request timeout: ${url} did not respond within ${timeoutMs}ms`)), timeoutMs));
-  }
-  if (deadlineAt !== undefined) {
-    timers.push(setTimeout(
-      () => failWith(new Error(
-        `validation watchdog: no terminal result was obtained before the validation deadline (hardTimeoutAt + grace); the script cannot tell whether the server finished internally`,
-      )),
-      Math.max(0, deadlineAt - Date.now()),
-    ));
-  }
-  const onChildExit = () => failWith(new Error(`MCP child exited before ${url} responded`));
-  if (exited) exited.then(onChildExit);
   try {
+    // 1. Refuse to start when the applicable absolute deadline already passed.
+    const pre = elapsedReason();
+    if (pre) { failWith(pre); throw failure; }
+    if (requestTimeoutMs) {
+      timers.push(setTimeout(() => failWith(new Error(`request timeout: ${url} did not respond within ${timeoutMs}ms`)), timeoutMs));
+    }
+    if (deadlineAt !== undefined) {
+      timers.push(setTimeout(
+        () => failWith(new Error(
+          `validation watchdog: no terminal result was obtained before the validation deadline (hardTimeoutAt + grace); the script cannot tell whether the server finished internally`,
+        )),
+        Math.max(0, deadlineAt - Date.now()),
+      ));
+    }
+    const onChildExit = () => failWith(new Error(`MCP child exited before ${url} responded`));
+    if (childExited) childExited.then(onChildExit);
+    const onChildError = () => failWith(new Error(`MCP child process error before ${url} responded`));
+    if (childFailed) childFailed.then(onChildError);
+
     const response = await fetch(url, { ...init, signal: controller.signal });
     const text = await response.text();
+    // 2. Compare the clock against the applicable deadlines BEFORE accepting.
+    const late = elapsedReason();
+    if (late) { failWith(late); throw failure; }
     if (failure) throw failure;
     return { status: response.status, text };
   } catch (error) {
+    const late = elapsedReason();
+    if (late) { failWith(late); throw failure; }
     if (failure) throw failure;
     throw error;
   } finally {
@@ -133,7 +171,7 @@ function parseRpcBody(rawText) {
  * polling, by the absolute validation deadline; a child that dies mid-request
  * aborts it.
  */
-async function sendRequest(port, method, params, { timeoutMs, deadlineAt, exited }) {
+async function sendRequest(port, method, params, { timeoutMs, deadlineAt, childExited, childFailed }) {
   const request = { jsonrpc: "2.0", id: 3, method, params };
   const raced = await fetchBounded(
     `http://127.0.0.1:${port}/mcp`,
@@ -142,7 +180,7 @@ async function sendRequest(port, method, params, { timeoutMs, deadlineAt, exited
       headers: { "Content-Type": "application/json", Accept: "application/json, text/event-stream" },
       body: JSON.stringify(request),
     },
-    { timeoutMs, deadlineAt, exited },
+    { timeoutMs, deadlineAt, childExited, childFailed },
   );
   return { body: parseRpcBody(raced.text), text: raced.text };
 }
@@ -161,18 +199,18 @@ async function callTool(port, name, args, bounds) {
   return { payload, text: content[0].text };
 }
 
-async function waitForHealth(port, { timeoutMs, exited, state }) {
+async function waitForHealth(port, { timeoutMs, childExited, childFailed, state }) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     try {
       const r = await fetchBounded(
         `http://127.0.0.1:${port}/health`,
         {},
-        { timeoutMs: Math.min(2_000, Math.max(100, deadline - Date.now())), exited },
+        { timeoutMs: Math.min(2_000, Math.max(100, deadline - Date.now())), childExited, childFailed },
       );
       if (r.status === 200) return;
     } catch (error) {
-      if (state.exit || /child exited/.test(String(error?.message))) {
+      if (state.exit || /child exited|child process error/.test(String(error?.message))) {
         throw new Error("MCP child exited before becoming healthy");
       }
     }
@@ -249,13 +287,13 @@ export async function runLiveDiscovery(options = {}) {
   let stderr = "";
   child.stderr.on("data", (d) => (stderr += d));
   const tracked = trackChildExit(child);
-  const { exited, state } = tracked;
+  const { terminated, failed, state } = tracked;
   onChild(child);
 
   let primaryError = null;
   try {
-    await waitForHealth(port, { timeoutMs: healthTimeoutMs, exited, state });
-    const bounds = { timeoutMs: requestTimeoutMs, exited };
+    await waitForHealth(port, { timeoutMs: healthTimeoutMs, childExited: terminated, childFailed: failed, state });
+    const bounds = { timeoutMs: requestTimeoutMs, childExited: terminated, childFailed: failed };
     const init = await sendRequest(port, "initialize", {
       protocolVersion: "2025-06-18",
       capabilities: {},
@@ -304,7 +342,8 @@ export async function runLiveDiscovery(options = {}) {
       poll = await callTool(port, "arr_get_operation", { operationId }, {
         timeoutMs: requestTimeoutMs,
         deadlineAt,
-        exited,
+        childExited: terminated,
+        childFailed: failed,
       });
       polls += 1;
       const p = poll.payload;
@@ -322,6 +361,9 @@ export async function runLiveDiscovery(options = {}) {
     if (poll.payload.status !== "completed") {
       throw new Error(`discovery operation ended ${poll.payload.status}${poll.payload.error ? `: ${poll.payload.error}` : ""}`);
     }
+    // 3. Acceptance gate: a completed poll that arrives after the absolute
+    //    validation deadline can never turn the validation into a success.
+    if (Date.now() > deadlineAt) throw watchdogError(operationId, graceMs);
     const result = validateDiscoveryResult(poll.payload, { operationId, downloadId });
 
     console.log(`=== completed discovery (${Date.now() - started}ms total, ${polls} polls) ===`);

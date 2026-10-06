@@ -1,37 +1,57 @@
 /**
  * Small child-process lifecycle helper shared by the validation scripts.
  *
- * It manages ONLY the child the calling script spawned: track its exit from
+ * It manages ONLY the child the calling script spawned: track its lifecycle from
  * the moment of spawn (so an already-exited, spawn-failed, or crashed child
- * never leaves the script waiting), and stop it with a bounded, escalating
- * SIGTERM → SIGKILL sequence. Termination is confirmed ONLY by the exit event;
- * a child-process 'error' event is not treated as proof the process is gone.
- * Race timers are cleared when the awaited side settles, so a successfully
- * stopped child never leaves a timer keeping the parent CLI alive.
+ * never leaves the script waiting), and stop it with a bounded,
+ * escalating SIGTERM → SIGKILL sequence. Spawn success, spawn
+ * failure, a runtime process error, and confirmed termination are tracked as
+ * SEPARATE facts: termination is confirmed ONLY by the exit event, and a child
+ * 'error' is never proof the process is gone. Cleanup waits on the termination
+ * promise, never on a promise an earlier error settled. Race timers are cleared
+ * when the awaited side settles, so a successfully stopped child never leaves a
+ * timer keeping the parent CLI alive.
  *
  * This is deliberately not a process-management framework: no name-based
  * kills, no port-based kills, no exit-event handlers doing async work.
  */
 
 /**
- * Track the owned child's terminal events from spawn. Returns:
- *   exited — promise resolving on the first of exit/error
- *   state  — { exit: {code, signal} | null, error: Error | null }
- * `state.exit` is the only confirmed-termination signal.
+ * Track the owned child's lifecycle from spawn as SEPARATE facts, never
+ * collapsed into one signal:
+ *   state.spawned     — the child successfully started (spawn event / pid)
+ *   state.spawnFailed   — an error arrived before the process ever started (nothing to kill)
+ *   state.error         — a runtime/process error (informational; NOT termination)
+ *   state.exit          — confirmed termination, set ONLY by the exit event
+ * Returns:
+ *   terminated — promise resolving ONLY on confirmed termination (the exit event)
+ *   failed     — promise resolving on the first process error, so active
+ *                HTTP/stdio requests can fail promptly
+ * Cleanup waits on `terminated`, never on a promise an arbitrary error settled.
+ * The error listener stays active for the whole lifecycle (plain `on`, not
+ * `once`), so a signalling error during cleanup cannot consume the only slot.
  */
 export function trackChildExit(child) {
-  const state = { exit: null, error: null };
-  const exited = new Promise((resolve) => {
-    child.once("exit", (code, signal) => {
-      state.exit = { code, signal };
-      resolve(state.exit);
-    });
-    child.once("error", (error) => {
-      state.error = error;
-      resolve({ error });
-    });
+  const state = { spawned: false, spawnFailed: false, error: null, exit: null };
+
+  let markTerminated = () => {};
+  const terminated = new Promise((resolve) => { markTerminated = resolve; });
+
+  let markFailed = () => {};
+  const failed = new Promise((resolve) => { markFailed = resolve; });
+
+  child.on("spawn", () => { state.spawned = true; });
+  child.on("exit", (code, signal) => {
+    state.exit = { code, signal };
+    markTerminated(state.exit);
   });
-  return { exited, state };
+  child.on("error", (error) => {
+    state.error = error;
+    if (!state.spawned && !state.exit) state.spawnFailed = true;
+    markFailed(error);
+  });
+
+  return { terminated, failed, state };
 }
 
 export function childExited(child) {
@@ -54,21 +74,25 @@ async function raceTimeout(promise, ms) {
 
 /**
  * Stop the owned child: SIGTERM, wait up to graceMs for the confirmed exit,
- * then escalate to SIGKILL and wait up to killMs. Returns once termination is
- * confirmed — it never hangs on a child that already exited, crashed, or
- * failed to spawn (a spawn-failed child never started, so there is nothing to
- * stop). If the final escalation wait ends without a confirmed exit, cleanup
- * FAILS loudly instead of pretending the child stopped.
+ * then escalate to SIGKILL and wait up to killMs. Every wait is against the
+ * `terminated` promise, which resolves ONLY on the exit event — never on a
+ * process error. Returns once termination is confirmed: a `kill()` return value
+ * or `child.killed` is never treated as proof. It never hangs on a child
+ * that already exited, and a verified spawn failure (no process ever existed)
+ * returns without signalling anything. A child that started and then hit a
+ * runtime error WITHOUT exiting still goes through the full escalation; if the
+ * final wait ends without a confirmed exit, cleanup FAILS loudly
+ * instead of pretending the child stopped.
  */
 export async function stopOwnedChild(child, tracked, { graceMs = 5000, killMs = 3000 } = {}) {
-  const { exited, state } = tracked;
-  if (childExited(child)) return;
-  if (state.error && !state.exit) return; // spawn failed: the child never started
+  const { terminated, state } = tracked;
+  if (childExited(child) || state.exit) return; // already terminated
+  if (state.spawnFailed) return; // spawn failed: no process was ever created
   child.kill("SIGTERM");
-  const term = await raceTimeout(exited, graceMs);
-  if (!term.timedOut && state.exit) return;
+  const term = await raceTimeout(terminated, graceMs);
+  if (!term.timedOut) return; // terminated resolved = confirmed exit
   child.kill("SIGKILL");
-  const forced = await raceTimeout(exited, killMs);
-  if (!forced.timedOut && state.exit) return;
+  const forced = await raceTimeout(terminated, killMs);
+  if (!forced.timedOut) return; // confirmed exit after the forced escalation
   throw new Error("cleanup failure: the owned child did not confirm termination after SIGTERM and SIGKILL");
 }
